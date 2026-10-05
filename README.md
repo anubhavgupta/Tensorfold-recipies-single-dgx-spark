@@ -20,6 +20,9 @@ version gets its own Docker image, built automatically the first time it is used
 | `start-qwen38-27b.sh` / `stop-qwen38-27b.sh` | Start/stop Qwen3.8-27B (see [Qwen3.8-27B preset](#qwen38-27b-preset)) |
 | `.env.qwen3.8-27b` | Optional config file `start-qwen38-27b.sh` reads for its settings |
 | `patches/qwen38-27b/` | Patches for the 27B on v0.6.5 (FP8 KV cache, video and media limits, memory reserve 0, pinned KV pool), applied only in the image `start-qwen38-27b.sh` runs |
+| `start-bonsai-27b.sh` / `stop-bonsai-27b.sh` | Start/stop Ternary-Bonsai-2-27B (see [Ternary-Bonsai-2-27B preset](#ternary-bonsai-2-27b-preset)) |
+| `.env.bonsai-27b` | Optional config file `start-bonsai-27b.sh` reads for its settings |
+| `patches/bonsai-27b/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches plus Prism 2-bit Hadamard CUDA loading), applied only in the image `start-bonsai-27b.sh` runs |
 | `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
 | `.env.flash-next` | Optional config file `start-qwen38-flash-next.sh` reads for its settings |
 | `Dockerfile` | Image recipe: base image + `pip install tensorfold[vision]` at a given commit |
@@ -258,6 +261,46 @@ token) the same pool is ~1.25M tokens (without a pool, ~90 GiB is left for cache
 memory and, in the worst case, the newest running request is stopped with "ran out of memory". Other workloads on
 the machine lower these numbers.
 
+## Ternary-Bonsai-2-27B preset
+
+> **Status: experimental, not yet validated.** The patches apply and compile and the image builds, but the live
+> correctness, throughput and full-context concurrency tests were stopped before they finished. Treat the numbers below
+> as predictions.
+
+`start-bonsai-27b.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
+`--parallel 8 --context 262144`, FP8 KV cache, a pinned KV pool, `--max-tokens 163840`, and Qwen/Bonsai sampling
+(THINKING=1: temperature 1.0, top_p 0.95; THINKING=0: temperature 0.7, top_p 0.80; top_k 20, min_p 0.0).
+`DRAFT_ID` defaults empty (`--no-drafts`) because DFlash2 drafting with the rotated 2-bit Bonsai pack still needs live
+validation. Text serving is the intended CUDA path; `VISION=0` by default.
+
+**Patches.** `patches/bonsai-27b/` copies the four Qwen3.8-27B capacity patches, then adds
+`0005-bonsai-cuda-2bit-hadamard.patch`. Stock v0.6.5 already recognizes `model_type: prism_hadamard_qwen35` for MLX,
+but has no CUDA serving entry point for this Prism pack. Patch 0005 is gated to that model type: it validates the Prism
+contract (`bits=2`, `group_size=128`, affine mode, Hadamard metadata), keeps the recurrent `in_proj_a`/`in_proj_b` gates
+as floating weights, applies the blockwise Hadamard rotation to activations before TensorFold's generic affine CUDA
+matmul, and applies the inverse transform after dequantizing the embedding. Other models in the base image are unchanged.
+
+The MLX pack stores ternary values as 2-bit affine codes in little-endian `uint32` words: codes 0/1/2 decode with
+`scale * code + bias`, where Bonsai sets `bias=-scale`, so the values are `-s, 0, +s`. The CUDA patch uses the stored
+2-bit words directly for correctness; it does not yet add Prism's custom low-bit fused kernels, so live throughput may be
+lower than the model card's specialized CUDA numbers.
+
+Capacity defaults are tuned for the smaller Bonsai weights: `KV_POOL_GB=auto` is free memory minus 24 GiB (minus 1 GiB
+per stream over 8), capped at 90 GiB. FP8 KV is still 32 KiB/token, so a full 262,144-token stream costs 8 GiB of KV;
+the default pool predicts roughly 11 full windows by KV math, with `PARALLEL=8` used until empirical testing raises it.
+
+```bash
+./start-bonsai-27b.sh
+THINKING=0 ./start-bonsai-27b.sh
+KV_POOL_GB=0 ./start-bonsai-27b.sh              # no pinned pool
+./stop-bonsai-27b.sh
+```
+
+Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
+`FOREGROUND`, `PATCHES` (must remain 1 for CUDA), `KV_DTYPE`, `KV_POOL_GB`, `MEMORY_RESERVE_GIB`, `PARALLEL`,
+`CONTEXT`, `PREFILL_FP8` (default 0), `CHECKPOINT_SLOTS`, `VISION`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`,
+`TOP_K`, `MIN_P`, plus any `TENSORFOLD_*` variable. They can also go in `.env.bonsai-27b`; environment variables win.
+
 ## Qwen3.8-Flash-Next preset
 
 `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` serve `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`,
@@ -303,6 +346,62 @@ already in the environment wins over the file either way. Ships with every setti
 its current default; uncomment and edit a line to persist an override without passing env vars on
 every start. `ENV_FILE=/path/to/other.env` points at a different file; `ENV_FILE=/dev/null` (or
 deleting `.env.flash-next`) runs on pure script defaults.
+
+## Benchmarks
+
+Measured on one DGX Spark (GB10, 128 GB), TensorFold v0.6.5, October 2026, with the presets' default settings unless
+noted. Throughput is aggregate decode tok/s across N clients sending the same prompt at once, thinking off
+(`chat_template_kwargs: {"enable_thinking": false}`), greedy. "Old" is the earlier patched recipe on this Spark
+(`Qwen3.8-27B-DGX-Spark-TensorFold` on v0.6.0, `Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold` on v0.6.1).
+
+### Qwen3.8-27B (`start-qwen38-27b.sh`)
+
+Throughput, 200-token replies, `--parallel 8`, no KV pool:
+
+| Clients | Prose: fp8 KV | Prose: bf16 KV | Prose: old | Code: fp8 KV | Code: bf16 KV | Code: old |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 49.0 | 48.2 | 48.3 | 85.2 | 71.7 | 78.6 |
+| 2 | 85.1 | 82.4 | 83.2 | 145.6 | 126.5 | 134.9 |
+| 4 | 144.0 | 144.4 | 134.7 | 243.4 | 215.8 | 195.7 |
+| 8 | 236.6 | 222.8 | 204.7 | 334.2 | 332.5 | 262.1 |
+
+Pinned KV pool vs none (fp8 KV, 512-token replies including prefill, 1/2/4/8 clients): the pool costs nothing.
+
+| | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Prose, 78 GiB pool | 40.7 | 70.4 | 120.4 | 194.8 |
+| Prose, no pool | 40.7 | 70.9 | 121.1 | 192.3 |
+| Code, 78 GiB pool | 72.3 | 126.5 | 212.8 | 306.9 |
+| Code, no pool | 70.8 | 126.6 | 206.7 | 308.9 |
+
+Memory and long context (fp8 KV, 78 GiB pool):
+
+| Test | Result |
+|---|---|
+| Startup estimate | 107.7 GiB of 115 (pool counted in full); no pool: 37.8 GiB (bf16 KV: 45.4) |
+| KV per token / full 262,144 window | 32 KiB / 8 GiB (bf16: 64 KiB / 16 GiB) |
+| 8 concurrent 44K-token needle prompts | all 8 correct, 4m10s total, host memory flat at 107.8-109.8 GB |
+| **Concurrent full-262K streams** | **8 measured**: a 258,537-token prompt was prefilled once (333 s), then sent 10 times at once with `--parallel 12`; 8 started within 5 s, each ran to 261,733 tokens (3,196-token replies, ~7.4 tok/s per stream, identical output), and the other 2 waited for memory. The pool holds 9 full windows; here the cached copy of the shared prompt took the 9th, so 9 should fit with different prompts (not measured: separate 259K prompts prefill one after another and never overlap). 10 would need a pool of ~82 GiB. |
+| Prefill of one 259K-token prompt | ~330 s (~780 tok/s); prompts this long prefill one at a time, since batched prefill shares 1,024 tokens a step (4,096 when nothing decodes) |
+| Video, 6 s 1280x720 clip | described correctly (4,399 prompt tokens) |
+| Images | 44 MiB body with 33 MiB of images answered; 50 images accepted, a 51st refused |
+
+### Qwen3.8-Flash-Next (`start-qwen38-flash-next.sh`)
+
+Throughput, 200-token replies, `--parallel 5`, int8 KV, `--ple-on-ssd`, MTP drafts 6 / confidence 0.60; new (stock
+v0.6.5) vs old (patched v0.6.1):
+
+| Clients | Prose: new | Prose: old | Code: new | Code: old |
+|---:|---:|---:|---:|---:|
+| 1 | 46.8 | 47.5 | 63.7 | 70.0 |
+| 2 | 93.7 | 92.4 | 138.4 | 139.5 |
+| 3 | 130.3 | 128.7 | 188.5 | 189.1 |
+| 4 | 161.3 | 160.3 | 232.3 | 224.1 |
+| 5 | 186.4 | 181.1 | 260.3 | 245.6 |
+
+MTP accept rate on code: 73.9%. With stock TensorFold defaults (MTP confidence 0.70, default prefill rows, 4 GiB vision
+workspace), prose was 45.9 / 65.4 / 112.5 / 114.4 / 165.8 tok/s at 1-5 clients; the preset's three settings close that
+gap. Concurrent full-context streams were not measured for Flash Next.
 
 ## Updating
 

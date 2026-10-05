@@ -1,0 +1,309 @@
+Bonsai CUDA support for TensorFold v0.6.5.
+
+Adds a CUDA entry point for prism-ml/Ternary-Bonsai-2-27B-mlx-2bit and teaches the
+Qwen3.8 CUDA loader to read Prism's 2-bit group-128 Hadamard pack. The changes are
+active only for model_type prism_hadamard_qwen35: recurrent gates stay as floating
+weights, packed projections rotate activations before MLX affine matmul, and the
+embedding applies the inverse transform after dequantization. This favors correctness
+and uses TensorFold's existing generic affine CUDA kernels for the 2-bit path.
+
+---
+--- tensorfold/families/bonsai/__init__.py	2026-10-05 19:09:35.000000000 +0530
++++ tensorfold/families/bonsai/__init__.py	2026-10-05 21:48:49.000000000 +0530
+@@ -16,7 +16,14 @@
+ REQUIRED_FILES = {MODELS[0]: ("hadamard.json",)}
+ KERNEL_PACKAGE = "tensorfold.kernels.qwen.prism.v1"
+ KERNEL_VERSION = "v1"
+-KERNEL_DEPENDENCIES = ("tensorfold.families.qwen3_5", "tensorfold.kernels.qwen.dense.v1")
++KERNEL_DEPENDENCIES = ("tensorfold.families.qwen3_5", "tensorfold.kernels.qwen.dense.v1",
++                       "tensorfold.families.bonsai.cuda")
++QUANT_METHODS = {"cuda": ("mlx",), "mlx": ("mlx",)}
++CUDA_AFFINE_BITS = (2,)
++CUDA_AFFINE_GROUPS = (128,)
++CUDA_CHECKPOINT_SLOTS = True
++CUDA_PREFILL_FP8 = False
++
+ 
+ 
+ def check(model_dir: str | Path) -> None:
+@@ -25,6 +32,16 @@
+     contract(model_dir)
+ 
+ 
++def check_quantization(config: dict[str, Any], backend: str) -> None:
++    """The CUDA and MLX backends both read Prism's exact 2-bit g128 affine contract only."""
++
++    from tensorfold.families.bonsai.pack import refusal
++
++    why = refusal(config)
++    if why:
++        raise ValueError(f"Ternary Bonsai cannot run this checkpoint: {why}")
++
++
+ def load(model_dir: Path, *, lane_kernels: str = "auto", drafter: str = "", drafter_bits: int = 4,
+          **_: Any) -> tuple[Any, Any]:
+     """2-bit lanes with tensor units; before M5 codes widen to 4 bits as far as the budget fits."""
+@@ -55,6 +72,29 @@
+     return family, tokenizer
+ 
+ 
++
++def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
++                master_port: int = 29551, no_drafts: bool = False, **options: Any):
++    """CUDA serving through the Qwen3.8 engine, with Bonsai's rotated 2-bit loader installed by patches."""
++
++    if tp != 1:
++        raise ValueError("Ternary Bonsai's CUDA loader is single-GPU only in this recipe")
++    if drafter and not no_drafts:
++        print("[tensorfold] Ternary Bonsai CUDA: DFlash2 drafting is experimental with rotated 2-bit weights; "
++              "use DRAFT_ID= (the default recipe) if replies look unstable", flush=True)
++    from tensorfold.families.qwen3_5 import gb10
++    from tensorfold.families.qwen3_5.cuda.engine import Qwen27Engine
++
++    streams = max(1, int(options.get("parallel") or 1))
++    wide = streams == 1 and gb10()
++    draft = Path(drafter) if drafter and not no_drafts else None
++    return Qwen27Engine(Path(model_dir), draft, max_rows=128 if wide else 12, tree_rows=16 if wide else None,
++                        tp=1, rank=rank, master=master, port=master_port, split_head=False, tp_draft=False,
++                        allow_copy=not no_drafts, streams=streams, context=options.get("context"),
++                        context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
++                        vision_urls=bool(options.get("vision_urls", False)),
++                        vision_offload=bool(options.get("vision_offload", False)), keep=options.get("checkpoint_slots"))
++
+ def engine_settings(model: Any) -> dict[str, Any]:
+     from tensorfold.families.qwen3_5 import engine_settings as dense
+ 
+@@ -71,4 +111,4 @@
+     return f"{kernel_source_version(families()[MODEL_TYPE])}-{getattr(model, 'pack_fingerprint', 'none')}-{decoder}"
+ 
+ 
+-__all__ = ["DRAFTER", "MODELS", "MODEL_TYPES", "TITLE", "check", "engine_settings", "kernel_version", "load"]
++__all__ = ["DRAFTER", "MODELS", "MODEL_TYPES", "TITLE", "check", "check_quantization", "cuda_engine", "engine_settings", "kernel_version", "load"]
+--- tensorfold/families/bonsai/cuda.py	1970-01-01 05:30:00.000000000 +0530
++++ tensorfold/families/bonsai/cuda.py	2026-10-05 21:48:49.000000000 +0530
+@@ -0,0 +1,48 @@
++"""CUDA helpers for Prism Bonsai's rotated affine pack."""
++
++from __future__ import annotations
++
++import torch
++
++BLOCK = 1024
++
++
++def _hadamard_blocks(x: torch.Tensor) -> torch.Tensor:
++    """Sylvester Hadamard over each 1024-wide block, matching Prism's normalized transform."""
++
++    if x.shape[-1] % BLOCK:
++        raise ValueError(f"Prism Hadamard widths must be multiples of {BLOCK}, not {x.shape[-1]}")
++    rows, width = x.numel() // x.shape[-1], int(x.shape[-1])
++    y = x.reshape(rows, width).to(torch.float32).reshape(rows, width // BLOCK, BLOCK).contiguous()
++    h = 1
++    while h < BLOCK:
++        v = y.reshape(rows, width // BLOCK, -1, 2, h)
++        a = v[..., 0, :].clone()
++        b = v[..., 1, :].clone()
++        v[..., 0, :] = a + b
++        v[..., 1, :] = a - b
++        h <<= 1
++    return (y * (1.0 / 32.0)).to(torch.bfloat16).reshape_as(x)
++
++
++def rotate_rows(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
++    """x * signs, then normalized 1024-point Hadamard blocks, rounded once to bf16."""
++
++    return _hadamard_blocks(x * signs.to(device=x.device, dtype=torch.float32))
++
++
++def inverse_rows(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
++    """Inverse embedding transform: Hadamard first, then signs, rounded to bf16."""
++
++    y = _hadamard_blocks(x)
++    return (y.to(torch.float32) * signs.to(device=x.device, dtype=torch.float32)).to(torch.bfloat16)
++
++
++def maybe_rotate(x: torch.Tensor, q) -> torch.Tensor:
++    signs = getattr(q, "prism_signs", None)
++    return rotate_rows(x, signs) if signs is not None else x
++
++
++def maybe_inverse_embedding(x: torch.Tensor, q) -> torch.Tensor:
++    signs = getattr(q, "prism_inverse_signs", None)
++    return inverse_rows(x, signs) if signs is not None else x
+--- tensorfold/families/qwen3_5/cuda/weights.py	2026-10-05 19:09:35.000000000 +0530
++++ tensorfold/families/qwen3_5/cuda/weights.py	2026-10-05 22:05:56.956772458 +0530
+@@ -220,7 +220,7 @@
+     def fast_prefill(self) -> bool:
+         """Whether every projection has an FP8 prompt kernel (run when prompts take FP8)."""
+ 
+-        if self.quant == "exl3" or getattr(self, "precision", "full") == "checkpoint":
++        if self.quant in ("exl3", "bonsai") or getattr(self, "precision", "full") == "checkpoint":
+             return False                             # EXL3 prompt glue stays bf16; checkpoint math has its own
+         for layer in self.layers:
+             modules = [m for m in (layer.gate, layer.up, layer.down) if m is not None]    # a MoE layer's are None
+@@ -280,7 +280,18 @@
+         return load_nvfp4(model_dir, device)
+     cfg = Config.read(model_dir)
+     raw = json.loads((model_dir / "config.json").read_text())
+-    t = _Tensors(model_dir, device)
++    bonsai = raw.get("model_type") == "prism_hadamard_qwen35"
++    bonsai_records = {}
++    bonsai_signs = {}
++    if bonsai:
++        from tensorfold.families.bonsai.pack import BLOCK, GATES, contract, signs_by_width
++
++        _, hadamard = contract(model_dir)
++        bonsai_records = {r["path"]: r for r in raw.get("modules") or []}
++        bonsai_signs = {int(k): torch.tensor(v, dtype=torch.float32, device=device).contiguous()
++                        for k, v in signs_by_width(hadamard).items()}
++    t = _Tensors(model_dir, device, skip=(lambda name: name.endswith(".signs") or name.startswith("vision_tower")
++                 or ".mtp." in name or name.startswith("mtp.")) if bonsai else None)
+     prefix = "language_model." if any(k.startswith("language_model.") for k in t) else ""
+ 
+     def get(name: str) -> torch.Tensor:
+@@ -289,6 +300,11 @@
+     def qlinear(name: str, pack: bool = True) -> QLinear:
+         from tensorfold.quantization import resolve_affine, validate_shapes
+ 
++        if bonsai and any(name.endswith(f"linear_attn.{gate}") for gate in GATES):
++            w = get(name + ".weight")
++            if w.ndim != 2 or w.dtype not in (torch.bfloat16, torch.float16, torch.float32):
++                raise ValueError(f"{name} is one of Bonsai's unquantized recurrent gates and must be floating point")
++            return Plain(w.to(torch.bfloat16).contiguous())
+         w = get(name + ".weight")
+         spec = resolve_affine(raw, prefix + name)
+         if spec is None:
+@@ -305,6 +321,16 @@
+             raise ValueError(f"{name} needs floating-point affine scales and biases")
+         validate_shapes(w.shape, scales.shape, biases.shape, spec)
+         q = QLinear(w.contiguous(), scales.contiguous(), biases.contiguous(), gs=spec.group_size, bits=spec.bits)
++        if bonsai:
++            record = bonsai_records.get(name)
++            if record and record.get("block") == BLOCK:
++                signs = bonsai_signs.get(q.k)
++                if signs is None:
++                    raise ValueError(f"{name}: no Bonsai Hadamard signs for width {q.k}")
++                if record.get("embedding"):
++                    q.prism_inverse_signs = signs
++                else:
++                    q.prism_signs = signs
+         if tiled and pack:
+             from .qmm_fast import tile
+ 
+@@ -335,6 +361,8 @@
+                             **{"gate": None, "up": None, "down": None, **fields}))
+     w = Weights(config=cfg, embed=qlinear("model.embed_tokens", pack=False), layers=layers,
+                 norm=get("model.norm.weight"), head=qlinear("lm_head"))
++    if bonsai:
++        w.quant = "bonsai"
+     half = cfg.rope_dims // 2
+     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
+     w.inv_freq = inv.to(torch.float32).to(device)
+--- tensorfold/families/qwen3_5/cuda/qmm_fast.py	2026-10-05 19:09:35.000000000 +0530
++++ tensorfold/families/qwen3_5/cuda/qmm_fast.py	2026-10-05 21:48:49.000000000 +0530
+@@ -10,11 +10,19 @@
+ from .weights import QLinear, Weights
+ 
+ 
++def _copy_prism(src: QLinear, dst: QLinear) -> QLinear:
++    if hasattr(src, "prism_signs"):
++        dst.prism_signs = src.prism_signs
++    if hasattr(src, "prism_inverse_signs"):
++        dst.prism_inverse_signs = src.prism_inverse_signs
++    return dst
++
++
+ def tile(q: QLinear) -> QLinear:
+     if q.layout == "tiled" or not q.fast:
+         return q
+     p = shared.pack(q.weight, q.scales, q.biases, 64)
+-    return QLinear(p.weight, p.scales, p.biases, layout="tiled", rows=q.n)
++    return _copy_prism(q, QLinear(p.weight, p.scales, p.biases, layout="tiled", rows=q.n))
+ 
+ 
+ def untile(q: QLinear) -> QLinear:
+@@ -22,7 +30,7 @@
+ 
+     if q.layout != "tiled":
+         return q
+-    return QLinear(*shared.unpack(shared.Q4(q.weight, q.scales, q.biases, q.n, q.k, 64)))
++    return _copy_prism(q, QLinear(*shared.unpack(shared.Q4(q.weight, q.scales, q.biases, q.n, q.k, 64))))
+ 
+ 
+ def rows(q: QLinear, a: int, b: int) -> QLinear:
+@@ -35,7 +43,7 @@
+                      q.biases[:, t0 * 64:t1 * 64].contiguous(), (t1 - t0) * 64, q.k, q.gs)
+     w, s, bias = shared.unpack(part)
+     lo, hi = a - t0 * 64, b - t0 * 64
+-    return tile(QLinear(w[lo:hi].contiguous(), s[lo:hi].contiguous(), bias[lo:hi].contiguous()))
++    return tile(_copy_prism(q, QLinear(w[lo:hi].contiguous(), s[lo:hi].contiguous(), bias[lo:hi].contiguous())))
+ 
+ 
+ def matmul_rows(x: torch.Tensor, parts: list[QLinear]) -> torch.Tensor:
+@@ -49,6 +57,11 @@
+ def matmul(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
+     """The lane matmul for either layout; both give the same bits."""
+ 
++    if hasattr(q, "prism_signs"):
++        from tensorfold.families.bonsai.cuda import rotate_rows
++
++        x = rotate_rows(x, q.prism_signs)
++        xs = None
+     if not q.fast:
+         from tensorfold.cuda.kernels.affine import matmul as affine_matmul
+ 
+@@ -61,6 +74,16 @@
+ def matmul_group(x: torch.Tensor, qs: list[QLinear], xs: torch.Tensor | None = None) -> list[torch.Tensor]:
+     """``[matmul(x, q, xs) for q in qs]`` with the same bits: one launch on sm_12x when all are tiled 4-bit."""
+ 
++    prism = [getattr(q, "prism_signs", None) for q in qs]
++    if prism[0] is not None and all(s is prism[0] for s in prism):
++        from tensorfold.families.bonsai.cuda import rotate_rows
++
++        x = rotate_rows(x, prism[0])
++        xs = None
++        qs = [_copy_prism(q, QLinear(q.weight, q.scales, q.biases, q.layout, q.rows, q.gs, q.bits)) for q in qs]
++        for q in qs:
++            if hasattr(q, "prism_signs"):
++                delattr(q, "prism_signs")
+     if all(q.layout == "tiled" and q.fast for q in qs):
+         return shared.matmul_group(x, qs, xs)
+     return [matmul(x, q, xs) for q in qs]
+@@ -85,8 +108,12 @@
+         raise ValueError("stack the stored layout, then tile")
+     if len({(q.bits, q.gs, q.k, q.scales.dtype, q.biases.dtype) for q in parts}) != 1:
+         raise ValueError("stacked projections must share an affine format and input width")
+-    return QLinear(torch.cat([q.weight for q in parts]).contiguous(), torch.cat([q.scales for q in parts]).contiguous(),
+-                   torch.cat([q.biases for q in parts]).contiguous(), gs=parts[0].gs, bits=parts[0].bits)
++    out = QLinear(torch.cat([q.weight for q in parts]).contiguous(), torch.cat([q.scales for q in parts]).contiguous(),
++                  torch.cat([q.biases for q in parts]).contiguous(), gs=parts[0].gs, bits=parts[0].bits)
++    signs = [getattr(q, "prism_signs", None) for q in parts]
++    if signs[0] is not None and all(s is signs[0] for s in signs):
++        out.prism_signs = signs[0]
++    return out
+ 
+ 
+ def _stackable(parts: list[QLinear]) -> bool:
+--- tensorfold/families/qwen3_5/cuda/glue.py	2026-10-05 19:09:35.000000000 +0530
++++ tensorfold/families/qwen3_5/cuda/glue.py	2026-10-05 21:48:49.000000000 +0530
+@@ -261,9 +261,15 @@
+     """Token rows: an EXL3 pack's table as stored, the MLX 4-bit table dequantized, or another affine table's."""
+ 
+     if q.layout == "b16":
+-        return q.weight[ids.to(torch.int64)].to(torch.bfloat16).contiguous()
+-    if q.fast:
+-        return embed(ids, q.weight, q.scales, q.biases, q.k)
+-    from tensorfold.cuda.kernels.affine import embed as affine_embed
++        out = q.weight[ids.to(torch.int64)].to(torch.bfloat16).contiguous()
++    elif q.fast:
++        out = embed(ids, q.weight, q.scales, q.biases, q.k)
++    else:
++        from tensorfold.cuda.kernels.affine import embed as affine_embed
+ 
+-    return affine_embed(ids, q)
++        out = affine_embed(ids, q)
++    if hasattr(q, "prism_inverse_signs"):
++        from tensorfold.families.bonsai.cuda import inverse_rows
++
++        out = inverse_rows(out, q.prism_inverse_signs)
++    return out
