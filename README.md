@@ -22,7 +22,7 @@ version gets its own Docker image, built automatically the first time it is used
 | `patches/qwen38-27b/` | Patches for the 27B on v0.6.5 (FP8 KV cache, video and media limits, memory reserve 0, pinned KV pool), applied only in the image `start-qwen38-27b.sh` runs |
 | `start-bonsai-27b.sh` / `stop-bonsai-27b.sh` | Start/stop Ternary-Bonsai-2-27B (see [Ternary-Bonsai-2-27B preset](#ternary-bonsai-2-27b-preset)) |
 | `.env.bonsai-27b` | Optional config file `start-bonsai-27b.sh` reads for its settings |
-| `patches/bonsai-27b/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches plus Prism 2-bit Hadamard CUDA loading), applied only in the image `start-bonsai-27b.sh` runs |
+| `patches/bonsai-27b/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches, Prism 2-bit Hadamard CUDA loading, and fast 2-bit decode), applied only in the image `start-bonsai-27b.sh` runs |
 | `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
 | `.env.flash-next` | Optional config file `start-qwen38-flash-next.sh` reads for its settings |
 | `Dockerfile` | Image recipe: base image + `pip install tensorfold[vision]` at a given commit |
@@ -235,7 +235,7 @@ docker logs -f tf-qwen38-27b
 ./stop-qwen38-27b.sh                                    # stop and remove the container
 ```
 
-Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
+Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (default DFlash2; empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
 `FOREGROUND`, `PATCHES`, `KV_DTYPE`, `KV_POOL_GB`, `MEMORY_RESERVE_GIB`, `REQUEST_BODY_MIB`, `IMAGE_TOTAL_MIB`,
 `VIDEO_MIB`, `VIDEO_TOTAL_MIB`, `PARALLEL`, `CONTEXT`, `PREFILL_FP8`, `CHECKPOINT_SLOTS`, `VISION`, `VISION_URLS`,
 `VISION_MAX_IMAGES`, `VISION_IMAGE_TOKENS`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`,
@@ -263,27 +263,39 @@ the machine lower these numbers.
 
 ## Ternary-Bonsai-2-27B preset
 
-> **Status: experimental, not yet validated.** The patches apply and compile and the image builds, but the live
-> correctness, throughput and full-context concurrency tests were stopped before they finished. Treat the numbers below
-> as predictions.
+> **Status: experimental.** Correctness, drafting, long prompts (23K-token recall) and thinking mode have been checked
+> live; full-context concurrency has not been measured.
 
 `start-bonsai-27b.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
 `--parallel 8 --context 262144`, FP8 KV cache, a pinned KV pool, `--max-tokens 163840`, and Qwen/Bonsai sampling
 (THINKING=1: temperature 1.0, top_p 0.95; THINKING=0: temperature 0.7, top_p 0.80; top_k 20, min_p 0.0).
-`DRAFT_ID` defaults empty (`--no-drafts`) because DFlash2 drafting with the rotated 2-bit Bonsai pack still needs live
-validation. Text serving is the intended CUDA path; `VISION=0` by default.
+`DRAFT_ID` defaults to `z-lab/Qwen3.8-27B-DFlash2`. Drafting is lossless (greedy outputs are identical with and without
+drafts) and roughly doubles single-stream speed; set `DRAFT_ID=` for `--no-drafts`. Text serving is the intended CUDA
+path; `VISION=0` by default.
 
-**Patches.** `patches/bonsai-27b/` copies the four Qwen3.8-27B capacity patches, then adds
-`0005-bonsai-cuda-2bit-hadamard.patch`. Stock v0.6.5 already recognizes `model_type: prism_hadamard_qwen35` for MLX,
-but has no CUDA serving entry point for this Prism pack. Patch 0005 is gated to that model type: it validates the Prism
-contract (`bits=2`, `group_size=128`, affine mode, Hadamard metadata), keeps the recurrent `in_proj_a`/`in_proj_b` gates
-as floating weights, applies the blockwise Hadamard rotation to activations before TensorFold's generic affine CUDA
-matmul, and applies the inverse transform after dequantizing the embedding. Other models in the base image are unchanged.
+**Patches.** `patches/bonsai-27b/` copies the four Qwen3.8-27B capacity patches, then adds two Bonsai patches. Stock
+v0.6.5 already recognizes `model_type: prism_hadamard_qwen35` for MLX, but has no CUDA serving entry point for this
+Prism pack. Both patches are gated to that model type; other models in the image are unchanged.
+
+- `0005-bonsai-cuda-2bit-hadamard.patch` loads the pack on CUDA. It validates the Prism contract (`bits=2`,
+  `group_size=128`, affine mode, Hadamard metadata), keeps the recurrent `in_proj_a`/`in_proj_b` gates as floating
+  weights, rotates activations (signs, then a blockwise Hadamard) before each quantized matmul, and applies the inverse
+  transform to the embedding. On its own it runs every projection through the generic affine kernel at ~1.3 tok/s.
+- `0006-bonsai-fast-decode.patch` makes it fast:
+  - Widens the 2-bit/group-128 codes at load to TensorFold's 4-bit/group-64 layout (lossless apart from fp16 to bf16
+    scale rounding), so Bonsai uses the same tiled decode, grouped and prefill kernels as the 27B.
+  - Replaces the Python Hadamard with a Triton kernel (bit-identical, 30-1000x faster), rotating once per group of
+    projections that share an input.
+  - Adds a 2-bit variant of the grouped decode kernel that reads half the weight bytes (about 2.2x faster per matmul
+    at small batch). It keeps a 2-bit copy next to the 4-bit one that prefill uses; set `TENSORFOLD_BONSAI_W2=0`
+    to drop it and decode from the 4-bit copy.
+  - Makes the DFlash2 verifier's row views and partial matmuls rotation-aware, so drafting works.
 
 The MLX pack stores ternary values as 2-bit affine codes in little-endian `uint32` words: codes 0/1/2 decode with
-`scale * code + bias`, where Bonsai sets `bias=-scale`, so the values are `-s, 0, +s`. The CUDA patch uses the stored
-2-bit words directly for correctness; it does not yet add Prism's custom low-bit fused kernels, so live throughput may be
-lower than the model card's specialized CUDA numbers.
+`scale * code + bias`, where Bonsai sets `bias=-scale`, so the values are `-s, 0, +s`.
+
+**First start is slow.** Any patch change rebuilds the image and the CUDA extensions. The first request after that
+takes ~70 s while the kernels compile; they are cached in `~/.cache/tensorfold-docker/kernels/`, so restarts are fast.
 
 Capacity defaults are tuned for the smaller Bonsai weights: `KV_POOL_GB=auto` is free memory minus 24 GiB (minus 1 GiB
 per stream over 8), capped at 90 GiB. FP8 KV is still 32 KiB/token, so a full 262,144-token stream costs 8 GiB of KV;
@@ -292,6 +304,7 @@ the default pool predicts roughly 11 full windows by KV math, with `PARALLEL=8` 
 ```bash
 ./start-bonsai-27b.sh
 THINKING=0 ./start-bonsai-27b.sh
+DRAFT_ID= ./start-bonsai-27b.sh                 # no drafts
 KV_POOL_GB=0 ./start-bonsai-27b.sh              # no pinned pool
 ./stop-bonsai-27b.sh
 ```
@@ -346,6 +359,45 @@ already in the environment wins over the file either way. Ships with every setti
 its current default; uncomment and edit a line to persist an override without passing env vars on
 every start. `ENV_FILE=/path/to/other.env` points at a different file; `ENV_FILE=/dev/null` (or
 deleting `.env.flash-next`) runs on pure script defaults.
+
+## Chat template (Qwen3.8-27B and Flash-Next)
+
+> **Reminder:** use the fixed Qwen chat template from
+> [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+> (the top-level `chat_template.jinja`; its first line reads `qwen3.8-froggeric-v22.5` at the time
+> of writing) instead of the model's official one. Download it with:
+> `curl -LO https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja`
+
+Compared with the official template, it:
+
+- defaults to medium reasoning effort instead of xhigh;
+- keeps chat history intact;
+- merges multiple system messages into one;
+- handles tool calls better.
+
+**Where to put it:** TensorFold has no option for a custom template path. It always reads
+`chat_template.jinja` from the model's snapshot directory, so the file has to replace the one there:
+
+```bash
+# Qwen3.8-27B:        models--Vontra--Qwen3.8-27B-MLX-4bit
+# Qwen3.8-Flash-Next: models--Vontra--Qwen3.8-Flash-Next-MLX-4bit-MTP
+M=~/.cache/huggingface/hub/models--Vontra--Qwen3.8-27B-MLX-4bit
+SNAP=$M/snapshots/$(cat $M/refs/main)
+mkdir -p ~/.cache/huggingface/chat-template-backups
+cp -L $SNAP/chat_template.jinja ~/.cache/huggingface/chat-template-backups/$(basename $M | sed 's/^models--//').official.jinja
+mv $SNAP/chat_template.jinja $SNAP/chat_template.jinja.orig   # keep the original symlink
+cp ./chat_template.jinja $SNAP/chat_template.jinja        # the downloaded fixed template
+```
+
+- Restart the server afterwards; the template is read only at startup.
+- To confirm it loaded, render a prompt with `POST /tokenize` and then `/detokenize`. With the fixed
+  template, a prompt without a reasoning effort contains no xhigh instruction.
+- Re-downloading the model, or a new snapshot appearing, brings back the official template, so
+  reapply the steps above after any update.
+- To restore the official template, run
+  `rm $SNAP/chat_template.jinja && mv $SNAP/chat_template.jinja.orig $SNAP/chat_template.jinja`.
+- **Don't change the Bonsai template:** keep its own template (embedded in `tokenizer_config.json`).
+  The fixed template is for Qwen3.8-27B and Flash-Next only.
 
 ## Benchmarks
 
@@ -402,6 +454,22 @@ v0.6.5) vs old (patched v0.6.1):
 MTP accept rate on code: 73.9%. With stock TensorFold defaults (MTP confidence 0.70, default prefill rows, 4 GiB vision
 workspace), prose was 45.9 / 65.4 / 112.5 / 114.4 / 165.8 tok/s at 1-5 clients; the preset's three settings close that
 gap. Concurrent full-context streams were not measured for Flash Next.
+
+### Ternary-Bonsai-2-27B (`start-bonsai-27b.sh`)
+
+Throughput, 200-token replies, `--parallel 8`, fp8 KV, with patch 0006. The 27B column ran the same script on the same
+day with its preset (DFlash2), so it is directly comparable (the table above used a slightly different script).
+
+| Clients | Prose: Bonsai + DFlash2 | Prose: Bonsai, no drafts | Prose: 27B + DFlash2 | Code: Bonsai + DFlash2 | Code: Bonsai, no drafts | Code: 27B + DFlash2 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 41.5 | 21.7 | 35.8 | 81.3 | 21.7 | 84.9 |
+| 2 | 73.0 | 40.7 | 63.2 | 127.9 | 40.9 | 152.3 |
+| 4 | 117.2 | 74.2 | 104.7 | 204.9 | 74.3 | 246.4 |
+| 8 | 173.5 | 123.5 | 175.8 | 291.9 | 123.5 | 398.4 |
+
+Bonsai beats the 27B on prose at 1-4 clients and ties at 8. On code the 27B pulls ahead: DFlash2 was trained on the
+27B, so it accepts fewer Bonsai tokens, and large verification batches are compute-bound, where 2-bit weights don't
+help. Before 0006 Bonsai decoded at ~1.3 tok/s. A 23,349-token prompt prefilled in 19 s (~1,230 tok/s).
 
 ## Updating
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit with stock TensorFold v0.6.5 plus the patch chain in
 # patches/bonsai-27b. The first four patches are the Ternary-Bonsai-2-27B capacity patches (FP8 KV, video/media limits,
-# reserve 0, pinned KV pool); 0005 adds Bonsai's CUDA loader for Prism's rotated 2-bit group-128 Hadamard pack.
+# reserve 0, pinned KV pool); 0005 adds Bonsai's CUDA loader for Prism's rotated 2-bit group-128 Hadamard pack;
+# 0006 makes it fast (fast 4-bit lane kernels for the ternary codes, 2-bit decode reads, a fused Hadamard kernel).
 # The plain stock image has Bonsai metadata/MLX support but no CUDA serving path for this checkpoint, so PATCHES=1
 # is required here.
 #
@@ -13,7 +14,7 @@
 #   HOST          bind address (default: 0.0.0.0)           SERVED_NAME  model id clients see
 #   NAME          container name (default: tf-bonsai-27b)   FOREGROUND   1: run attached instead of detached
 #   MODEL_ID      target model (default: prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
-#   DRAFT_ID      optional DFlash2 drafter; default empty because drafting is not yet validated for Bonsai CUDA
+#   DRAFT_ID      DFlash2 drafter (default: z-lab/Qwen3.8-27B-DFlash2; empty: --no-drafts)
 #   PATCHES       must be 1: the patched image with patches/bonsai-27b
 #   KV_DTYPE      fp8 (default; half-size cache) or bf16
 #   KV_POOL_GB    auto: free-at-start minus 24 GiB, at most 90; <n>: n GiB; 0: no pinned pool
@@ -43,7 +44,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 MODEL_ID="${MODEL_ID:-prism-ml/Ternary-Bonsai-2-27B-mlx-2bit}"
-DRAFT_ID="${DRAFT_ID-}"
+DRAFT_ID="${DRAFT_ID-z-lab/Qwen3.8-27B-DFlash2}"
 SERVED_NAME="${SERVED_NAME:-Ternary-Bonsai-2-27B}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"

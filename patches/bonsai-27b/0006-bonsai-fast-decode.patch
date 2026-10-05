@@ -1,0 +1,578 @@
+--- tensorfold/cuda/kernels/qmm.cpp
++++ tensorfold/cuda/kernels/qmm.cpp
+@@ -7,6 +7,9 @@
+ void qmm_group_cuda(const at::Tensor&, const at::Tensor&, const std::vector<at::Tensor>&,
+                     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, std::vector<at::Tensor>&,
+                     const std::vector<int64_t>&, const std::vector<int64_t>&, bool, int, int);
++void qmm_group2_cuda(const at::Tensor&, const at::Tensor&, const std::vector<at::Tensor>&,
++                     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, std::vector<at::Tensor>&,
++                     const std::vector<int64_t>&, const std::vector<int64_t>&, bool, int, int);
+ void qmm_prefill_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
+                       int, bool, int);
+ void qmm_prefill8w_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
+@@ -48,7 +51,7 @@
+ }
+ 
+ // Up to four packed 4-bit weights against one x in one sm_12x launch, each with its own K split (its own bits).
+-void qmm_group(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++static void group_checked(int64_t bits, const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
+                const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,
+                std::vector<at::Tensor> outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks, bool f32,
+                int64_t tile, int64_t pdl) {
+@@ -67,7 +70,7 @@
+         TORCH_CHECK(sk == 1 || sk == 2 || sk == 4 || sk == 8, "K split 1, 2, 4 or 8");
+         TORCH_CHECK(kg % sk == 0, "K splits into whole groups a slice");
+         TORCH_CHECK(ws[i].is_cuda() && ws[i].is_contiguous() && ws[i].scalar_type() == at::kInt &&
+-                    ws[i].numel() == npad * k / 8, "packed weight does not match n and K");
++                    ws[i].numel() == npad * k * bits / 32, "packed weight does not match n and K");
+         TORCH_CHECK(scales[i].stride(1) == 1 && biases[i].stride(1) == 1 && scales[i].stride(0) >= npad &&
+                     biases[i].stride(0) == scales[i].stride(0) && scales[i].scalar_type() == at::kBFloat16 &&
+                     biases[i].scalar_type() == at::kBFloat16 && scales[i].size(0) == kg && scales[i].size(1) == npad &&
+@@ -76,7 +79,24 @@
+                     outs[i].scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
+     }
+     c10::cuda::CUDAGuard guard(x.device());
+-    qmm_group_cuda(x, xs, ws, scales, biases, outs, ns, sks, f32, static_cast<int>(tile), static_cast<int>(pdl));
++    if (bits == 2) qmm_group2_cuda(x, xs, ws, scales, biases, outs, ns, sks, f32, static_cast<int>(tile),
++                                   static_cast<int>(pdl));
++    else qmm_group_cuda(x, xs, ws, scales, biases, outs, ns, sks, f32, static_cast<int>(tile), static_cast<int>(pdl));
++}
++
++void qmm_group(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++               const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,
++               std::vector<at::Tensor> outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks, bool f32,
++               int64_t tile, int64_t pdl) {
++    group_checked(4, x, xs, ws, scales, biases, outs, ns, sks, f32, tile, pdl);
++}
++
++// qmm_group over ``pack2`` words: the same codes as 2 bits (each 0-3), the same bits out.
++void qmm_group2(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++                const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,
++                std::vector<at::Tensor> outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks, bool f32,
++                int64_t tile, int64_t pdl) {
++    group_checked(2, x, xs, ws, scales, biases, outs, ns, sks, f32, tile, pdl);
+ }
+ 
+ // Prefill: x (M, K) bf16 times a packed 4-bit weight with each weight rounded once to bf16, one fp32 chain over K.
+@@ -151,6 +171,7 @@
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("qmm", &qmm);
+     m.def("qmm_group", &qmm_group);
++    m.def("qmm_group2", &qmm_group2);
+     m.def("qmm_prefill", &qmm_prefill);
+     m.def("qmm_prefill8", &qmm_prefill8);
+     m.def("qmm_prefill8w", &qmm_prefill8w);
+--- tensorfold/cuda/kernels/qmm_group.cu
++++ tensorfold/cuda/kernels/qmm_group.cu
+@@ -43,6 +43,14 @@
+     return r;
+ }
+ 
++// Eight 2-bit codes (bits 2p, 2p + 1 of the low 16) into nibble p of a word: the 4-bit words' layout, same codes.
++__device__ __forceinline__ uint32_t spread2(uint32_t v) {
++    v &= 0xFFFFu;
++    v = (v | (v << 8)) & 0x00FF00FFu;
++    v = (v | (v << 4)) & 0x0F0F0F0Fu;
++    return (v | (v << 2)) & 0x33333333u;
++}
++
+ template <int N>
+ using ic = std::integral_constant<int, N>;
+ 
+@@ -51,7 +59,7 @@
+ // SKIP: a warp's m16 tiles wholly past M skip their fragments, mmas and scaling (a part-filled row tile). SPREAD:
+ // every K slice sums its share of the tile's outputs (else slice 0 sums them all); the same adds in the same order.
+ template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SWAP = false, bool SKIP = false,
+-          bool SPREAD = false>
++          bool SPREAD = false, int BITS = 4>
+ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
+         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const __grid_constant__ Parts parts,
+         int M, int K, int ldx, int rows_t, int C) {
+@@ -76,8 +84,10 @@
+     auto stage = [&](int s) { return buf + s * T::STAGE; };
+     const int rows = min(BM, M - m0);           // rows past M stay zero in every stage (set once below)
+     // each thread's copies, fixed for the block: sources advance a group at a time
+-    constexpr int TILE_BYTES = 64 * GS / 2;     // one stored 64-column tile's group block
+-    constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
++    static_assert(BITS == 4 || (BITS == 2 && GS % 64 == 0), "4-bit words, or 2-bit words of 64-input groups");
++    constexpr int TILE_BYTES = 64 * GS * BITS / 8;  // one stored 64-column tile's group block
++    constexpr int WB = T::W * BITS / 4;             // a stage's weight bytes (the stage keeps 4-bit room)
++    constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (WB / 16 + T::THREADS - 1) / T::THREADS;
+     constexpr int SC = (2 * T::S / 16 + T::THREADS - 1) / T::THREADS;
+     static_assert(BM <= T::THREADS, "one input sum a thread");
+     const __nv_bfloat16* xsrc[XC];
+@@ -95,7 +105,7 @@
+ #pragma unroll
+     for (int j = 0; j < WC; ++j) {
+         const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+-        wok[j] = c < T::W / 16;
++        wok[j] = c < WB / 16;
+         wsrc[j] = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES +
+                   off * 16;
+         wdst[j] = T::X + c * 16;
+@@ -173,11 +183,22 @@
+                 const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+                 const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
+                 uint32_t words[T::NT][GS / 32];
++                if constexpr (BITS == 4) {
++#pragma unroll
++                    for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++                        for (int v = 0; v < GS / 32; ++v)
++                            words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                } else {                                  // a 2-bit word holds a lane's two 4-bit words' codes
+ #pragma unroll
+-                for (int j = 0; j < T::NT; ++j)
++                    for (int j = 0; j < T::NT; ++j)
+ #pragma unroll
+-                    for (int v = 0; v < GS / 32; ++v)
+-                        words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                        for (int u = 0; u < GS / 64; ++u) {
++                            const uint32_t w2 = pw[((wn * T::NT + j) * 32 + lane) * (GS / 64) + u];
++                            words[j][2 * u] = spread2(w2);
++                            words[j][2 * u + 1] = spread2(w2 >> 16);
++                        }
++                }
+                 float d[I][J][4];
+                 if constexpr (SWAP) {
+ #pragma unroll
+@@ -347,7 +368,7 @@
+ }
+ 
+ template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SWAP = false, bool SKIP = false,
+-          bool SPREAD = false>
++          bool SPREAD = false, int BITS = 4>
+ void launch(const at::Tensor& x, const at::Tensor& xs, Parts& parts, int C, bool pdl) {
+     using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
+     const int M = x.size(0), K = x.size(1), rows_t = (M + BM - 1) / BM;
+@@ -358,7 +379,7 @@
+         P.first = clusters;
+         clusters += rows_t * ((P.tiles + C / P.sk - 1) / (C / P.sk));
+     }
+-    auto kernel = group_kernel<GS, BM, BN, WM, WN, STAGES, F32, SWAP, SKIP, SPREAD>;
++    auto kernel = group_kernel<GS, BM, BN, WM, WN, STAGES, F32, SWAP, SKIP, SPREAD, BITS>;
+     static bool configured = false;
+     if (!configured) {
+         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
+@@ -392,34 +413,35 @@
+ 
+ // Tiles never change bits; 0 picks by rows and chip: the PRO 6000, power-capped at one row, takes fewer MMAs a weight.
+ // 10-12 (``qmm.group_tile`` on SM 12.0 from 96 SMs) spread the slice sums and skip m16 tiles wholly past M.
+-template <bool F32>
++template <bool F32, int BITS>
+ void dispatch(int tile, int M, bool gb10, const at::Tensor& x, const at::Tensor& xs, Parts& parts, int C, bool pdl) {
+     if (tile == 0 && gb10) tile = M <= 16 ? 2 : M <= 32 ? 3 : M <= 64 ? 4 : 5;
+     if (tile == 0) tile = M <= 8 ? 7 : M <= 16 ? 8 : M <= 32 ? 9 : M <= 64 ? 4 : 5;
+     auto go = [&](auto full, auto skip, int bm) { M % bm ? skip() : full(); };
+     switch (tile) {
+-        case 1: launch<64, 16, 64, 1, 4, 4, F32>(x, xs, parts, C, pdl); break;
+-        case 2: launch<64, 16, 64, 1, 4, 8, F32>(x, xs, parts, C, pdl); break;
+-        case 3: launch<64, 32, 64, 1, 4, 4, F32>(x, xs, parts, C, pdl); break;
+-        case 4: launch<64, 64, 64, 1, 4, 4, F32>(x, xs, parts, C, pdl); break;
+-        case 5: launch<64, 64, 128, 2, 4, 3, F32>(x, xs, parts, C, pdl); break;
+-        case 6: launch<64, 8, 64, 1, 4, 4, F32, true>(x, xs, parts, C, pdl); break;
+-        case 7: launch<64, 8, 128, 1, 4, 4, F32, true>(x, xs, parts, C, pdl); break;
+-        case 8: launch<64, 16, 128, 1, 8, 4, F32>(x, xs, parts, C, pdl); break;
+-        case 9: launch<64, 32, 128, 1, 8, 4, F32>(x, xs, parts, C, pdl); break;
+-        case 10: go([&] { launch<64, 128, 128, 2, 4, 2, F32, false, false, true>(x, xs, parts, C, pdl); },
+-                    [&] { launch<64, 128, 128, 2, 4, 2, F32, false, true, true>(x, xs, parts, C, pdl); }, 128); break;
+-        case 11: go([&] { launch<64, 64, 128, 1, 8, 3, F32, false, false, true>(x, xs, parts, C, pdl); },
+-                    [&] { launch<64, 64, 128, 1, 8, 3, F32, false, true, true>(x, xs, parts, C, pdl); }, 64); break;
+-        case 12: go([&] { launch<64, 64, 128, 2, 4, 3, F32, false, false, true>(x, xs, parts, C, pdl); },
+-                    [&] { launch<64, 64, 128, 2, 4, 3, F32, false, true, true>(x, xs, parts, C, pdl); }, 64); break;
++        case 1: launch<64, 16, 64, 1, 4, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 2: launch<64, 16, 64, 1, 4, 8, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 3: launch<64, 32, 64, 1, 4, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 4: launch<64, 64, 64, 1, 4, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 5: launch<64, 64, 128, 2, 4, 3, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 6: launch<64, 8, 64, 1, 4, 4, F32, true, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 7: launch<64, 8, 128, 1, 4, 4, F32, true, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 8: launch<64, 16, 128, 1, 8, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 9: launch<64, 32, 128, 1, 8, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 10: go([&] { launch<64, 128, 128, 2, 4, 2, F32, false, false, true, BITS>(x, xs, parts, C, pdl); },
++                    [&] { launch<64, 128, 128, 2, 4, 2, F32, false, true, true, BITS>(x, xs, parts, C, pdl); }, 128); break;
++        case 11: go([&] { launch<64, 64, 128, 1, 8, 3, F32, false, false, true, BITS>(x, xs, parts, C, pdl); },
++                    [&] { launch<64, 64, 128, 1, 8, 3, F32, false, true, true, BITS>(x, xs, parts, C, pdl); }, 64); break;
++        case 12: go([&] { launch<64, 64, 128, 2, 4, 3, F32, false, false, true, BITS>(x, xs, parts, C, pdl); },
++                    [&] { launch<64, 64, 128, 2, 4, 3, F32, false, true, true, BITS>(x, xs, parts, C, pdl); }, 64); break;
+         default: TORCH_CHECK(false, "unknown group tile ", tile);
+     }
+ }
+ 
+ } // namespace
+ 
+-void qmm_group_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++template <int BITS>
++void group_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
+                     const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,
+                     std::vector<at::Tensor>& outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks,
+                     bool f32, int tile, int pdl) {
+@@ -440,6 +462,21 @@
+     const auto* props = at::cuda::getCurrentDeviceProperties();
+     const bool gb10 = props->major == 12 && props->minor == 1;
+     const bool early = pdl < 0 ? gb10 : pdl > 0;           // overlapping launches pay on GB10, cost the capped PRO 6000
+-    if (f32) dispatch<true>(tile, x.size(0), gb10, x, xs, parts, C, early);
+-    else dispatch<false>(tile, x.size(0), gb10, x, xs, parts, C, early);
++    if (f32) dispatch<true, BITS>(tile, x.size(0), gb10, x, xs, parts, C, early);
++    else dispatch<false, BITS>(tile, x.size(0), gb10, x, xs, parts, C, early);
++}
++
++void qmm_group_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++                    const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,
++                    std::vector<at::Tensor>& outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks,
++                    bool f32, int tile, int pdl) {
++    group_cuda<4>(x, xs, ws, scales, biases, outs, ns, sks, f32, tile, pdl);
++}
++
++// The same matmul over 2-bit words (codes 0-3 of the 4-bit layout): half the weight bytes, the same bits out.
++void qmm_group2_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++                     const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,
++                     std::vector<at::Tensor>& outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks,
++                     bool f32, int tile, int pdl) {
++    group_cuda<2>(x, xs, ws, scales, biases, outs, ns, sks, f32, tile, pdl);
+ }
+--- tensorfold/cuda/kernels/qmm.py
++++ tensorfold/cuda/kernels/qmm.py
+@@ -18,7 +18,7 @@
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_qmm_v5", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
++    return load(name="tensorfold_qmm_v5b", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+                                                    str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
+                                                    str(here / "qmm_prefill8.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+@@ -99,6 +99,26 @@
+     return Q4(out, major(scales), major(biases), n, k, gs)
+ 
+ 
++def pack2(weight: torch.Tensor) -> torch.Tensor | None:
++    """``pack`` words whose codes all fit 2 bits, as 2-bit words for ``qmm_group2`` (half the bytes), else None.
++
++    A lane's words v = 2u, 2u + 1 of a group become word u: nibble p of each in bits 2p (low half, high half).
++    """
++
++    gs32 = int(weight.shape[-1])
++    if gs32 % 2 or bool((weight & -0x33333334).any()):     # 0xCCCCCCCC: a code above 3
++        return None
++    out = torch.empty(weight.shape[:-1] + (gs32 // 2,), dtype=torch.int32, device=weight.device)
++    for t0 in range(0, int(weight.shape[0]), 64):
++        w = weight[t0:t0 + 64]
++        c = torch.zeros_like(w)
++        for p in range(8):
++            c |= ((w >> (4 * p)) & 3) << (2 * p)
++        c = c.reshape(w.shape[:-1] + (gs32 // 2, 2))
++        out[t0:t0 + 64] = c[..., 0] | (c[..., 1] << 16)
++    return out.contiguous()
++
++
+ def unpack(q: Q4, chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """The stored MLX layout again: (n, k/8) int32 words, (n, k/gs) scales and biases, ``chunk`` tiles at a time."""
+ 
+@@ -169,8 +189,10 @@
+     if out is None:
+         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+     if q.gs == 64 and reduce and grouped(x.device.index):
+-        _ext().qmm_group(x, xs, [q.weight], [q.scales], [q.biases], [out], [q.n], [sk], f32,
+-                         group_tile(m, *_chip(x.device.index)), -1)
++        w2 = getattr(q, "w2", None)
++        run = _ext().qmm_group if w2 is None else _ext().qmm_group2
++        run(x, xs, [q.weight if w2 is None else w2], [q.scales], [q.biases], [out], [q.n], [sk], f32,
++            group_tile(m, *_chip(x.device.index)), -1)
+         return out
+     if sk > 1 and not reduce and part is None:
+         part = torch.empty((sk, m, q.n), dtype=torch.float32, device=x.device)
+@@ -185,7 +207,10 @@
+     if x.dtype != torch.bfloat16 or x.dim() != 2 or any(x.shape[1] != q.k for q in qs):
+         raise ValueError("matmul_group: x must be (M, K) bf16 with every weight's K")
+     sks = sks or [split_k(q.n, q.k, q.gs) for q in qs]
+-    if not (1 <= len(qs) <= 4 and all(q.gs == 64 for q in qs) and grouped(x.device.index)):
++    w2 = [getattr(q, "w2", None) for q in qs]
++    two = all(w is not None for w in w2)
++    if not (1 <= len(qs) <= 4 and all(q.gs == 64 for q in qs) and grouped(x.device.index)) or (
++            not two and any(w is not None for w in w2)):
+         return [matmul(x, q, xs, sk=s, f32=f32) for q, s in zip(qs, sks)]
+     if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 8) or x.data_ptr() % 16:
+         x = x.clone(memory_format=torch.contiguous_format)
+@@ -194,8 +219,9 @@
+     dtype = torch.float32 if f32 else torch.bfloat16
+     outs = [torch.empty((x.shape[0], q.n), dtype=dtype, device=x.device) for q in qs]
+     tile = tile or group_tile(x.shape[0], *_chip(x.device.index))
+-    _ext().qmm_group(x, xs, [q.weight for q in qs], [q.scales for q in qs], [q.biases for q in qs], outs,
+-                     [q.n for q in qs], sks, f32, tile, early)
++    run = _ext().qmm_group2 if two else _ext().qmm_group
++    run(x, xs, w2 if two else [q.weight for q in qs], [q.scales for q in qs], [q.biases for q in qs], outs,
++        [q.n for q in qs], sks, f32, tile, early)
+     return outs
+ 
+ 
+--- tensorfold/families/bonsai/cuda.py
++++ tensorfold/families/bonsai/cuda.py
+@@ -3,39 +3,91 @@
+ from __future__ import annotations
+ 
+ import torch
++import triton
++import triton.language as tl
+ 
+ BLOCK = 1024
+ 
+ 
+-def _hadamard_blocks(x: torch.Tensor) -> torch.Tensor:
+-    """Sylvester Hadamard over each 1024-wide block, matching Prism's normalized transform."""
+-
+-    if x.shape[-1] % BLOCK:
+-        raise ValueError(f"Prism Hadamard widths must be multiples of {BLOCK}, not {x.shape[-1]}")
+-    rows, width = x.numel() // x.shape[-1], int(x.shape[-1])
+-    y = x.reshape(rows, width).to(torch.float32).reshape(rows, width // BLOCK, BLOCK).contiguous()
+-    h = 1
+-    while h < BLOCK:
+-        v = y.reshape(rows, width // BLOCK, -1, 2, h)
+-        a = v[..., 0, :].clone()
+-        b = v[..., 1, :].clone()
+-        v[..., 0, :] = a + b
+-        v[..., 1, :] = a - b
+-        h <<= 1
+-    return (y * (1.0 / 32.0)).to(torch.bfloat16).reshape_as(x)
++@triton.jit
++def _fwht(X, S, OUT, K: tl.constexpr, INVERSE: tl.constexpr):
++    """One normalized 1024-point Sylvester transform of one block of one row, in fp32 registers, rounded once."""
++
++    row = tl.program_id(0).to(tl.int64)
++    blk = tl.program_id(1)
++    i = tl.arange(0, 1024)
++    x = tl.load(X + row * K + blk * 1024 + i).to(tl.float32)
++    s = tl.load(S + blk * 1024 + i)
++    if not INVERSE:
++        x = x * s
++    for stage in tl.static_range(10):
++        x = tl.reshape(x, (512 >> stage, 2, 1 << stage))
++        a, b = tl.split(tl.permute(x, (0, 2, 1)))
++        x = tl.reshape(tl.permute(tl.join(a + b, a - b), (0, 2, 1)), (1024,))
++    x = x * (1.0 / 32.0)
++    if INVERSE:
++        x = x * s
++    tl.store(OUT + row * K + blk * 1024 + i, x.to(tl.bfloat16))
++
++
++def _transform(x: torch.Tensor, signs: torch.Tensor, inverse: bool) -> torch.Tensor:
++    width = int(x.shape[-1])
++    if width % BLOCK:
++        raise ValueError(f"Prism Hadamard widths must be multiples of {BLOCK}, not {width}")
++    if signs.dtype != torch.float32 or signs.device != x.device or signs.numel() != width:
++        signs = signs.to(device=x.device, dtype=torch.float32).contiguous()
++    x = x.contiguous()
++    rows = x.numel() // width
++    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
++    if rows:
++        _fwht[(rows, width // BLOCK)](x, signs, out, K=width, INVERSE=inverse, num_warps=4)
++    return out
+ 
+ 
+ def rotate_rows(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+     """x * signs, then normalized 1024-point Hadamard blocks, rounded once to bf16."""
+ 
+-    return _hadamard_blocks(x * signs.to(device=x.device, dtype=torch.float32))
++    return _transform(x, signs, False)
+ 
+ 
+ def inverse_rows(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+     """Inverse embedding transform: Hadamard first, then signs, rounded to bf16."""
+ 
+-    y = _hadamard_blocks(x)
+-    return (y.to(torch.float32) * signs.to(device=x.device, dtype=torch.float32)).to(torch.bfloat16)
++    return _transform(x, signs, True)
++
++
++def widen(weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, group: int,
++          chunk: int = 8192) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """2-bit MLX words in groups of ``group`` -> the 4-bit, 64-group bf16 layout the fast kernels read.
++
++    Every 2-bit code is kept as the same 4-bit code and each group's scale and bias are repeated for its
++    64-input halves, so the products are unchanged apart from the fp16 -> bf16 rounding of scales and biases.
++    """
++
++    if group % 64 or weight.dtype != torch.int32:
++        raise ValueError("Bonsai widening takes int32 2-bit words in groups that are multiples of 64")
++    n, words = int(weight.shape[0]), int(weight.shape[1])
++    k = words * 16
++    out = torch.empty((n, k // 8), dtype=torch.int32, device=weight.device)
++    shifts2 = torch.arange(0, 32, 2, dtype=torch.int32, device=weight.device)
++    shifts4 = torch.arange(0, 32, 4, dtype=torch.int32, device=weight.device)
++    for a in range(0, n, chunk):
++        b = min(n, a + chunk)
++        codes = (weight[a:b, :, None] >> shifts2) & 3                                    # (rows, words, 16)
++        codes = codes.reshape(b - a, k // 8, 8)
++        out[a:b] = _words(codes, shifts4)
++    rep = group // 64
++    return (out, scales.to(torch.bfloat16).repeat_interleave(rep, dim=1).contiguous(),
++            biases.to(torch.bfloat16).repeat_interleave(rep, dim=1).contiguous())
++
++
++def _words(codes: torch.Tensor, shifts4: torch.Tensor) -> torch.Tensor:
++    """Eight 4-bit codes (last axis) -> one little-endian int32 word, wrapping into the sign bit like MLX's uint32."""
++
++    words = torch.zeros(codes.shape[:-1], dtype=torch.int32, device=codes.device)
++    for p in range(8):
++        words |= codes[..., p] << shifts4[p]
++    return words
+ 
+ 
+ def maybe_rotate(x: torch.Tensor, q) -> torch.Tensor:
+--- tensorfold/families/bonsai/__init__.py
++++ tensorfold/families/bonsai/__init__.py
+@@ -79,9 +79,6 @@
+ 
+     if tp != 1:
+         raise ValueError("Ternary Bonsai's CUDA loader is single-GPU only in this recipe")
+-    if drafter and not no_drafts:
+-        print("[tensorfold] Ternary Bonsai CUDA: DFlash2 drafting is experimental with rotated 2-bit weights; "
+-              "use DRAFT_ID= (the default recipe) if replies look unstable", flush=True)
+     from tensorfold.families.qwen3_5 import gb10
+     from tensorfold.families.qwen3_5.cuda.engine import Qwen27Engine
+ 
+--- tensorfold/families/qwen3_5/cuda/prefill.py
++++ tensorfold/families/qwen3_5/cuda/prefill.py
+@@ -33,6 +33,10 @@
+         return w.prefill(x)                               # an EXL3 pack's or an NVFP4 checkpoint's projection
+     packed = tile(w)
+     if packed.fast:                                       # each weight rounded once to bf16, one fp32 chain over K
++        if hasattr(packed, "prism_signs"):                # Prism Bonsai: rows into the weight's Hadamard basis
++            from tensorfold.families.bonsai.cuda import rotate_rows
++
++            x = rotate_rows(x, packed.prism_signs)
+         return shared.prefill_matmul(x, packed, f32=f32, tile=shared.prompt_tile(x.shape[0], packed.n))
+     return matmul_partial(x, packed) if f32 else matmul(x, packed)
+ 
+--- tensorfold/families/qwen3_5/cuda/qmm_fast.py
++++ tensorfold/families/qwen3_5/cuda/qmm_fast.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ 
+ from tensorfold.cuda.kernels import qmm as shared
+@@ -22,7 +24,12 @@
+     if q.layout == "tiled" or not q.fast:
+         return q
+     p = shared.pack(q.weight, q.scales, q.biases, 64)
+-    return _copy_prism(q, QLinear(p.weight, p.scales, p.biases, layout="tiled", rows=q.n))
++    out = _copy_prism(q, QLinear(p.weight, p.scales, p.biases, layout="tiled", rows=q.n))
++    if hasattr(q, "prism_signs") and os.environ.get("TENSORFOLD_BONSAI_W2", "1") != "0":
++        w2 = shared.pack2(p.weight)                    # ternary codes: decode reads 2-bit words, the same bits out
++        if w2 is not None:
++            out.w2 = w2
++    return out
+ 
+ 
+ def untile(q: QLinear) -> QLinear:
+@@ -37,7 +44,11 @@
+     """Rows [a, b) of a tiled weight: a view when they are whole 128-row blocks from a tile edge, else a small copy."""
+ 
+     if a % 64 == 0 and (b - a) % 128 == 0:
+-        return QLinear(q.weight[a // 64:b // 64], q.scales[:, a:b], q.biases[:, a:b], layout="tiled", rows=b - a)
++        out = _copy_prism(q, QLinear(q.weight[a // 64:b // 64], q.scales[:, a:b], q.biases[:, a:b], layout="tiled",
++                                     rows=b - a))
++        if getattr(q, "w2", None) is not None:
++            out.w2 = q.w2[a // 64:b // 64]
++        return out
+     t0, t1 = a // 64, -(-b // 64)
+     part = shared.Q4(q.weight[t0:t1], q.scales[:, t0 * 64:t1 * 64].contiguous(),
+                      q.biases[:, t0 * 64:t1 * 64].contiguous(), (t1 - t0) * 64, q.k, q.gs)
+@@ -46,22 +57,27 @@
+     return tile(_copy_prism(q, QLinear(w[lo:hi].contiguous(), s[lo:hi].contiguous(), bias[lo:hi].contiguous())))
+ 
+ 
++def _rotate(x: torch.Tensor, q, xs: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """A Prism Bonsai projection's input in its Hadamard basis (its group sums change with it)."""
++
++    signs = getattr(q, "prism_signs", None)
++    if signs is None:
++        return x, xs
++    from tensorfold.families.bonsai.cuda import rotate_rows
++
++    return rotate_rows(x, signs), None
++
++
+ def matmul_rows(x: torch.Tensor, parts: list[QLinear]) -> torch.Tensor:
+     """``x`` against row blocks of one weight, with the bits of the stacked weight's matmul."""
+ 
++    x, _ = _rotate(x, parts[0], None)
+     sk = shared.split_k(sum(p.n for p in parts), parts[0].k, parts[0].gs)
+     xs = shared.group_sums(x, parts[0].gs)
+     return torch.cat([shared.matmul(x, p, xs, sk=sk) for p in parts], dim=1)
+ 
+ 
+-def matmul(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
+-    """The lane matmul for either layout; both give the same bits."""
+-
+-    if hasattr(q, "prism_signs"):
+-        from tensorfold.families.bonsai.cuda import rotate_rows
+-
+-        x = rotate_rows(x, q.prism_signs)
+-        xs = None
++def _matmul(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
+     if not q.fast:
+         from tensorfold.cuda.kernels.affine import matmul as affine_matmul
+ 
+@@ -71,27 +87,29 @@
+     return lane_matmul(x, q.weight, q.scales, q.biases, xs=xs)
+ 
+ 
++def matmul(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
++    """The lane matmul for either layout; both give the same bits."""
++
++    x, xs = _rotate(x, q, xs)
++    return _matmul(x, q, xs)
++
++
+ def matmul_group(x: torch.Tensor, qs: list[QLinear], xs: torch.Tensor | None = None) -> list[torch.Tensor]:
+     """``[matmul(x, q, xs) for q in qs]`` with the same bits: one launch on sm_12x when all are tiled 4-bit."""
+ 
+-    prism = [getattr(q, "prism_signs", None) for q in qs]
+-    if prism[0] is not None and all(s is prism[0] for s in prism):
+-        from tensorfold.families.bonsai.cuda import rotate_rows
+-
+-        x = rotate_rows(x, prism[0])
+-        xs = None
+-        qs = [_copy_prism(q, QLinear(q.weight, q.scales, q.biases, q.layout, q.rows, q.gs, q.bits)) for q in qs]
+-        for q in qs:
+-            if hasattr(q, "prism_signs"):
+-                delattr(q, "prism_signs")
++    signs = getattr(qs[0], "prism_signs", None)
++    if any(getattr(q, "prism_signs", None) is not signs for q in qs):
++        return [matmul(x, q, xs) for q in qs]          # projections in different bases: each rotates its own input
++    x, xs = _rotate(x, qs[0], xs)                       # one shared basis: rotate once for the group
+     if all(q.layout == "tiled" and q.fast for q in qs):
+         return shared.matmul_group(x, qs, xs)
+-    return [matmul(x, q, xs) for q in qs]
++    return [_matmul(x, q, xs) for q in qs]
+ 
+ 
+ def matmul_partial(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
+     """fp32 sums for a tiled weight, unrounded: a row-parallel rank's share of a projection."""
+ 
++    x, xs = _rotate(x, q, xs)
+     if not q.fast:
+         from tensorfold.cuda.kernels.affine import matmul as affine_matmul
+ 
+--- tensorfold/families/qwen3_5/cuda/weights.py
++++ tensorfold/families/qwen3_5/cuda/weights.py
+@@ -320,7 +320,13 @@
+         if any(value.dtype not in (torch.bfloat16, torch.float16, torch.float32) for value in (scales, biases)):
+             raise ValueError(f"{name} needs floating-point affine scales and biases")
+         validate_shapes(w.shape, scales.shape, biases.shape, spec)
+-        q = QLinear(w.contiguous(), scales.contiguous(), biases.contiguous(), gs=spec.group_size, bits=spec.bits)
++        if bonsai and (spec.bits, spec.group_size) == (2, 128):
++            from tensorfold.families.bonsai.cuda import widen
++
++            # same codes in the 4-bit g64 bf16 layout, so the fast lane kernels, tiling and grouping all apply
++            q = QLinear(*widen(w.contiguous(), scales, biases, spec.group_size), gs=64, bits=4)
++        else:
++            q = QLinear(w.contiguous(), scales.contiguous(), biases.contiguous(), gs=spec.group_size, bits=spec.bits)
+         if bonsai:
+             record = bonsai_records.get(name)
+             if record and record.get("block") == BLOCK:
