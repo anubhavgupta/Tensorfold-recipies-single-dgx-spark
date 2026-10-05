@@ -16,6 +16,9 @@
 #   --tf-detach          Run in the background (follow with: docker logs -f NAME).
 #   --tf-docker-arg ARG  Extra `docker run` argument; repeatable (e.g. --tf-docker-arg=-eFOO=1).
 #   --tf-shell           Open a bash shell in the container instead of running tensorfold.
+#   --tf-patches DIR     Run a derived image with DIR/*.patch (unified diffs against site-packages, `patch -p0`)
+#                        applied on top of REF's image, tagged <image>-p<hash of the patches>. Built once, rebuilt
+#                        when the patches change (or with --tf-rebuild); the plain image stays unpatched.
 #   --tf-help            Show this help.
 #
 # Host environment variables named TENSORFOLD_*, NCCL_*, HF_*, CUDA_VISIBLE_DEVICES are forwarded.
@@ -34,7 +37,7 @@ HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 TF_CACHE="${TF_CACHE:-$HOME/.cache/tensorfold-docker}"
 
 version="${TF_VERSION:-latest}"
-rebuild=0 detach=0 shell=0 name=""
+rebuild=0 detach=0 shell=0 name="" patches=""
 offline="${TF_OFFLINE:-0}"
 docker_extra=()
 
@@ -53,6 +56,8 @@ while [[ $# -gt 0 ]]; do
     --tf-docker-arg) need "$@"; docker_extra+=("$2"); shift 2 ;;
     --tf-docker-arg=*) docker_extra+=("${1#*=}"); shift ;;
     --tf-shell) shell=1; shift ;;
+    --tf-patches) need "$@"; patches="$2"; shift 2 ;;
+    --tf-patches=*) patches="${1#*=}"; shift ;;
     --tf-help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     --) shift; break ;;
     *) break ;;
@@ -109,8 +114,30 @@ if [[ $offline -eq 0 ]] && { [[ $rebuild -eq 1 ]] || ! docker image inspect "$im
     -t "$image" -t "tensorfold:${tag_safe}" "$SCRIPT_DIR" >&2
 fi
 
-# Compiled kernels are tied to the TensorFold build, so they are cached per commit.
+# Compiled kernels are tied to the TensorFold build, so they are cached per commit (and per patch set).
 kernel_cache="$TF_CACHE/kernels/${commit:0:12}"
+
+if [[ -n "$patches" ]]; then
+  [[ -d "$patches" ]] || die "--tf-patches: no directory $patches"
+  patch_files=("$patches"/*.patch)
+  [[ -e "${patch_files[0]}" ]] || die "--tf-patches: no *.patch files in $patches"
+  patch_hash="$(cat "${patch_files[@]}" | sha256sum | cut -c1-12)"
+  base_image="$image"
+  image="${image}-p${patch_hash}"
+  kernel_cache="${kernel_cache}-p${patch_hash}"
+  if [[ $rebuild -eq 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo ">> building $image ($base_image + $(cd "$patches" && ls *.patch | paste -sd' '))" >&2
+    docker build --build-arg BASE="$base_image" -t "$image" -f - "$patches" >&2 <<'DOCKERFILE'
+ARG BASE
+FROM ${BASE}
+COPY *.patch /opt/tf-patches/
+RUN cd "$(python -c 'import os, tensorfold; print(os.path.dirname(os.path.dirname(tensorfold.__file__)))')" \
+ && for p in /opt/tf-patches/*.patch; do echo "applying $p"; patch -p0 --forward --no-backup-if-mismatch < "$p" || exit 1; done \
+ && python -m compileall -q tensorfold
+DOCKERFILE
+    docker image inspect "$image" >/dev/null 2>&1 || die "could not build $image"
+  fi
+fi
 mkdir -p "$HF_CACHE" "$TF_CACHE/state" "$kernel_cache"
 
 run=(docker run --rm --init --gpus all --ipc=host --network host

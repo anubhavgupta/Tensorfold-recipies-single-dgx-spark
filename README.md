@@ -19,6 +19,7 @@ version gets its own Docker image, built automatically the first time it is used
 | `tensorfold.sh` | The script |
 | `start-qwen38-27b.sh` / `stop-qwen38-27b.sh` | Start/stop Qwen3.8-27B (see [Qwen3.8-27B preset](#qwen38-27b-preset)) |
 | `.env.qwen3.8-27b` | Optional config file `start-qwen38-27b.sh` reads for its settings |
+| `patches/qwen38-27b/` | Patches for the 27B on v0.6.5 (FP8 KV cache, video and media limits, memory reserve 0, pinned KV pool), applied only in the image `start-qwen38-27b.sh` runs |
 | `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
 | `.env.flash-next` | Optional config file `start-qwen38-flash-next.sh` reads for its settings |
 | `Dockerfile` | Image recipe: base image + `pip install tensorfold[vision]` at a given commit |
@@ -39,6 +40,7 @@ The container runs as root, so files it writes to these folders are owned by roo
 | `--tf-detach` | Runs the container in the background. Follow its output with `docker logs -f NAME`. |
 | `--tf-docker-arg ARG` | Adds one extra argument to `docker run`. Repeatable. |
 | `--tf-shell` | Opens a bash shell in the container instead of running `tensorfold`. |
+| `--tf-patches DIR` | Runs a derived image with `DIR/*.patch` (diffs against site-packages, `patch -p0`) applied on top of the version's image, tagged `<image>-p<hash>`; built once, rebuilt when the patches change. |
 | `--tf-help` | Shows the help text. |
 
 Script settings, read from the environment:
@@ -162,26 +164,77 @@ NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 ./tensorfold.sh \
 
 `start-qwen38-27b.sh` serves `Vontra/Qwen3.8-27B-MLX-4bit` with `--drafter z-lab/Qwen3.8-27B-DFlash2`, using the settings of
 the `Qwen3.8-27B-DGX-Spark-TensorFold` recipe that stock TensorFold supports: port 8888, model name
-`Qwen3.8-27B`, `--parallel 4 --context 262144`, `--prefill-fp8 --vision --thinking`, `--max-tokens 122880`,
-`--vision-max-images 50 --vision-image-tokens 16384`, `TENSORFOLD_VIDEO_TOKENS=16384`,
-`TENSORFOLD_MEMORY_RESERVE_GIB=2` and a 64 MiB stack limit. Sampling follows Qwen's recommendation and switches
-with `THINKING`: 1.0 / 0.95 in thinking mode, 0.7 / 0.80 with `THINKING=0`; top_k 20 and min_p 0.0 either way
+`Qwen3.8-27B`, `--parallel 8 --context 262144`, FP8 KV cache (below), `--prefill-fp8 --vision --thinking`, `--max-tokens 163840`,
+`--vision-max-images 50 --vision-image-tokens 16384`, `TENSORFOLD_VIDEO_TOKENS=16384`, video input, 96 MiB request
+bodies, a 0 GiB memory reserve, a pinned KV pool and a 64 MiB stack limit. Sampling follows Qwen's recommendation and
+switches with `THINKING`: 1.0 / 0.95 in thinking mode, 0.7 / 0.80 with `THINKING=0`; top_k 20 and min_p 0.0 either way
 (TensorFold has no presence or repetition penalty).
-The recipe's image limits were patches there; stock TensorFold has them as the two `--vision-*` flags (v0.6.3+).
-Still left out, because stock v0.6.5 has no equivalent: the fp8 KV cache (`--kv-dtype` is Flash Next only, so
-this model keeps bf16 KV), the pinned KV pool, YaRN, and a memory reserve below 2 GiB.
+
+**Patches (`PATCHES=1`, the default).** Four of the old recipe's v0.6.0 patches are ported to v0.6.5 in
+`patches/qwen38-27b/`. The script runs them as `./tensorfold.sh --tf-patches patches/qwen38-27b`, which builds a derived
+image `tensorfold:<version>-<commit>-p<patch hash>` on top of the stock one (rebuilt when a patch changes). The stock
+image, Flash Next and every other command stay unpatched, and each patch only acts when its variable is set, which only
+this script does:
+
+| Patch | What it adds | Setting (default) | Stock v0.6.5 |
+|---|---|---|---|
+| `0001-qwen27-kv-fp8` | FP8 KV cache for the 27B | `KV_DTYPE=fp8` → `TENSORFOLD_KV_DTYPE` | `--kv-dtype` is Flash Next only |
+| `0002-qwen27-video-media-limits` | video input for the 27B; size limits as variables | `REQUEST_BODY_MIB` (96), `IMAGE_TOTAL_MIB` (64), `VIDEO_MIB` (64), `VIDEO_TOTAL_MIB` (96) | video for Flash Next only; 32 / 20 / 16 / 20 MiB |
+| `0003-qwen27-memory-reserve` | memory reserve down to 0 | `MEMORY_RESERVE_GIB` (0) | floor 2 GiB |
+| `0004-qwen27-kv-pool` | pinned KV cache pool | `KV_POOL_GB` (auto) → `TENSORFOLD_KV_POOL_GIB` | caches grow and shrink on demand |
+
+The many-images part of the old recipe's image patch is stock now (`--vision-max-images`, `--vision-image-tokens`,
+v0.6.3+). Not ported: YaRN (1M-token windows). `PATCHES=0` runs the plain stock image; it needs `KV_DTYPE=bf16` and
+defaults `KV_POOL_GB=0`, `MEMORY_RESERVE_GIB=2`.
+
+**Pinned KV pool (`KV_POOL_GB=auto`).** Once loaded, the server takes one block of cache memory, touches its pages and
+keeps it inside torch's allocator for good; every stream's cache and the kept prompt states grow inside it, and the
+memory gate counts against the pool instead of the host's free memory. Memory use therefore stays flat instead of
+rising and falling with each request, and other programs can't take what the caches need. `auto` is the memory free at
+start minus 31 GiB (minus 1 GiB a stream over 8), at most 78 GiB - ~2.5M fp8 tokens, enough for 8 full 262k windows;
+the startup line reads `inside a pinned 78.0 GiB cache pool (2,555,904 tokens)`. `KV_POOL_GB=<n>` sets it,
+`KV_POOL_GB=0` turns it off. With `--vision-offload`, the vision tower's move to the CPU no longer empties torch's
+cache while a pool is set (it would hand the pool back). Measured: startup estimate 107.7 GiB of 115 (the pool
+counted in full), 8 concurrent 44k-token needle prompts all answered, host memory flat at 107.8-109.8 GB throughout,
+and decode speed the same with or without the pool (512-token replies including prefill, 1/2/4/8 clients: prose
+40.7/70.4/120.4/194.8 vs 40.7/70.9/121.1/192.3 tok/s, code 72.3/126.5/212.8/306.9 vs 70.8/126.6/206.7/308.9).
+
+**Video and media limits.** Stock v0.6.5 has the video code (frame groups, `TENSORFOLD_VIDEO_TOKENS`) but turns it
+on only for Flash Next; patch 0002 turns it on for the 27B too (`video_url` parts with an mp4 data URL, or an
+https URL with `VISION_URLS=1`). Checked: a 6 s 1280x720 clip (4,399 prompt tokens) described correctly; a 44 MiB
+body with 33 MiB of images (four 1700x1700 PNGs) answered; 50 images accepted and a 51st refused.
+
+**FP8 KV cache (`KV_DTYPE=fp8`, the default).** Stock `--kv-dtype` is Flash Next only, so the 27B would keep a bf16
+cache. Patch 0001 stores keys and values as e4m3, one byte, rounded the same way before use so drafted replies still
+equal serial ones. Measured here (v0.6.5, `--parallel 8 --context 262144`, no pool):
+
+| | bf16 | fp8 |
+|---|---:|---:|
+| KV per token / full 262,144 window | 64 KiB / 16 GiB | 32 KiB / 8 GiB |
+| Startup estimate | 45.36 GiB | 37.77 GiB |
+| GPU memory added by an 80k-token prompt | 6.2 GiB | 3.8 GiB |
+| Full 262k windows that fit at once (~90 GiB free) | 4–5 | 8+ |
+| Decode, prose, 1/2/4/8 clients (tok/s) | 48.2 / 82.4 / 144.4 / 222.8 | 49.0 / 85.1 / 144.0 / 236.6 |
+| Decode, code, 1/2/4/8 clients (tok/s) | 71.7 / 126.5 / 215.8 / 332.5 | 85.2 / 145.6 / 243.4 / 334.2 |
+
+Checks on the fp8 image: the 80k needle is found, 4 concurrent prompts (the batched prefill path) answer correctly,
+and repeated greedy replies are identical. The old recipe measured the quality cost at 4k context: perplexity 3.315
+vs 3.316, KL 0.0031 (FP8 prompts, `PREFILL_FP8=1`, cost ~14x more).
 
 ```bash
 ./start-qwen38-27b.sh                                   # background container tf-qwen38-27b
-./start-qwen38-27b.sh --parallel 8 --context 163840     # extra args override the defaults
-PARALLEL=8 CONTEXT=163840 THINKING=0 ./start-qwen38-27b.sh
+./start-qwen38-27b.sh --parallel 4 --context 131072     # extra args override the defaults
+KV_DTYPE=bf16 PARALLEL=4 THINKING=0 ./start-qwen38-27b.sh  # bf16 cache
+KV_POOL_GB=0 ./start-qwen38-27b.sh                      # no pinned pool: caches grow on demand
+PATCHES=0 KV_DTYPE=bf16 ./start-qwen38-27b.sh           # plain stock image
 FOREGROUND=1 ./start-qwen38-27b.sh                      # attached; Ctrl+C stops it
 docker logs -f tf-qwen38-27b
 ./stop-qwen38-27b.sh                                    # stop and remove the container
 ```
 
 Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
-`FOREGROUND`, `PARALLEL`, `CONTEXT`, `PREFILL_FP8`, `CHECKPOINT_SLOTS`, `VISION`, `VISION_URLS`,
+`FOREGROUND`, `PATCHES`, `KV_DTYPE`, `KV_POOL_GB`, `MEMORY_RESERVE_GIB`, `REQUEST_BODY_MIB`, `IMAGE_TOTAL_MIB`,
+`VIDEO_MIB`, `VIDEO_TOTAL_MIB`, `PARALLEL`, `CONTEXT`, `PREFILL_FP8`, `CHECKPOINT_SLOTS`, `VISION`, `VISION_URLS`,
 `VISION_MAX_IMAGES`, `VISION_IMAGE_TOKENS`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`,
 plus any `TENSORFOLD_*` variable. They can also go in `.env.qwen3.8-27b` (every line commented out at its default;
 `ENV_FILE` picks another file); a variable already in the environment wins over the file.
@@ -190,20 +243,20 @@ Compared on this Spark with the old patched recipe (thinking off, 200-token repl
 `--parallel 8`), new vs old: prose 48.2/48.3, 82.4/83.2, 144.4/134.7, 222.8/204.7 at 1/2/4/8 clients; code
 71.7/78.6, 126.5/134.9, 215.8/195.7, 332.5/262.1.
 
-How many parallel requests fit: each token of context takes 64 KiB of attention cache (bf16), so a full
-262,144-token request takes 16 GiB. After loading, about 90 GiB is left for caches on this Spark (~1.4M tokens
-across all running requests). `--context` only caps each request; caches grow as requests need them.
+How many parallel requests fit: the default 78 GiB pool holds ~2.5M fp8 tokens (32 KiB a token, 8 GiB per full
+262,144-token request), so the default 8 at 262,144 all fit (~9 at full length). With `KV_DTYPE=bf16` (64 KiB a
+token) the same pool is ~1.25M tokens (without a pool, ~90 GiB is left for caches, ~1.4M):
 
-| `--parallel` | Longest `--context` all requests can use at once |
+| `--parallel` (bf16 cache, `KV_POOL_GB=0`) | Longest `--context` all requests can use at once |
 |---|---|
 | 1–5 | 262,144 (full) |
 | 6 | ~220K |
 | 7 | ~190K |
 | 8 | ~160K (`--context 163840`) |
 
-Past that total, new requests wait for memory and, in the worst case, the newest running request is stopped
-with "ran out of memory". The default here, `--parallel 4` at 262,144, stays within it. Other workloads on the
-machine lower these numbers.
+`--context` only caps each request; caches grow as requests need them (inside the pool, if any). Past that total, new requests wait for
+memory and, in the worst case, the newest running request is stopped with "ran out of memory". Other workloads on
+the machine lower these numbers.
 
 ## Qwen3.8-Flash-Next preset
 

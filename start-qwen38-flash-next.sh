@@ -22,7 +22,7 @@
 #   VISION (1) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384)
 #   MTP_DRAFTS (6) / MTP_CONFIDENCE (0.60): TensorFold's own Flash Next default is 6 / 0.70, but the
 #     recipe's swept 0.60 beat it ~3-4% with identical output, so this script matches it; empty: TensorFold's own default
-#   THINKING (1) MAX_TOKENS (32768); sampling is Qwen's recommendation and switches with THINKING:
+#   THINKING (1) MAX_TOKENS (163840); sampling is Qwen's recommendation and switches with THINKING:
 #     thinking mode TEMPERATURE (1.0) TOP_P (0.95), instruct/non-thinking mode TEMPERATURE (0.7)
 #     TOP_P (0.80); TOP_K (20) and MIN_P (0.0) are the same either way. Qwen also recommends a
 #     presence_penalty (1.5 in instruct mode) and a repetition_penalty, but TensorFold has neither
@@ -73,7 +73,7 @@ VISION="${VISION:-1}"
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"
 VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-16384}"
 THINKING="${THINKING:-1}"
-MAX_TOKENS="${MAX_TOKENS:-32768}"
+MAX_TOKENS="${MAX_TOKENS:-163840}"
 # Qwen's recommended sampling: thinking mode (temperature 1.0, top_p 0.95) vs instruct/non-thinking
 # mode (0.7, 0.80). top_k 20 and min_p 0.0 are the same in both. presence_penalty 1.5 (instruct mode)
 # and repetition_penalty are also Qwen's recommendation, but TensorFold has neither setting (it always
