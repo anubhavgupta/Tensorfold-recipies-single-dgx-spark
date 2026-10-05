@@ -17,7 +17,8 @@ version gets its own Docker image, built automatically the first time it is used
 | Path | Purpose |
 |---|---|
 | `tensorfold.sh` | The script |
-| `start-qwen38-27b.sh` | Starts Qwen3.8-27B with the settings below (see [Qwen3.8-27B preset](#qwen38-27b-preset)) |
+| `start-qwen38-27b.sh` / `stop-qwen38-27b.sh` | Start/stop Qwen3.8-27B (see [Qwen3.8-27B preset](#qwen38-27b-preset)) |
+| `.env.qwen3.8-27b` | Optional config file `start-qwen38-27b.sh` reads for its settings |
 | `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
 | `.env.flash-next` | Optional config file `start-qwen38-flash-next.sh` reads for its settings |
 | `Dockerfile` | Image recipe: base image + `pip install tensorfold[vision]` at a given commit |
@@ -161,24 +162,33 @@ NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 ./tensorfold.sh \
 
 `start-qwen38-27b.sh` serves `Vontra/Qwen3.8-27B-MLX-4bit` with `--drafter z-lab/Qwen3.8-27B-DFlash2`, using the settings of
 the `Qwen3.8-27B-DGX-Spark-TensorFold` recipe that stock TensorFold supports: port 8888, model name
-`Qwen3.8-27B`, `--parallel 4 --context 262144`, Qwen's sampling (1.0 / 0.95 / 20), `--prefill-fp8 --vision
---thinking`, `--vision-max-images 50 --vision-image-tokens 16384`, `TENSORFOLD_VIDEO_TOKENS=16384`,
-`TENSORFOLD_MEMORY_RESERVE_GIB=2` and a 64 MiB stack limit.
+`Qwen3.8-27B`, `--parallel 4 --context 262144`, `--prefill-fp8 --vision --thinking`, `--max-tokens 122880`,
+`--vision-max-images 50 --vision-image-tokens 16384`, `TENSORFOLD_VIDEO_TOKENS=16384`,
+`TENSORFOLD_MEMORY_RESERVE_GIB=2` and a 64 MiB stack limit. Sampling follows Qwen's recommendation and switches
+with `THINKING`: 1.0 / 0.95 in thinking mode, 0.7 / 0.80 with `THINKING=0`; top_k 20 and min_p 0.0 either way
+(TensorFold has no presence or repetition penalty).
 The recipe's image limits were patches there; stock TensorFold has them as the two `--vision-*` flags (v0.6.3+).
-Still left out, because stock v0.6.4 has no equivalent: the fp8 KV cache (`--kv-dtype` accepts only bf16 for
-this model), the pinned KV pool, YaRN, and a memory reserve below 2 GiB.
+Still left out, because stock v0.6.5 has no equivalent: the fp8 KV cache (`--kv-dtype` is Flash Next only, so
+this model keeps bf16 KV), the pinned KV pool, YaRN, and a memory reserve below 2 GiB.
 
 ```bash
 ./start-qwen38-27b.sh                                   # background container tf-qwen38-27b
 ./start-qwen38-27b.sh --parallel 8 --context 163840     # extra args override the defaults
-PORT=9000 TF_VERSION=v0.6.3 ./start-qwen38-27b.sh
+PARALLEL=8 CONTEXT=163840 THINKING=0 ./start-qwen38-27b.sh
 FOREGROUND=1 ./start-qwen38-27b.sh                      # attached; Ctrl+C stops it
 docker logs -f tf-qwen38-27b
-docker stop tf-qwen38-27b
+./stop-qwen38-27b.sh                                    # stop and remove the container
 ```
 
-Settings read from the environment: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
-`FOREGROUND`, plus any `TENSORFOLD_*` variable.
+Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
+`FOREGROUND`, `PARALLEL`, `CONTEXT`, `PREFILL_FP8`, `CHECKPOINT_SLOTS`, `VISION`, `VISION_URLS`,
+`VISION_MAX_IMAGES`, `VISION_IMAGE_TOKENS`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`,
+plus any `TENSORFOLD_*` variable. They can also go in `.env.qwen3.8-27b` (every line commented out at its default;
+`ENV_FILE` picks another file); a variable already in the environment wins over the file.
+
+Compared on this Spark with the old patched recipe (thinking off, 200-token replies, aggregate tok/s, both at
+`--parallel 8`), new vs old: prose 48.2/48.3, 82.4/83.2, 144.4/134.7, 222.8/204.7 at 1/2/4/8 clients; code
+71.7/78.6, 126.5/134.9, 215.8/195.7, 332.5/262.1.
 
 How many parallel requests fit: each token of context takes 64 KiB of attention cache (bf16), so a full
 262,144-token request takes 16 GiB. After loading, about 90 GiB is left for caches on this Spark (~1.4M tokens
