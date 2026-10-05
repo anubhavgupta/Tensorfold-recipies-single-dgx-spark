@@ -22,7 +22,7 @@ version gets its own Docker image, built automatically the first time it is used
 | `patches/qwen38-27b/` | Patches for the 27B on v0.6.5 (FP8 KV cache, video and media limits, memory reserve 0, pinned KV pool), applied only in the image `start-qwen38-27b.sh` runs |
 | `start-bonsai-27b.sh` / `stop-bonsai-27b.sh` | Start/stop Ternary-Bonsai-2-27B (see [Ternary-Bonsai-2-27B preset](#ternary-bonsai-2-27b-preset)) |
 | `.env.bonsai-27b` | Optional config file `start-bonsai-27b.sh` reads for its settings |
-| `patches/bonsai-27b/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches, Prism 2-bit Hadamard CUDA loading, and fast 2-bit decode), applied only in the image `start-bonsai-27b.sh` runs |
+| `patches/bonsai-27b/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches, Prism 2-bit Hadamard CUDA loading, fast decode, single-copy PQ2 weights), applied only in the image `start-bonsai-27b.sh` runs |
 | `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
 | `.env.flash-next` | Optional config file `start-qwen38-flash-next.sh` reads for its settings |
 | `Dockerfile` | Image recipe: base image + `pip install tensorfold[vision]` at a given commit |
@@ -263,8 +263,8 @@ the machine lower these numbers.
 
 ## Ternary-Bonsai-2-27B preset
 
-> **Status: experimental.** Correctness, drafting, long prompts (23K-token recall) and thinking mode have been checked
-> live; full-context concurrency has not been measured.
+> **Status: experimental.** Correctness, drafting, long prompts (30K-token recall), thinking mode and full 262K
+> concurrency have been checked live.
 
 `start-bonsai-27b.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
 `--parallel 8 --context 262144`, FP8 KV cache, a pinned KV pool, `--max-tokens 163840`, and Qwen/Bonsai sampling
@@ -273,9 +273,9 @@ the machine lower these numbers.
 drafts) and roughly doubles single-stream speed; set `DRAFT_ID=` for `--no-drafts`. Text serving is the intended CUDA
 path; `VISION=0` by default.
 
-**Patches.** `patches/bonsai-27b/` copies the four Qwen3.8-27B capacity patches, then adds two Bonsai patches. Stock
+**Patches.** `patches/bonsai-27b/` copies the four Qwen3.8-27B capacity patches, then adds three Bonsai patches. Stock
 v0.6.5 already recognizes `model_type: prism_hadamard_qwen35` for MLX, but has no CUDA serving entry point for this
-Prism pack. Both patches are gated to that model type; other models in the image are unchanged.
+Prism pack. All three are gated to that model type; other models in the image are unchanged.
 
 - `0005-bonsai-cuda-2bit-hadamard.patch` loads the pack on CUDA. It validates the Prism contract (`bits=2`,
   `group_size=128`, affine mode, Hadamard metadata), keeps the recurrent `in_proj_a`/`in_proj_b` gates as floating
@@ -290,6 +290,19 @@ Prism pack. Both patches are gated to that model type; other models in the image
     at small batch). It keeps a 2-bit copy next to the 4-bit one that prefill uses; set `TENSORFOLD_BONSAI_W2=0`
     to drop it and decode from the 4-bit copy.
   - Makes the DFlash2 verifier's row views and partial matmuls rotation-aware, so drafting works.
+- `0007-bonsai-pq2-fused-rotation.patch` keeps one compact copy of the weights and fuses the rotations, borrowing ideas
+  from PrismML's llama.cpp fork:
+  - **PQ2 weights:** the 2-bit codes in the lane layout of 0006's 2-bit kernel plus one exact fp16 scale per 128
+    weights and no bias array (bias = -scale is applied through the activation sums): 2.125 bits per weight. Every
+    path reads it: decode and DFlash2 verification (below 96 rows), and new PQ2 prefill GEMMs for bf16 and FP8 prompts
+    (96 rows and up). Weights drop from ~20 GiB (4-bit + 2-bit copies) to **7.0 GiB**, and the fp16 scales are no longer
+    rounded to bf16.
+  - **Fused rotations:** add+RMSNorm, SwiGLU, attention output gate and GDN gated norm each write their output already
+    rotated (Triton, bit-identical to producer-then-rotate), removing a launch per projection input; a fused
+    rotate+int8-quantize kernel lets `PREFILL_FP8=1` work for Bonsai (~1,475 vs ~1,145 prompt tok/s on 30K tokens).
+  - `TENSORFOLD_BONSAI_PQ2=0` falls back to 0006's widened weights (for A/B tests).
+  - A ternary 1.75-bit base-3 format (like the fork's `PTQ1_0`) was built and is exact, but decoding it was
+    ALU-bound on GB10 (~40x slower than PQ2), so it is not used.
 
 The MLX pack stores ternary values as 2-bit affine codes in little-endian `uint32` words: codes 0/1/2 decode with
 `scale * code + bias`, where Bonsai sets `bias=-scale`, so the values are `-s, 0, +s`.
@@ -297,19 +310,33 @@ The MLX pack stores ternary values as 2-bit affine codes in little-endian `uint3
 **First start is slow.** Any patch change rebuilds the image and the CUDA extensions. The first request after that
 takes ~70 s while the kernels compile; they are cached in `~/.cache/tensorfold-docker/kernels/`, so restarts are fast.
 
-Capacity defaults are tuned for the smaller Bonsai weights: `KV_POOL_GB=auto` is free memory minus 24 GiB (minus 1 GiB
-per stream over 8), capped at 90 GiB. FP8 KV is still 32 KiB/token, so a full 262,144-token stream costs 8 GiB of KV;
-the default pool predicts roughly 11 full windows by KV math, with `PARALLEL=8` used until empirical testing raises it.
+**Memory.** `KV_POOL_GB=auto` is free memory minus 24 GiB (minus 1 GiB per stream over 8), capped at 90 GiB. The pinned
+pool is most of the footprint: with it the server uses ~110 GB of the Spark; with `KV_POOL_GB=0` the startup estimate
+is ~17 GiB (weights 7 GiB, DFlash2 drafter, workspace) and caches grow on demand. FP8 KV is 32 KiB/token, so a full
+262,144-token stream costs 8 GiB.
+
+**Full-context concurrency (measured with 0007).** A 257,010-token prompt was prefilled once (357 s), then sent N
+times at once with 5,126-token replies (each stream runs to 262,136 tokens, greedy; all answered the needle correctly):
+
+| Pool | `PARALLEL` | Sent | Ran at once | Per stream | Rest |
+|---|---:|---:|---:|---:|---|
+| 86 GiB (auto) | 14 | 12 | 9 | 6-13 tok/s | 3 waited for memory |
+| **92 GiB** | 12 | 11 | **10** | 5.6-11 tok/s | 1 waited |
+
+**Last successful: 10 concurrent full 262K streams** (`PARALLEL=12 KV_POOL_GB=92`, startup estimate 113.9 of 115.9
+GiB). The cached copy of the shared prompt takes one window, so 11 may fit with different prompts (not measured).
+The default `PARALLEL=8` serves 8 full windows with room to spare.
 
 ```bash
 ./start-bonsai-27b.sh
 THINKING=0 ./start-bonsai-27b.sh
 DRAFT_ID= ./start-bonsai-27b.sh                 # no drafts
 KV_POOL_GB=0 ./start-bonsai-27b.sh              # no pinned pool
+PARALLEL=12 KV_POOL_GB=92 ./start-bonsai-27b.sh # 10 full 262K streams
 ./stop-bonsai-27b.sh
 ```
 
-Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
+Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (default DFlash2; empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
 `FOREGROUND`, `PATCHES` (must remain 1 for CUDA), `KV_DTYPE`, `KV_POOL_GB`, `MEMORY_RESERVE_GIB`, `PARALLEL`,
 `CONTEXT`, `PREFILL_FP8` (default 0), `CHECKPOINT_SLOTS`, `VISION`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`,
 `TOP_K`, `MIN_P`, plus any `TENSORFOLD_*` variable. They can also go in `.env.bonsai-27b`; environment variables win.
@@ -457,19 +484,23 @@ gap. Concurrent full-context streams were not measured for Flash Next.
 
 ### Ternary-Bonsai-2-27B (`start-bonsai-27b.sh`)
 
-Throughput, 200-token replies, `--parallel 8`, fp8 KV, with patch 0006. The 27B column ran the same script on the same
-day with its preset (DFlash2), so it is directly comparable (the table above used a slightly different script).
+Throughput, 200-token replies (`ignore_eos`), `--parallel 8`, fp8 KV, default pool; 0007 and the 0006 path
+(`TENSORFOLD_BONSAI_PQ2=0`) measured back to back with the same script:
 
-| Clients | Prose: Bonsai + DFlash2 | Prose: Bonsai, no drafts | Prose: 27B + DFlash2 | Code: Bonsai + DFlash2 | Code: Bonsai, no drafts | Code: 27B + DFlash2 |
+| Clients | Prose: 0007 + DFlash2 | Prose: 0006 + DFlash2 | Prose: 0007, no drafts | Code: 0007 + DFlash2 | Code: 0006 + DFlash2 | Code: 0007, no drafts |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 41.5 | 21.7 | 35.8 | 81.3 | 21.7 | 84.9 |
-| 2 | 73.0 | 40.7 | 63.2 | 127.9 | 40.9 | 152.3 |
-| 4 | 117.2 | 74.2 | 104.7 | 204.9 | 74.3 | 246.4 |
-| 8 | 173.5 | 123.5 | 175.8 | 291.9 | 123.5 | 398.4 |
+| 1 | 44.2 | 48.4 | 26.3 | 87.6 | 79.8 | 26.3 |
+| 2 | 86.3 | 83.4 | 47.8 | 148.3 | 133.4 | 48.0 |
+| 4 | 134.1 | 137.1 | 88.0 | 234.9 | 219.7 | 87.6 |
+| 8 | 195.8 | 204.4 | 142.3 | 308.9 | 294.9 | 143.0 |
 
-Bonsai beats the 27B on prose at 1-4 clients and ties at 8. On code the 27B pulls ahead: DFlash2 was trained on the
-27B, so it accepts fewer Bonsai tokens, and large verification batches are compute-bound, where 2-bit weights don't
-help. Before 0006 Bonsai decoded at ~1.3 tok/s. A 23,349-token prompt prefilled in 19 s (~1,230 tok/s).
+Host memory in use while serving: 112 GB with 0007 vs 119 GB with 0006 (same 90 GiB pool). Without drafts 0007
+decodes at 26.3 tok/s single-stream (0006: ~21.7, 0005: ~1.3). Drafted prose varies by a few percent between runs
+because PQ2's exact fp16 scales change a few tokens, and with them the acceptance rate.
+
+Earlier comparison against Qwen3.8-27B + DFlash2 with 0006 (a different script, without `ignore_eos`): Bonsai beat
+the 27B on prose at 1-4 clients and tied at 8; the 27B led on code at higher concurrency (DFlash2 is trained on the
+27B, and large verification batches are compute-bound).
 
 ## Updating
 

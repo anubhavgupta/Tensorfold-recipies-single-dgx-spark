@@ -2,7 +2,8 @@
 # Serve prism-ml/Ternary-Bonsai-2-27B-mlx-2bit with stock TensorFold v0.6.5 plus the patch chain in
 # patches/bonsai-27b. The first four patches are the Ternary-Bonsai-2-27B capacity patches (FP8 KV, video/media limits,
 # reserve 0, pinned KV pool); 0005 adds Bonsai's CUDA loader for Prism's rotated 2-bit group-128 Hadamard pack;
-# 0006 makes it fast (fast 4-bit lane kernels for the ternary codes, 2-bit decode reads, a fused Hadamard kernel).
+# 0006 makes it fast (fast lane kernels for the ternary codes, 2-bit decode reads, a fused Hadamard kernel); 0007 keeps
+# one 2.125-bit PQ2 copy of the weights (~7 GiB) read by decode and prefill, and fuses the rotations into producers.
 # The plain stock image has Bonsai metadata/MLX support but no CUDA serving path for this checkpoint, so PATCHES=1
 # is required here.
 #

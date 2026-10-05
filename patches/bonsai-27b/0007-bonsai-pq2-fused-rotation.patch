@@ -1,0 +1,2560 @@
+--- tensorfold/cuda/kernels/prism_rot.cpp
++++ tensorfold/cuda/kernels/prism_rot.cpp
+@@ -0,0 +1,59 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void prism_rotate_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, bool);
++void prism_rmsnorm_rotate_cuda(const at::Tensor&, const c10::optional<at::Tensor>&, const at::Tensor&, const at::Tensor&, at::Tensor&, const c10::optional<at::Tensor>&, double);
++void prism_silu_mul_rotate_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&);
++void prism_quantize_rows_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t);
++
++static int64_t rows_of(const at::Tensor& x) { return x.numel() / x.size(-1); }
++
++void check_x(const at::Tensor& x, const at::Tensor& signs) {
++    TORCH_CHECK(x.is_cuda() && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat || x.scalar_type() == at::kHalf), "x CUDA bf16/fp32/fp16");
++    TORCH_CHECK(x.dim() >= 2 && x.size(-1) % 1024 == 0, "last dim must be a multiple of 1024");
++    TORCH_CHECK(x.stride(-1) == 1, "last dim contiguous");
++    TORCH_CHECK(signs.is_cuda() && signs.is_contiguous() && signs.scalar_type() == at::kFloat && signs.numel() == x.size(-1), "signs: contiguous CUDA fp32 matching K");
++}
++
++void rotate(const at::Tensor& x, const at::Tensor& signs, at::Tensor& out, bool inverse) {
++    check_x(x, signs);
++    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16 && out.sizes() == x.sizes() && out.is_contiguous(), "out: contiguous bf16 same shape");
++    c10::cuda::CUDAGuard guard(x.device());
++    prism_rotate_cuda(x, signs, out, inverse);
++}
++
++void rmsnorm_rotate(const at::Tensor& x, const c10::optional<at::Tensor>& residual, const at::Tensor& w,
++                    double eps, const at::Tensor& signs, at::Tensor& out, const c10::optional<at::Tensor>& h) {
++    check_x(x, signs);
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kFloat && w.numel() == x.size(-1), "norm weight fp32 CUDA K");
++    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16 && out.sizes() == x.sizes() && out.is_contiguous(), "out: contiguous bf16 same shape");
++    if (residual.has_value()) TORCH_CHECK((*residual).is_cuda() && (*residual).sizes() == x.sizes() && (*residual).stride(-1) == 1, "residual same CUDA shape");
++    if (h.has_value()) TORCH_CHECK((*h).is_cuda() && (*h).scalar_type() == at::kBFloat16 && (*h).sizes() == x.sizes() && (*h).is_contiguous(), "h: contiguous bf16 same shape");
++    c10::cuda::CUDAGuard guard(x.device());
++    prism_rmsnorm_rotate_cuda(x, residual, w, signs, out, h, eps);
++}
++
++void silu_mul_rotate(const at::Tensor& gate, const at::Tensor& up, const at::Tensor& signs, at::Tensor& out) {
++    check_x(gate, signs);
++    TORCH_CHECK(up.is_cuda() && up.sizes() == gate.sizes() && up.stride(-1) == 1 && up.scalar_type() == gate.scalar_type(), "up same shape/dtype as gate");
++    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16 && out.sizes() == gate.sizes() && out.is_contiguous(), "out: contiguous bf16 same shape");
++    c10::cuda::CUDAGuard guard(gate.device());
++    prism_silu_mul_rotate_cuda(gate, up, signs, out);
++}
++
++void quantize_rows(const at::Tensor& x, at::Tensor& x8, at::Tensor& xs, at::Tensor& a, int64_t gs) {
++    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat) && x.dim() == 2, "x contiguous CUDA rows");
++    TORCH_CHECK(x.size(1) % gs == 0 && x.size(1) % 32 == 0, "K multiple of gs and 32");
++    TORCH_CHECK(x8.is_cuda() && x8.is_contiguous() && x8.scalar_type() == at::kByte && x8.sizes() == x.sizes(), "x8 uint8 same shape");
++    TORCH_CHECK(xs.is_cuda() && xs.is_contiguous() && xs.scalar_type() == at::kBFloat16 && xs.size(0) == x.size(0) && xs.size(1) == x.size(1) / gs, "xs bf16 (M,K/gs)");
++    TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.scalar_type() == at::kFloat && a.numel() == x.size(0), "a fp32 (M,)");
++    c10::cuda::CUDAGuard guard(x.device());
++    prism_quantize_rows_cuda(x, x8, xs, a, gs);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("rotate", &rotate);
++    m.def("rmsnorm_rotate", &rmsnorm_rotate);
++    m.def("silu_mul_rotate", &silu_mul_rotate);
++    m.def("quantize_rows", &quantize_rows);
++}
+--- tensorfold/cuda/kernels/prism_rot.cu
++++ tensorfold/cuda/kernels/prism_rot.cu
+@@ -0,0 +1,245 @@
++#include <cuda.h>
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp8.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <torch/extension.h>
++#include <stdint.h>
++
++namespace {
++constexpr int BLOCK = 1024;
++constexpr int THREADS = 256;
++
++template <typename T> __device__ __forceinline__ float load_as_float(const T *p) { return static_cast<float>(*p); }
++template <> __device__ __forceinline__ float load_as_float<__nv_bfloat16>(const __nv_bfloat16 *p) { return __bfloat162float(*p); }
++template <> __device__ __forceinline__ float load_as_float<half>(const half *p) { return __half2float(*p); }
++
++__device__ __forceinline__ __nv_bfloat16 bf16_rn(float x) { return __float2bfloat16_rn(x); }
++
++__device__ __forceinline__ void fwht_shared_1024(float *s) {
++    __syncthreads();
++#pragma unroll 1
++    for (int h = 1; h < BLOCK; h <<= 1) {
++        for (int idx = threadIdx.x; idx < BLOCK / 2; idx += blockDim.x) {
++            int j = (idx / h) * (2 * h) + (idx % h);
++            float a = s[j];
++            float b = s[j + h];
++            s[j] = a + b;
++            s[j + h] = a - b;
++        }
++        __syncthreads();
++    }
++}
++
++template <typename T, bool INVERSE>
++__global__ void rotate_kernel(const T *__restrict__ x, const float *__restrict__ signs,
++                              __nv_bfloat16 *__restrict__ out, int64_t rows, int K, int64_t ldx) {
++    __shared__ float s[BLOCK];
++    int64_t bid = blockIdx.x;
++    int64_t row = bid / (K / BLOCK);
++    int blk = bid - row * (K / BLOCK);
++    if (row >= rows) return;
++    int base = blk * BLOCK;
++    for (int i = threadIdx.x; i < BLOCK; i += blockDim.x) {
++        float v = load_as_float(reinterpret_cast<const T *>(x) + row * ldx + base + i);
++        float sg = signs[base + i];
++        s[i] = INVERSE ? v : v * sg;
++    }
++    fwht_shared_1024(s);
++    for (int i = threadIdx.x; i < BLOCK; i += blockDim.x) {
++        float v = s[i] * (1.0f / 32.0f);
++        if constexpr (INVERSE) v *= signs[base + i];
++        out[row * (int64_t)K + base + i] = bf16_rn(v);
++    }
++}
++
++template <typename T, typename R, bool HAS_R, bool STORE_H>
++__global__ void rmsnorm_rotate_kernel(const T *__restrict__ x, const R *__restrict__ r, const float *__restrict__ w,
++                                      const float *__restrict__ signs, __nv_bfloat16 *__restrict__ out,
++                                      __nv_bfloat16 *__restrict__ h_out, int64_t rows, int D, int64_t ldx,
++                                      int64_t ldr, float eps) {
++    __shared__ float smem[BLOCK];
++    __shared__ float sums[THREADS / 32];
++    __shared__ float inv_s;
++    int64_t row = blockIdx.x;
++    if (row >= rows) return;
++    float local = 0.0f;
++    for (int i = threadIdx.x; i < D; i += blockDim.x) {
++        float v = load_as_float(reinterpret_cast<const T *>(x) + row * ldx + i);
++        if constexpr (HAS_R) {
++            float rv = load_as_float(reinterpret_cast<const R *>(r) + row * ldr + i);
++            __nv_bfloat16 hb = bf16_rn(v + rv);
++            if constexpr (STORE_H) h_out[row * (int64_t)D + i] = hb;
++            v = __bfloat162float(hb);
++        }
++        local += v * v;
++    }
++    // warp/block reduction, deterministic enough because the reference uses one Triton program-wide reduction.
++    for (int off = 16; off > 0; off >>= 1) local += __shfl_down_sync(0xffffffff, local, off);
++    if ((threadIdx.x & 31) == 0) sums[threadIdx.x >> 5] = local;
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        float v = threadIdx.x < (blockDim.x / 32) ? sums[threadIdx.x] : 0.0f;
++        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
++        if (threadIdx.x == 0) inv_s = rsqrtf(v / (float)D + eps);
++    }
++    __syncthreads();
++    for (int blk = 0; blk < D / BLOCK; ++blk) {
++        int base = blk * BLOCK;
++        for (int i = threadIdx.x; i < BLOCK; i += blockDim.x) {
++            float v = load_as_float(reinterpret_cast<const T *>(x) + row * ldx + base + i);
++            if constexpr (HAS_R) {
++                float rv = load_as_float(reinterpret_cast<const R *>(r) + row * ldr + base + i);
++                v = __bfloat162float(bf16_rn(v + rv));
++            }
++            float y = __bfloat162float(bf16_rn(v * inv_s * w[base + i]));
++            smem[i] = y * signs[base + i];
++        }
++        fwht_shared_1024(smem);
++        for (int i = threadIdx.x; i < BLOCK; i += blockDim.x) {
++            out[row * (int64_t)D + base + i] = bf16_rn(smem[i] * (1.0f / 32.0f));
++        }
++        __syncthreads();
++    }
++}
++
++template <typename G, typename U>
++__global__ void silu_mul_rotate_kernel(const G *__restrict__ gate, const U *__restrict__ up,
++                                       const float *__restrict__ signs, __nv_bfloat16 *__restrict__ out,
++                                       int64_t rows, int K, int64_t ldg, int64_t ldu) {
++    __shared__ float s[BLOCK];
++    int64_t bid = blockIdx.x;
++    int64_t row = bid / (K / BLOCK);
++    int blk = bid - row * (K / BLOCK);
++    if (row >= rows) return;
++    int base = blk * BLOCK;
++    for (int i = threadIdx.x; i < BLOCK; i += blockDim.x) {
++        float g = load_as_float(reinterpret_cast<const G *>(gate) + row * ldg + base + i);
++        float u = load_as_float(reinterpret_cast<const U *>(up) + row * ldu + base + i);
++        float a = __bfloat162float(bf16_rn((g / (1.0f + expf(-g))) * u));
++        s[i] = a * signs[base + i];
++    }
++    fwht_shared_1024(s);
++    for (int i = threadIdx.x; i < BLOCK; i += blockDim.x) out[row * (int64_t)K + base + i] = bf16_rn(s[i] * (1.0f / 32.0f));
++}
++
++template <typename T>
++__global__ void quantize_rows_kernel(const T *__restrict__ x, uint8_t *__restrict__ x8, __nv_bfloat16 *__restrict__ xs,
++                                     float *__restrict__ aout, int64_t rows, int K, int GS) {
++    __shared__ float shared[THREADS / 32];
++    __shared__ float a_s;
++    int64_t row = blockIdx.x;
++    if (row >= rows) return;
++    float m = 0.0f;
++    for (int i = threadIdx.x; i < K; i += blockDim.x) {
++        float v = load_as_float(reinterpret_cast<const T *>(x) + row * (int64_t)K + i);
++        m = fmaxf(m, fabsf(v));
++    }
++    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
++    if ((threadIdx.x & 31) == 0) shared[threadIdx.x >> 5] = m;
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        float v = threadIdx.x < (blockDim.x / 32) ? shared[threadIdx.x] : 0.0f;
++        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
++        if (threadIdx.x == 0) {
++            a_s = v > 0.0f ? v * (1.0f / 448.0f) : 1.0f;
++            aout[row] = a_s;
++        }
++    }
++    __syncthreads();
++    float a = a_s;
++    for (int g = threadIdx.x; g < K / GS; g += blockDim.x) {
++        float sum = 0.0f;
++        for (int j = 0; j < GS; ++j) sum += load_as_float(reinterpret_cast<const T *>(x) + row * (int64_t)K + g * GS + j);
++        xs[row * (int64_t)(K / GS) + g] = bf16_rn(sum / a);
++    }
++    for (int k0 = 0; k0 < K; k0 += 256) {
++        for (int mm = threadIdx.x; mm < 256 && k0 + mm < K; mm += blockDim.x) {
++            int j = mm & 3;
++            int src = (mm / 32) * 32 + ((mm % 32) / 16) * 16 + ((mm % 16) / 4) * 2 + (j & 1) + (j / 2) * 8;
++            float v = load_as_float(reinterpret_cast<const T *>(x) + row * (int64_t)K + k0 + src) / a;
++            __nv_fp8_e4m3 q(v);
++            x8[row * (int64_t)K + k0 + mm] = *reinterpret_cast<uint8_t *>(&q);
++        }
++    }
++}
++
++template <typename scalar_t, bool INV>
++void launch_rotate_t(const at::Tensor& x, const at::Tensor& signs, at::Tensor& out) {
++    const int64_t rows = x.numel() / x.size(-1);
++    const int K = static_cast<int>(x.size(-1));
++    if (rows == 0) return;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    rotate_kernel<scalar_t, INV><<<dim3(rows * (K / BLOCK)), dim3(THREADS), 0, stream>>>(
++        reinterpret_cast<const scalar_t *>(x.data_ptr()), signs.data_ptr<float>(), reinterpret_cast<__nv_bfloat16 *>(out.data_ptr()),
++        rows, K, x.stride(-2));
++}
++
++template <typename T, typename R, bool HAS_R, bool STORE_H>
++void launch_rms_t(const at::Tensor& x, const at::Tensor& r, const at::Tensor& w, const at::Tensor& signs,
++                  at::Tensor& out, at::Tensor& h, float eps) {
++    int64_t rows = x.numel() / x.size(-1);
++    if (rows == 0) return;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    rmsnorm_rotate_kernel<T, R, HAS_R, STORE_H><<<dim3(rows), dim3(THREADS), 0, stream>>>(
++        reinterpret_cast<const T *>(x.data_ptr()), reinterpret_cast<const R *>(r.defined() ? r.data_ptr() : x.data_ptr()),
++        w.data_ptr<float>(), signs.data_ptr<float>(), reinterpret_cast<__nv_bfloat16 *>(out.data_ptr()),
++        reinterpret_cast<__nv_bfloat16 *>(h.defined() ? h.data_ptr() : out.data_ptr()), rows, static_cast<int>(x.size(-1)),
++        x.stride(-2), r.defined() ? r.stride(-2) : x.stride(-2), eps);
++}
++
++template <typename G, typename U>
++void launch_silu_t(const at::Tensor& g, const at::Tensor& u, const at::Tensor& signs, at::Tensor& out) {
++    int64_t rows = g.numel() / g.size(-1);
++    if (rows == 0) return;
++    int K = static_cast<int>(g.size(-1));
++    auto stream = at::cuda::getCurrentCUDAStream();
++    silu_mul_rotate_kernel<G, U><<<dim3(rows * (K / BLOCK)), dim3(THREADS), 0, stream>>>(
++        reinterpret_cast<const G *>(g.data_ptr()), reinterpret_cast<const U *>(u.data_ptr()), signs.data_ptr<float>(),
++        reinterpret_cast<__nv_bfloat16 *>(out.data_ptr()), rows, K, g.stride(-2), u.stride(-2));
++}
++} // namespace
++
++void prism_rotate_cuda(const at::Tensor& x, const at::Tensor& signs, at::Tensor& out, bool inverse) {
++    if (x.scalar_type() == at::kBFloat16) {
++        inverse ? launch_rotate_t<__nv_bfloat16, true>(x, signs, out) : launch_rotate_t<__nv_bfloat16, false>(x, signs, out);
++    } else if (x.scalar_type() == at::kHalf) {
++        inverse ? launch_rotate_t<half, true>(x, signs, out) : launch_rotate_t<half, false>(x, signs, out);
++    } else if (x.scalar_type() == at::kFloat) {
++        inverse ? launch_rotate_t<float, true>(x, signs, out) : launch_rotate_t<float, false>(x, signs, out);
++    }
++}
++
++void prism_rmsnorm_rotate_cuda(const at::Tensor& x, const c10::optional<at::Tensor>& residual, const at::Tensor& w,
++                               const at::Tensor& signs, at::Tensor& out, const c10::optional<at::Tensor>& h,
++                               double eps) {
++#define DISPATCH_R(XT, RT, HAS, STORE) launch_rms_t<XT, RT, HAS, STORE>(x, residual.has_value()?*residual:at::Tensor(), w, signs, out, const_cast<at::Tensor&>(h.has_value()?*h:out), static_cast<float>(eps))
++    bool store = h.has_value();
++    if (!residual.has_value()) {
++        if (x.scalar_type() == at::kBFloat16) { if (store) DISPATCH_R(__nv_bfloat16, __nv_bfloat16, false, true); else DISPATCH_R(__nv_bfloat16, __nv_bfloat16, false, false); }
++        else if (x.scalar_type() == at::kHalf) { if (store) DISPATCH_R(half, half, false, true); else DISPATCH_R(half, half, false, false); }
++        else if (x.scalar_type() == at::kFloat) { if (store) DISPATCH_R(float, float, false, true); else DISPATCH_R(float, float, false, false); }
++    } else {
++        const at::Tensor& r = *residual;
++        if (x.scalar_type() == at::kBFloat16 && r.scalar_type() == at::kBFloat16) { if (store) DISPATCH_R(__nv_bfloat16, __nv_bfloat16, true, true); else DISPATCH_R(__nv_bfloat16, __nv_bfloat16, true, false); }
++        else if (x.scalar_type() == at::kBFloat16 && r.scalar_type() == at::kFloat) { if (store) DISPATCH_R(__nv_bfloat16, float, true, true); else DISPATCH_R(__nv_bfloat16, float, true, false); }
++        else if (x.scalar_type() == at::kFloat && r.scalar_type() == at::kBFloat16) { if (store) DISPATCH_R(float, __nv_bfloat16, true, true); else DISPATCH_R(float, __nv_bfloat16, true, false); }
++        else if (x.scalar_type() == at::kFloat && r.scalar_type() == at::kFloat) { if (store) DISPATCH_R(float, float, true, true); else DISPATCH_R(float, float, true, false); }
++        else if (x.scalar_type() == at::kHalf && r.scalar_type() == at::kHalf) { if (store) DISPATCH_R(half, half, true, true); else DISPATCH_R(half, half, true, false); }
++    }
++#undef DISPATCH_R
++}
++
++void prism_silu_mul_rotate_cuda(const at::Tensor& gate, const at::Tensor& up, const at::Tensor& signs, at::Tensor& out) {
++    if (gate.scalar_type() == at::kBFloat16 && up.scalar_type() == at::kBFloat16) launch_silu_t<__nv_bfloat16, __nv_bfloat16>(gate, up, signs, out);
++    else if (gate.scalar_type() == at::kFloat && up.scalar_type() == at::kFloat) launch_silu_t<float, float>(gate, up, signs, out);
++    else if (gate.scalar_type() == at::kHalf && up.scalar_type() == at::kHalf) launch_silu_t<half, half>(gate, up, signs, out);
++}
++
++void prism_quantize_rows_cuda(const at::Tensor& x, at::Tensor& x8, at::Tensor& xs, at::Tensor& a, int64_t gs) {
++    int64_t rows = x.size(0); if (rows == 0) return;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    if (x.scalar_type() == at::kBFloat16) quantize_rows_kernel<__nv_bfloat16><<<dim3(rows), dim3(THREADS), 0, stream>>>(reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr()), x8.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16 *>(xs.data_ptr()), a.data_ptr<float>(), rows, static_cast<int>(x.size(1)), static_cast<int>(gs));
++    else if (x.scalar_type() == at::kFloat) quantize_rows_kernel<float><<<dim3(rows), dim3(THREADS), 0, stream>>>(x.data_ptr<float>(), x8.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16 *>(xs.data_ptr()), a.data_ptr<float>(), rows, static_cast<int>(x.size(1)), static_cast<int>(gs));
++}
+--- tensorfold/cuda/kernels/prism_rot.py
++++ tensorfold/cuda/kernels/prism_rot.py
+@@ -0,0 +1,312 @@
++from __future__ import annotations
++
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_prism_rot_v1", sources=[str(here / "prism_rot.cpp"), str(here / "prism_rot.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def _shape(x: torch.Tensor) -> tuple[int, int]:
++    if x.dim() < 2:
++        raise ValueError("expected at least 2-D tensor with rows in the last dimension")
++    return x.numel() // x.shape[-1], int(x.shape[-1])
++
++
++def _out(x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
++    return torch.empty_like(x, dtype=torch.bfloat16, memory_format=torch.contiguous_format) if out is None else out
++
++
++def rotate(x: torch.Tensor, signs: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
++    y = _out(x, out)
++    _ext().rotate(x.contiguous() if x.stride(-1) != 1 else x, signs.to(device=x.device, dtype=torch.float32).contiguous(), y, False)
++    return y
++
++
++def inverse(x: torch.Tensor, signs: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
++    y = _out(x, out)
++    _ext().rotate(x.contiguous() if x.stride(-1) != 1 else x, signs.to(device=x.device, dtype=torch.float32).contiguous(), y, True)
++    return y
++
++
++def rmsnorm_rotate(x: torch.Tensor, norm_weight: torch.Tensor, eps: float, signs: torch.Tensor,
++                   residual: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
++                   h_out: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++    y = _out(x, out)
++    w = norm_weight.to(device=x.device, dtype=torch.float32).contiguous()
++    s = signs.to(device=x.device, dtype=torch.float32).contiguous()
++    xx = x.contiguous() if x.stride(-1) != 1 else x
++    rr = None if residual is None else (residual.contiguous() if residual.stride(-1) != 1 else residual)
++    _ext().rmsnorm_rotate(xx, rr, w, float(eps), s, y, h_out)
++    return (h_out, y) if h_out is not None else y
++
++
++def silu_mul_rotate(gate: torch.Tensor, up: torch.Tensor, signs: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
++    y = _out(gate, out)
++    g = gate.contiguous() if gate.stride(-1) != 1 else gate
++    u = up.contiguous() if up.stride(-1) != 1 else up
++    _ext().silu_mul_rotate(g, u, signs.to(device=gate.device, dtype=torch.float32).contiguous(), y)
++    return y
++
++
++def quantize_rows(x: torch.Tensor, gs: int = 64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    if x.dim() != 2:
++        raise ValueError("quantize_rows expects a 2-D contiguous row tensor")
++    x = x.contiguous()
++    m, k = x.shape
++    x8 = torch.empty((m, k), dtype=torch.uint8, device=x.device)
++    xs = torch.empty((m, k // gs), dtype=torch.bfloat16, device=x.device)
++    a = torch.empty((m,), dtype=torch.float32, device=x.device)
++    _ext().quantize_rows(x, x8, xs, a, int(gs))
++    return x8, xs, a
++
++
++def rotate_quantize_rows(x: torch.Tensor, signs: torch.Tensor, gs: int = 64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    # Exact public path: reuse TensorFold's Triton fragment quantizer after the CUDA FWHT.
++    # The CUDA quantizer binding above is kept for experimentation, but can differ by 1 FP8 code on ties.
++    from tensorfold.cuda.kernels import qmm
++
++    return qmm.quantize_rows(rotate(x, signs), gs)
++
++# Exact Triton fusions. These mirror tensorfold.families.qwen3_5.cuda.glue and
++# tensorfold.cuda.kernels.qmm producer arithmetic, then append the Bonsai FWHT
++# butterfly from tensorfold.families.bonsai.cuda._fwht.
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _fwht1024(v):
++    for stage in tl.static_range(10):
++        v = tl.reshape(v, (512 >> stage, 2, 1 << stage))
++        a, b = tl.split(tl.permute(v, (0, 2, 1)))
++        v = tl.reshape(tl.permute(tl.join(a + b, a - b), (0, 2, 1)), (1024,))
++    return v
++
++
++@triton.jit
++def _store_xs(Y, XS, row, blk: tl.constexpr, K: tl.constexpr, GS: tl.constexpr):
++    yg = tl.reshape(Y.to(tl.float32), (1024 // GS, GS))
++    g = tl.arange(0, 1024 // GS)
++    tl.store(XS + row * (K // GS) + blk * (1024 // GS) + g, tl.sum(yg, axis=1))
++
++
++@triton.jit
++def _add_rmsnorm_rotate(X, R, W, S, H, Y, XS, eps, D: tl.constexpr, BLOCKD: tl.constexpr,
++                        HAS_R: tl.constexpr, STORE_H: tl.constexpr, GS: tl.constexpr):
++    row = tl.program_id(0)
++    blk = tl.program_id(1)
++    offs = tl.arange(0, BLOCKD)
++    ok = offs < D
++    x = tl.load(X + row * D + offs, mask=ok, other=0.0).to(tl.float32)
++    if HAS_R:
++        r = tl.load(R + row * D + offs, mask=ok, other=0.0).to(tl.float32)
++        h = (x + r).to(tl.bfloat16)
++        if STORE_H:
++            tl.store(H + row * D + offs, h, mask=ok)
++        x = h.to(tl.float32)
++    ss = tl.sum(x * x, axis=0)
++    inv = 1.0 / tl.sqrt(ss / D + eps)
++    i = blk * 1024 + tl.arange(0, 1024)
++    xb = tl.load(X + row * D + i).to(tl.float32)
++    if HAS_R:
++        rb = tl.load(R + row * D + i).to(tl.float32)
++        xb = (xb + rb).to(tl.bfloat16).to(tl.float32)
++    wb = tl.load(W + i).to(tl.float32)
++    y = (xb * inv * wb).to(tl.bfloat16).to(tl.float32) * tl.load(S + i)
++    out = (_fwht1024(y) * (1.0 / 32.0)).to(tl.bfloat16)
++    tl.store(Y + row * D + i, out)
++    _store_xs(out, XS, row, blk, D, GS)
++
++
++@triton.jit
++def _swiglu_rotate(GATE, UP, S, OUT, XS, N: tl.constexpr, GS: tl.constexpr):
++    row = tl.program_id(0)
++    blk = tl.program_id(1)
++    offs = blk * 1024 + tl.arange(0, 1024)
++    g = tl.load(GATE + row * N + offs).to(tl.float32)
++    u = tl.load(UP + row * N + offs).to(tl.float32)
++    a = (g * tl.sigmoid(g) * u).to(tl.bfloat16).to(tl.float32) * tl.load(S + offs)
++    out = (_fwht1024(a) * (1.0 / 32.0)).to(tl.bfloat16)
++    tl.store(OUT + row * N + offs, out)
++    _store_xs(out, XS, row, blk, N, GS)
++
++
++@triton.jit
++def _gate_mul_rotate(O, QG, S, OUT, XS, H: tl.constexpr, D: tl.constexpr, GS: tl.constexpr):
++    row = tl.program_id(0)
++    blk = tl.program_id(1)
++    k = blk * 1024 + tl.arange(0, 1024)
++    head = k // D
++    d = k - head * D
++    o = tl.load(O + (row * H + head) * D + d).to(tl.float32)
++    g = tl.load(QG + (row * H + head) * 2 * D + D + d).to(tl.float32)
++    a = (o * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32) * tl.load(S + k)
++    out = (_fwht1024(a) * (1.0 / 32.0)).to(tl.bfloat16)
++    tl.store(OUT + row * (H * D) + k, out)
++    _store_xs(out, XS, row, blk, H * D, GS)
++
++
++@triton.jit
++def _gated_norm_rotate(YR, Z, W, S, OUT, XS, eps, VH: tl.constexpr, DV: tl.constexpr, GS: tl.constexpr):
++    row = tl.program_id(0)
++    blk = tl.program_id(1)
++    d = tl.arange(0, DV)
++    # 1024 Bonsai block == 8 value heads when DV=128.
++    heads = blk * (1024 // DV) + tl.arange(0, 1024 // DV)
++    y = tl.load(YR + (row * VH + heads[:, None]) * DV + d[None, :]).to(tl.float32)
++    z = tl.load(Z + (row * VH + heads[:, None]) * DV + d[None, :]).to(tl.float32)
++    ww = tl.load(W + d).to(tl.float32)
++    yn = y * (1.0 / tl.sqrt(tl.sum(y * y, axis=1) / DV + eps))[:, None] * ww[None, :]
++    prod = (z * tl.sigmoid(z) * yn).to(tl.bfloat16)
++    flat = tl.reshape(prod, (1024,)).to(tl.float32)
++    k = blk * 1024 + tl.arange(0, 1024)
++    out = (_fwht1024(flat * tl.load(S + k)) * (1.0 / 32.0)).to(tl.bfloat16)
++    tl.store(OUT + row * (VH * DV) + k, out)
++    _store_xs(out, XS, row, blk, VH * DV, GS)
++
++
++@triton.jit
++def _rotate_quantize_rows(X, S, X8, XS, A, K: tl.constexpr, GS: tl.constexpr):
++    row = tl.program_id(0)
++    offs = tl.arange(0, 1024)
++    # First pass: exact Bonsai FWHT per 1024 block; reduce max across the row.
++    top = tl.full((), 0.0, tl.float32)
++    for blk in tl.static_range(0, K // 1024):
++        k = blk * 1024 + offs
++        x = tl.load(X + row * K + k).to(tl.float32) * tl.load(S + k)
++        r = (_fwht1024(x) * (1.0 / 32.0)).to(tl.bfloat16).to(tl.float32)
++        top = tl.maximum(top, tl.max(tl.abs(r), axis=0))
++    a = tl.where(top > 0.0, top / 448.0, 1.0)
++    tl.store(A + row, a)
++    # Second pass: recompute and emit qmm.quantize_rows' exact fragment order and group sums.
++    for blk in tl.static_range(0, K // 1024):
++        k = blk * 1024 + offs
++        r = _fwht1024(tl.load(X + row * K + k).to(tl.float32) * tl.load(S + k)) * (1.0 / 32.0)
++        # group sums and FP8 codes over bf16 rotated row, matching quantize_rows(rotate(...)).
++        rb = r.to(tl.bfloat16).to(tl.float32)
++        rg = tl.reshape(rb, (1024 // GS, GS))
++        gi = blk * (1024 // GS) + tl.arange(0, 1024 // GS)
++        tl.store(XS + row * (K // GS) + gi, (tl.sum(rg, axis=1) / a).to(tl.bfloat16))
++        idx = offs
++        p = idx % 256
++        b32 = p // 32
++        rem = p - b32 * 32
++        hi16 = rem // 16
++        rest = rem - hi16 * 16
++        half = rest // 8
++        rest2 = rest - half * 8
++        pair = rest2 // 2
++        bit = rest2 - pair * 2
++        m = b32 * 32 + hi16 * 16 + pair * 4 + bit + half * 2
++        chunk = idx // 256
++        q = (rb / a).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++        tl.store(X8 + row * K + blk * 1024 + chunk * 256 + m, q)
++
++
++def add_rmsnorm_rotate(x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor, eps: float,
++                       signs: torch.Tensor, *, out: torch.Tensor | None = None,
++                       h_out: torch.Tensor | None = None, gs: int = 64, return_xs: bool = True):
++    rows, d = x.shape
++    y = torch.empty_like(x, dtype=torch.bfloat16) if out is None else out
++    h = (torch.empty_like(x, dtype=torch.bfloat16) if residual is not None and h_out is None else h_out)
++    xs = torch.empty((rows, d // gs), dtype=torch.float32, device=x.device)
++    block = triton.next_power_of_2(d)
++    _add_rmsnorm_rotate[(rows, d // 1024)](x, residual if residual is not None else x,
++                                           weight, signs, h if h is not None else y, y, xs, eps,
++                                           D=d, BLOCKD=block, HAS_R=residual is not None,
++                                           STORE_H=h is not None, GS=gs,
++                                           num_warps=8)
++    if return_xs:
++        from tensorfold.cuda.kernels import qmm
++        xs = qmm.group_sums(y, gs)
++    return (h if h is not None else x), y, xs if return_xs else None
++
++
++def swiglu_rotate(gate: torch.Tensor, up: torch.Tensor, signs: torch.Tensor, *, out: torch.Tensor | None = None,
++                  gs: int = 64, return_xs: bool = True):
++    rows, n = gate.shape
++    y = torch.empty_like(gate, dtype=torch.bfloat16) if out is None else out
++    xs = torch.empty((rows, n // gs), dtype=torch.float32, device=gate.device)
++    _swiglu_rotate[(rows, n // 1024)](gate, up, signs, y, xs, N=n, GS=gs, num_warps=4)
++    if return_xs:
++        from tensorfold.cuda.kernels import qmm
++        xs = qmm.group_sums(y, gs)
++    return y, xs if return_xs else None
++
++
++def gate_mul_rotate(o: torch.Tensor, qg: torch.Tensor, signs: torch.Tensor, *, heads: int, head_dim: int,
++                    out: torch.Tensor | None = None, gs: int = 64, return_xs: bool = True):
++    rows = o.shape[0]
++    k = heads * head_dim
++    y = torch.empty((rows, k), dtype=torch.bfloat16, device=o.device) if out is None else out
++    xs = torch.empty((rows, k // gs), dtype=torch.float32, device=o.device)
++    _gate_mul_rotate[(rows, k // 1024)](o, qg, signs, y, xs, H=heads, D=head_dim, GS=gs, num_warps=4)
++    if return_xs:
++        from tensorfold.cuda.kernels import qmm
++        xs = qmm.group_sums(y, gs)
++    return y, xs if return_xs else None
++
++
++def gated_norm_rotate(y: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, signs: torch.Tensor,
++                      *, out: torch.Tensor | None = None, gs: int = 64, return_xs: bool = True):
++    rows, vh, dv = y.shape
++    k = vh * dv
++    o = torch.empty((rows, k), dtype=torch.bfloat16, device=y.device) if out is None else out
++    xs = torch.empty((rows, k // gs), dtype=torch.float32, device=y.device)
++    _gated_norm_rotate[(rows, k // 1024)](y, z, weight, signs, o, xs, eps, VH=vh, DV=dv, GS=gs, num_warps=4)
++    if return_xs:
++        from tensorfold.cuda.kernels import qmm
++        xs = qmm.group_sums(o, gs)
++    return o, xs if return_xs else None
++
++
++def rotate_quantize_rows_triton(x: torch.Tensor, signs: torch.Tensor, gs: int = 64):
++    if x.dim() != 2:
++        raise ValueError("rotate_quantize_rows expects a 2-D row tensor")
++    x = x.contiguous()
++    m, k = x.shape
++    x8 = torch.empty((m, k), dtype=torch.uint8, device=x.device)
++    xs = torch.empty((m, k // gs), dtype=torch.bfloat16, device=x.device)
++    a = torch.empty((m,), dtype=torch.float32, device=x.device)
++    _rotate_quantize_rows[(m,)](x, signs, x8, xs, a, K=k, GS=gs, num_warps=4)
++    return x8, xs, a
++
++
++# Promote the exact single-kernel implementation to the public name requested by the integration plan.
++rotate_quantize_rows = rotate_quantize_rows_triton
++
++
++def add_rmsnorm_rotate_quantize(x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor, eps: float,
++                                signs: torch.Tensor, gs: int = 64):
++    h, y, _ = add_rmsnorm_rotate(x, residual, weight, eps, signs, gs=gs, return_xs=False)
++    from tensorfold.cuda.kernels import qmm
++    return h, qmm.quantize_rows(y, gs)
++
++
++def swiglu_rotate_quantize(gate: torch.Tensor, up: torch.Tensor, signs: torch.Tensor, gs: int = 64):
++    y, _ = swiglu_rotate(gate, up, signs, gs=gs, return_xs=False)
++    from tensorfold.cuda.kernels import qmm
++    return qmm.quantize_rows(y, gs)
++
++
++def gate_mul_rotate_quantize(o: torch.Tensor, qg: torch.Tensor, signs: torch.Tensor, *, heads: int, head_dim: int,
++                             gs: int = 64):
++    y, _ = gate_mul_rotate(o, qg, signs, heads=heads, head_dim=head_dim, gs=gs, return_xs=False)
++    from tensorfold.cuda.kernels import qmm
++    return qmm.quantize_rows(y, gs)
++
++
++def gated_norm_rotate_quantize(y: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float,
++                               signs: torch.Tensor, gs: int = 64):
++    out, _ = gated_norm_rotate(y, z, weight, eps, signs, gs=gs, return_xs=False)
++    from tensorfold.cuda.kernels import qmm
++    return qmm.quantize_rows(out, gs)
+--- tensorfold/cuda/kernels/qmm_tern.cpp
++++ tensorfold/cuda/kernels/qmm_tern.cpp
+@@ -0,0 +1,85 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void qmm_tern_pq2_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++                       const std::vector<at::Tensor>& scales, std::vector<at::Tensor>& outs,
++                       const std::vector<int64_t>& ns, const std::vector<int64_t>& sks, bool f32, int tile, int pdl);
++void qmm_tern_prefill_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, at::Tensor& out,
++                           int N, bool f32, int tile);
++void qmm_tern_prefill8_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
++                            const at::Tensor& scales, at::Tensor& out, int N, bool f32, int tile);
++
++void pq2_group(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++               const std::vector<at::Tensor>& scales, std::vector<at::Tensor> outs,
++               const std::vector<int64_t>& ns, const std::vector<int64_t>& sks, bool f32, int64_t tile, int64_t pdl) {
++    const size_t parts = ws.size();
++    TORCH_CHECK(parts >= 1 && parts <= 4 && scales.size() == parts && outs.size() == parts && ns.size() == parts &&
++                sks.size() == parts, "one to four PQ2 parts");
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
++                x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M, K) bf16 with contiguous rows");
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
++                "x rows must start on 16-byte boundaries");
++    const int64_t m = x.size(0), k = x.size(1), kg64 = k / 64, kg128 = k / 128;
++    TORCH_CHECK(k % 128 == 0 && xs.is_cuda() && xs.is_contiguous() && xs.scalar_type() == at::kFloat &&
++                xs.size(0) == m && xs.size(1) == kg64, "K multiple of 128; xs: (M, K/64) fp32");
++    for (size_t i = 0; i < parts; ++i) {
++        const int64_t n = ns[i], npad = (n + 127) / 128 * 128, sk = sks[i];
++        TORCH_CHECK(sk == 1 || sk == 2 || sk == 4 || sk == 8, "K split 1, 2, 4 or 8");
++        TORCH_CHECK(kg64 % sk == 0 && (kg64 / sk) % 2 == 0, "K splits into whole 128-groups per slice");
++        TORCH_CHECK(ws[i].is_cuda() && ws[i].is_contiguous() && ws[i].scalar_type() == at::kInt &&
++                    ws[i].numel() == npad * k / 16, "PQ2 lane weight does not match n and K");
++        TORCH_CHECK(scales[i].is_cuda() && scales[i].scalar_type() == at::kHalf && scales[i].dim() == 2 &&
++                    scales[i].stride(1) == 1 && scales[i].stride(0) >= npad && scales[i].size(0) == kg128 &&
++                    scales[i].size(1) == npad, "scales: fp16 (K/128, n padded to 128), rows may be strided");
++        TORCH_CHECK(outs[i].is_cuda() && outs[i].is_contiguous() && outs[i].size(0) == m && outs[i].size(1) == n &&
++                    outs[i].scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
++    }
++    c10::cuda::CUDAGuard guard(x.device());
++    qmm_tern_pq2_cuda(x, xs, ws, scales, outs, ns, sks, f32, static_cast<int>(tile), static_cast<int>(pdl));
++}
++
++
++void prefill_matmul(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, at::Tensor out,
++                    int64_t n, bool f32, int64_t tile) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
++                x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M, K) bf16 with contiguous rows");
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
++                "x rows must start on 16-byte boundaries");
++    const int64_t k = x.size(1), kg64 = k / 64, kg128 = k / 128, npad = (n + 127) / 128 * 128;
++    TORCH_CHECK(k % 128 == 0 && w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt &&
++                w.numel() == npad * k / 16, "PQ2 lane weight does not match n and K");
++    TORCH_CHECK(scales.is_cuda() && scales.scalar_type() == at::kHalf && scales.dim() == 2 && scales.stride(1) == 1 &&
++                scales.stride(0) >= npad && scales.size(0) == kg128 && scales.size(1) == npad,
++                "scales: fp16 (K/128, n padded to 128), rows may be strided");
++    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == x.size(0) && out.size(1) == n &&
++                out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
++    TORCH_CHECK(kg64 > 0, "empty K");
++    c10::cuda::CUDAGuard guard(x.device());
++    qmm_tern_prefill_cuda(x, w, scales, out, static_cast<int>(n), f32, static_cast<int>(tile));
++}
++
++void prefill_matmul8(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
++                     const at::Tensor& scales, at::Tensor out, int64_t n, bool f32, int64_t tile) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kByte && x.dim() == 2 && x.is_contiguous(),
++                "x8: contiguous uint8 (M, K)");
++    const int64_t m = x.size(0), k = x.size(1), kg64 = k / 64, kg128 = k / 128, npad = (n + 127) / 128 * 128;
++    TORCH_CHECK(k % 128 == 0 && xs.is_cuda() && xs.scalar_type() == at::kBFloat16 && xs.is_contiguous() &&
++                xs.size(0) == m && xs.size(1) == kg64, "xs: contiguous bf16 (M, K/64)");
++    TORCH_CHECK(a.is_cuda() && a.scalar_type() == at::kFloat && a.is_contiguous() && a.numel() == m,
++                "a: contiguous fp32 (M)");
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt && w.numel() == npad * k / 16,
++                "PQ2 lane weight does not match n and K");
++    TORCH_CHECK(scales.is_cuda() && scales.scalar_type() == at::kHalf && scales.dim() == 2 && scales.stride(1) == 1 &&
++                scales.stride(0) >= npad && scales.size(0) == kg128 && scales.size(1) == npad,
++                "scales: fp16 (K/128, n padded to 128), rows may be strided");
++    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == m && out.size(1) == n &&
++                out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
++    c10::cuda::CUDAGuard guard(x.device());
++    qmm_tern_prefill8_cuda(x, xs, a, w, scales, out, static_cast<int>(n), f32, static_cast<int>(tile));
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("pq2_group", &pq2_group, "Fast Bonsai PQ2 grouped decode: 2-bit lane weights, fp16 scale per 128, implicit -scale bias");
++    m.def("prefill_matmul", &prefill_matmul, "Bonsai PQ2 bf16 prefill GEMM");
++    m.def("prefill_matmul8", &prefill_matmul8, "Bonsai PQ2 FP8/int8-row prefill GEMM");
++}
+--- tensorfold/cuda/kernels/qmm_tern.cu
++++ tensorfold/cuda/kernels/qmm_tern.cu
+@@ -0,0 +1,893 @@
++// sm_12x lane matmul: up to four projections of one input a launch, each column with qmm.cu's order and so its bits.
++
++#include <ATen/ATen.h>
++#include <algorithm>
++#include <ATen/cuda/CUDAContext.h>
++#include <cooperative_groups.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <type_traits>
++#include <vector>
++
++#include "qmm_frag.cuh"
++
++namespace {
++
++using namespace qmm_frag;
++
++constexpr int PARTS = 4;
++
++// One projection: packed weights and fp16 scales (rows npad apart), (M, n) output, K split, tiles, first cluster.
++struct Part {
++    const uint32_t* w;
++    const half* scales;
++    void* out;
++    int n, npad, sk, tiles, first;
++};
++
++struct Parts {
++    Part p[PARTS];
++    int count;
++};
++
++// pair() with the nibble mask in a register: compilers rematerialize a literal mask at every use.
++__device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
++    const uint32_t t = ((w >> s) & mask) | 0x43004300u;
++    uint32_t r;
++#if __CUDA_ARCH__ >= 900
++    asm("sub.rn.bf16x2 %0, %1, %2;\n" : "=r"(r) : "r"(t), "r"(0x43004300u));
++#else
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC300C300u));
++#endif
++    return r;
++}
++
++// Eight 2-bit codes (bits 2p, 2p + 1 of the low 16) into nibble p of a word: the 4-bit words' layout, same codes.
++__device__ __forceinline__ uint32_t spread2(uint32_t v) {
++    v &= 0xFFFFu;
++    v = (v | (v << 8)) & 0x00FF00FFu;
++    v = (v | (v << 4)) & 0x0F0F0F0Fu;
++    return (v | (v << 2)) & 0x33333333u;
++}
++
++template <int N>
++using ic = std::integral_constant<int, N>;
++
++// Clusters of C blocks along x, one part each: a cluster covers C / sk column tiles, each split in sk K slices.
++// SWAP (8-row tiles): weights are the MMA's A operand (16 columns) and the rows its B (8), half the MMAs of 16 rows.
++// SKIP: a warp's m16 tiles wholly past M skip their fragments, mmas and scaling (a part-filled row tile). SPREAD:
++// every K slice sums its share of the tile's outputs (else slice 0 sums them all); the same adds in the same order.
++template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SWAP = false, bool SKIP = false,
++          bool SPREAD = false, int BITS = 4>
++__global__ void __launch_bounds__(WM * WN * 32) group_kernel(
++        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const __grid_constant__ Parts parts,
++        int M, int K, int ldx, int rows_t, int C) {
++    using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
++    static_assert(!SWAP || (BM == 8 && WM == 1 && T::NT % 2 == 0), "swapped tiles: 8 rows, column pairs a warp");
++    constexpr int I = SWAP ? T::NT / 2 : T::MT;     // MMA m16 tiles a warp: column pairs (swapped) or row tiles
++    constexpr int J = SWAP ? 1 : T::NT;             // MMA n8 tiles a warp: the 8 rows (swapped) or column tiles
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K / GS, cid = blockIdx.x / C, rank = blockIdx.x % C;
++    int q = 0;
++#pragma unroll
++    for (int i = 1; i < PARTS; ++i)
++        if (i < parts.count && cid >= parts.p[i].first) q = i;
++    const Part P = parts.p[q];                   // in registers: the loads below index it every group
++    const int sk = P.sk, lc = cid - P.first;
++    const int tile = lc / rows_t * (C / sk) + rank / sk, slice = rank % sk;
++    const int m0 = lc % rows_t * BM, n0 = tile * BN, per = KG / sk, g0 = slice * per;
++    const bool live = tile < P.tiles;            // a cluster's spare blocks past the last tile only join its syncs
++
++    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    const int rows = min(BM, M - m0);           // rows past M stay zero in every stage (set once below)
++    // each thread's copies, fixed for the block: sources advance a group at a time
++    static_assert(BITS == 4 || (BITS == 2 && GS % 64 == 0), "4-bit words, or 2-bit words of 64-input groups");
++    constexpr int TILE_BYTES = 64 * GS * BITS / 8;  // one stored 64-column tile's group block
++    constexpr int WB = T::W * BITS / 4;             // a stage's weight bytes (the stage keeps 4-bit room)
++    constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (WB / 16 + T::THREADS - 1) / T::THREADS;
++    constexpr int SC = (2 * T::S / 16 + T::THREADS - 1) / T::THREADS;
++    static_assert(BM <= T::THREADS, "one input sum a thread");
++    const __nv_bfloat16* xsrc[XC];
++    const unsigned char* wsrc[WC];
++    const half* ssrc[SC];
++    int xdst[XC], wdst[WC], sdst[SC];
++    bool xok[XC], wok[WC], sok[SC];
++#pragma unroll
++    for (int j = 0; j < XC; ++j) {
++        const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
++        xok[j] = c < BM * T::CHUNKS && r < rows;
++        xsrc[j] = x + static_cast<size_t>(m0 + min(r, rows - 1)) * ldx + ch * 8;
++        xdst[j] = r * T::ROW + swz<T::CHUNKS>(r, ch) * 16;
++    }
++#pragma unroll
++    for (int j = 0; j < WC; ++j) {
++        const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
++        wok[j] = c < WB / 16;
++        wsrc[j] = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES +
++                  off * 16;
++        wdst[j] = T::X + c * 16;
++    }
++#pragma unroll
++    for (int j = 0; j < SC; ++j) {
++        const int c = tid + j * T::THREADS, off = c % (T::S / 16);
++        sok[j] = c < (T::S / 16);
++        ssrc[j] = P.scales + n0 + off * 8;
++        sdst[j] = T::X + T::W + off * 16;
++    }
++    const bool xsok = tid < rows;
++    const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
++    // a group's inputs and input sums (the previous kernel's outputs) into stage s
++    auto load_x = [&](int s, int g) {
++        unsigned char* p = stage(s);
++#pragma unroll
++        for (int j = 0; j < XC; ++j)
++            if (xok[j]) cp16(p + xdst[j], xsrc[j] + g * GS);
++        if (xsok) cp4(p + T::X + T::W + 2 * T::S + tid * 4, xssrc + g);
++    };
++    // a group's weights, scales (constant, so loadable before the previous kernel ends)
++    auto load_w = [&](int s, int g) {
++        unsigned char* p = stage(s);
++#pragma unroll
++        for (int j = 0; j < WC; ++j)
++            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * TILE_BYTES);
++#pragma unroll
++        for (int j = 0; j < SC; ++j)
++            if (sok[j]) cp16(p + sdst[j], ssrc[j] + static_cast<size_t>(g / 2) * P.npad);
++    };
++    uint32_t mask;                              // 0x000F000F, opaque to the compiler (kept in a register)
++    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
++
++    float acc[I][J][4];
++#pragma unroll
++    for (int i = 0; i < I; ++i)
++#pragma unroll
++        for (int j = 0; j < J; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++    if (live) {
++#pragma unroll
++        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS)
++            if (c / T::CHUNKS >= rows)
++#pragma unroll
++                for (int s = 0; s < STAGES; ++s)
++                    *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
++        // weights before the previous kernel ends, inputs after it: wait_group's count still finds each stage whole
++#pragma unroll
++        for (int s = 0; s < STAGES - 1; ++s) {
++            if (s < per) load_w(s, g0 + s);
++            commit();
++        }
++        grid_wait();
++#pragma unroll
++        for (int s = 0; s < STAGES - 1; ++s) {
++            if (s < per) load_x(s, g0 + s);
++            commit();
++        }
++        grid_launch();
++        auto steps = [&](auto live_c) {                   // LIVE: the warp's m16 tiles holding rows below M
++            [[maybe_unused]] constexpr int LIVE = decltype(live_c)::value;
++            for (int it = 0; it < per; ++it) {
++                wait<STAGES - 2>();
++                __syncthreads();
++                const int next = it + STAGES - 1;
++                if (next < per) {
++                    load_x(next % STAGES, g0 + next);
++                    load_w(next % STAGES, g0 + next);
++                }
++                commit();
++                const unsigned char* p = stage(it % STAGES);
++                const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
++                const half* ps = reinterpret_cast<const half*>(p + T::X + T::W);
++                const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
++                uint32_t words[T::NT][GS / 32];
++                if constexpr (BITS == 4) {
++#pragma unroll
++                    for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++                        for (int v = 0; v < GS / 32; ++v)
++                            words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                } else {                                  // a 2-bit word holds a lane's two 4-bit words' codes
++#pragma unroll
++                    for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++                        for (int u = 0; u < GS / 64; ++u) {
++                            const uint32_t w2 = pw[((wn * T::NT + j) * 32 + lane) * (GS / 64) + u];
++                            words[j][2 * u] = spread2(w2);
++                            words[j][2 * u + 1] = spread2(w2 >> 16);
++                        }
++                }
++                float d[I][J][4];
++                if constexpr (SWAP) {
++#pragma unroll
++                    for (int kt = 0; kt < GS / 16; ++kt) {
++                        uint32_t bx[2];                           // rows 0-7 at k lo, k hi: the B fragment
++                        const int ch = kt * 2 + ((lane >> 3) & 1);
++                        ldmatrix2(bx, p + (lane & 7) * T::ROW + swz<T::CHUNKS>(lane & 7, ch) * 16);
++#pragma unroll
++                        for (int i = 0; i < I; ++i) {             // A rows g, g + 8 are columns of n8 tiles 2i, 2i + 1
++                            const int s0 = (kt & 1) * 8;
++                            const uint32_t a[4] = {pairm(words[2 * i][kt / 2], s0, mask),
++                                                   pairm(words[2 * i + 1][kt / 2], s0, mask),
++                                                   pairm(words[2 * i][kt / 2], s0 + 4, mask),
++                                                   pairm(words[2 * i + 1][kt / 2], s0 + 4, mask)};
++                            if (kt == 0) mma0(d[i][0], a, bx[0], bx[1]);
++                            else mma(d[i][0], a, bx[0], bx[1]);
++                        }
++                    }
++#pragma unroll
++                    for (int i = 0; i < I; ++i)
++#pragma unroll
++                        for (int e = 0; e < 4; ++e) {             // d: column g (+ 8 for e >= 2), rows 2t, 2t + 1
++                            const int col = wn * (BN / WN) + i * 16 + (lane >> 2) + (e >> 1) * 8;
++                            const float sv = __half2float(ps[col]);
++                            const float xv = px[(lane & 3) * 2 + (e & 1)];
++                            acc[i][0][e] = __fmaf_rn(xv, -sv, __fmaf_rn(d[i][0][e], sv, acc[i][0][e]));
++                        }
++                } else {
++#pragma unroll
++                    for (int kt = 0; kt < GS / 16; ++kt) {
++                        uint32_t a[LIVE > 0 ? LIVE : 1][4];
++#pragma unroll
++                        for (int i = 0; i < LIVE; ++i) {
++                            const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                            const int ch = kt * 2 + (lane >> 4);
++                            ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
++                        }
++#pragma unroll
++                        for (int j = 0; j < T::NT; ++j) {
++                            const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
++                            const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
++#pragma unroll
++                            for (int i = 0; i < LIVE; ++i) {
++                                if (kt == 0) mma0(d[i][j], a[i], b0, b1);
++                                else mma(d[i][j], a[i], b0, b1);
++                            }
++                        }
++                    }
++#pragma unroll
++                    for (int j = 0; j < T::NT; ++j) {
++                        const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
++                        const half2 s2 = *reinterpret_cast<const half2*>(ps + col);
++                        const float sv[2] = {__low2float(s2), __high2float(s2)};
++#pragma unroll
++                        for (int i = 0; i < LIVE; ++i) {
++                            const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
++                            const float xv[2] = {px[row], px[row + 8]};
++#pragma unroll
++                            for (int e = 0; e < 4; ++e)           // acc = fma(xs, b, fma(p, s, acc)): qmm.cu's order
++                                acc[i][j][e] = __fmaf_rn(xv[e >> 1], -sv[e & 1],
++                                                         __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
++                        }
++                    }
++                }
++            }
++        };
++        if constexpr (!SKIP || SWAP || T::MT == 1) {
++            steps(ic<T::MT>());
++        } else {
++            const int live = min(T::MT, max(0, (M - m0 - wm * (BM / WM) + 15) / 16));
++            if (live == 0) steps(ic<0>());
++            else if (live == 1) steps(ic<1>());
++            else if (T::MT > 2 && live == 2) steps(ic<(T::MT > 2 ? 2 : T::MT)>());
++            else if (T::MT > 3 && live == 3) steps(ic<(T::MT > 3 ? 3 : T::MT)>());
++            else if (T::MT > 4 && live <= 4) steps(ic<(T::MT > 4 ? 4 : T::MT)>());
++            else if (T::MT > 6 && live <= 6) steps(ic<(T::MT > 6 ? 6 : T::MT)>());
++            else steps(ic<T::MT>());
++        }
++        wait<0>();
++        __syncthreads();
++    } else {
++        grid_launch();
++    }
++    const int N = P.n;
++    auto put = [&](int row, int col, float v) {
++        if (row >= M || col >= N) return;
++        if (F32) reinterpret_cast<float*>(P.out)[static_cast<size_t>(row) * N + col] = v;
++        else reinterpret_cast<__nv_bfloat16*>(P.out)[static_cast<size_t>(row) * N + col] = __float2bfloat16_rn(v);
++    };
++    auto emit = [&](int i, int j, int h, float v0, float v1) {      // entries 2h, 2h + 1 of fragment (i, j)
++        if constexpr (SWAP) {                    // column g (+ 8 for h 1), rows 2t, 2t + 1
++            const int col = n0 + wn * (BN / WN) + i * 16 + (lane >> 2) + h * 8;
++            put(m0 + (lane & 3) * 2, col, v0);
++            put(m0 + (lane & 3) * 2 + 1, col, v1);
++        } else {
++            const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
++            const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++            if (row >= M) return;
++            if (!F32 && col + 1 < N && (N & 1) == 0) {
++                auto* dst = reinterpret_cast<__nv_bfloat16*>(P.out) + static_cast<size_t>(row) * N + col;
++                *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++            } else {
++                put(row, col, v0);
++                put(row, col + 1, v1);
++            }
++        }
++    };
++    if (sk > 1) {                                // uniform in a cluster: it holds one part
++#if __CUDA_ARCH__ >= 900
++        auto cluster = cooperative_groups::this_cluster();
++        float* mine = reinterpret_cast<float*>(buf);
++        if (SPREAD || slice != 0) {
++#pragma unroll
++            for (int i = 0; i < I; ++i)
++#pragma unroll
++                for (int j = 0; j < J; ++j)
++#pragma unroll
++                    for (int e = 0; e < 4; ++e) mine[((i * J + j) * 4 + e) * T::THREADS + tid] = acc[i][j][e];
++        }
++        cluster.sync();
++        if constexpr (SPREAD) {                  // slice s adds pairs s, s + sk, .. over the tile's slices in order
++            if (live) {
++                for (int pr = slice; pr < I * J * 2; pr += sk) {
++                    const float* first = cluster.map_shared_rank(mine, rank - slice);
++                    float v0 = first[2 * pr * T::THREADS + tid], v1 = first[(2 * pr + 1) * T::THREADS + tid];
++#pragma unroll 7
++                    for (int peer = 1; peer < sk; ++peer) {
++                        const float* theirs = cluster.map_shared_rank(mine, rank - slice + peer);
++                        v0 = v0 + theirs[2 * pr * T::THREADS + tid];
++                        v1 = v1 + theirs[(2 * pr + 1) * T::THREADS + tid];
++                    }
++                    emit(pr / (J * 2), pr / 2 % J, pr % 2, v0, v1);
++                }
++            }
++            cluster.sync();                      // peers keep their memory until every slice has read it
++            return;
++        } else {
++            if (slice == 0 && live) {            // slice 0 adds its tile's peers in slice order, as qmm.cu does
++                for (int peer = 1; peer < sk; ++peer) {
++                    const float* theirs = cluster.map_shared_rank(mine, rank + peer);
++#pragma unroll
++                    for (int i = 0; i < I; ++i)
++#pragma unroll
++                        for (int j = 0; j < J; ++j)
++#pragma unroll
++                            for (int e = 0; e < 4; ++e)
++                                acc[i][j][e] = acc[i][j][e] + theirs[((i * J + j) * 4 + e) * T::THREADS + tid];
++                }
++            }
++            cluster.sync();                      // peers keep their memory until slice 0 has read it
++            if (slice != 0) return;
++        }
++#else
++        __trap();
++        return;
++#endif
++    }
++    if (!live) return;
++#pragma unroll
++    for (int i = 0; i < I; ++i)
++#pragma unroll
++        for (int j = 0; j < J; ++j)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) emit(i, j, h, acc[i][j][2 * h], acc[i][j][2 * h + 1]);
++}
++
++template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SWAP = false, bool SKIP = false,
++          bool SPREAD = false, int BITS = 4>
++void launch(const at::Tensor& x, const at::Tensor& xs, Parts& parts, int C, bool pdl) {
++    using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
++    const int M = x.size(0), K = x.size(1), rows_t = (M + BM - 1) / BM;
++    int clusters = 0;
++    for (int i = 0; i < parts.count; ++i) {
++        Part& P = parts.p[i];
++        P.tiles = (P.n + BN - 1) / BN;
++        P.first = clusters;
++        clusters += rows_t * ((P.tiles + C / P.sk - 1) / (C / P.sk));
++    }
++    auto kernel = group_kernel<GS, BM, BN, WM, WN, STAGES, F32, SWAP, SKIP, SPREAD, BITS>;
++    static bool configured = false;
++    if (!configured) {
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
++        configured = true;
++    }
++    cudaLaunchConfig_t config = {};
++    config.gridDim = dim3(clusters * C);
++    config.blockDim = dim3(T::THREADS);
++    config.dynamicSmemBytes = T::SMEM;
++    config.stream = at::cuda::getCurrentCUDAStream();
++    cudaLaunchAttribute attr[2];
++    int n = 0;
++    if (C > 1) {
++        attr[n].id = cudaLaunchAttributeClusterDimension;
++        attr[n].val.clusterDim.x = C;
++        attr[n].val.clusterDim.y = 1;
++        attr[n].val.clusterDim.z = 1;
++        ++n;
++    }
++    if (pdl) {                                   // may start while the previous kernel finishes: grid_wait guards x
++        attr[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++        attr[n].val.programmaticStreamSerializationAllowed = 1;
++        ++n;
++    }
++    config.attrs = attr;
++    config.numAttrs = n;
++    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
++                                      xs.data_ptr<float>(), parts, M, K, M == 1 ? K : static_cast<int>(x.stride(0)),
++                                      rows_t, C));
++}
++
++// Tiles never change bits; 0 picks by rows and chip: the PRO 6000, power-capped at one row, takes fewer MMAs a weight.
++// 10-12 (``qmm.group_tile`` on SM 12.0 from 96 SMs) spread the slice sums and skip m16 tiles wholly past M.
++template <bool F32, int BITS>
++void dispatch(int tile, int M, bool gb10, const at::Tensor& x, const at::Tensor& xs, Parts& parts, int C, bool pdl) {
++    if (tile == 0 && gb10) tile = M <= 16 ? 2 : M <= 32 ? 3 : M <= 64 ? 4 : 5;
++    if (tile == 0) tile = M <= 8 ? 7 : M <= 16 ? 8 : M <= 32 ? 9 : M <= 64 ? 4 : 5;
++    auto go = [&](auto full, auto skip, int bm) { M % bm ? skip() : full(); };
++    switch (tile) {
++        case 1: launch<64, 16, 64, 1, 4, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 2: launch<64, 16, 64, 1, 4, 8, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 3: launch<64, 32, 64, 1, 4, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 4: launch<64, 64, 64, 1, 4, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 5: launch<64, 64, 128, 2, 4, 3, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 6: launch<64, 8, 64, 1, 4, 4, F32, true, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 7: launch<64, 8, 128, 1, 4, 4, F32, true, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 8: launch<64, 16, 128, 1, 8, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 9: launch<64, 32, 128, 1, 8, 4, F32, false, false, false, BITS>(x, xs, parts, C, pdl); break;
++        case 10: go([&] { launch<64, 128, 128, 2, 4, 2, F32, false, false, true, BITS>(x, xs, parts, C, pdl); },
++                    [&] { launch<64, 128, 128, 2, 4, 2, F32, false, true, true, BITS>(x, xs, parts, C, pdl); }, 128); break;
++        case 11: go([&] { launch<64, 64, 128, 1, 8, 3, F32, false, false, true, BITS>(x, xs, parts, C, pdl); },
++                    [&] { launch<64, 64, 128, 1, 8, 3, F32, false, true, true, BITS>(x, xs, parts, C, pdl); }, 64); break;
++        case 12: go([&] { launch<64, 64, 128, 2, 4, 3, F32, false, false, true, BITS>(x, xs, parts, C, pdl); },
++                    [&] { launch<64, 64, 128, 2, 4, 3, F32, false, true, true, BITS>(x, xs, parts, C, pdl); }, 64); break;
++        default: TORCH_CHECK(false, "unknown group tile ", tile);
++    }
++}
++
++} // namespace
++
++template <int BITS>
++void group_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++                    const std::vector<at::Tensor>& scales,
++                    std::vector<at::Tensor>& outs, const std::vector<int64_t>& ns, const std::vector<int64_t>& sks,
++                    bool f32, int tile, int pdl) {
++    Parts parts = {};
++    parts.count = static_cast<int>(ws.size());
++    int C = 1;
++    for (int i = 0; i < parts.count; ++i) {
++        Part& P = parts.p[i];
++        P.w = reinterpret_cast<const uint32_t*>(ws[i].data_ptr());
++        P.scales = reinterpret_cast<const half*>(scales[i].data_ptr());
++        P.out = outs[i].data_ptr();
++        P.n = static_cast<int>(ns[i]);
++        P.npad = static_cast<int>(scales[i].stride(0));
++        P.sk = static_cast<int>(sks[i]);
++        C = std::max(C, P.sk);
++    }
++    const auto* props = at::cuda::getCurrentDeviceProperties();
++    const bool gb10 = props->major == 12 && props->minor == 1;
++    const bool early = pdl < 0 ? gb10 : pdl > 0;           // overlapping launches pay on GB10, cost the capped PRO 6000
++    if (f32) dispatch<true, BITS>(tile, x.size(0), gb10, x, xs, parts, C, early);
++    else dispatch<false, BITS>(tile, x.size(0), gb10, x, xs, parts, C, early);
++}
++
++// PQ2 fallback: existing 2-bit lane layout, one fp16 scale per 128 inputs and implicit bias = -scale.
++void qmm_tern_pq2_cuda(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
++                       const std::vector<at::Tensor>& scales, std::vector<at::Tensor>& outs,
++                       const std::vector<int64_t>& ns, const std::vector<int64_t>& sks, bool f32, int tile, int pdl) {
++    group_cuda<2>(x, xs, ws, scales, outs, ns, sks, f32, tile, pdl);
++}
++
++
++namespace pq2_prefill {
++
++using namespace qmm_frag;
++
++__device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
++    uint32_t d;
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
++    return d;
++}
++
++__device__ __forceinline__ uint16_t bf16_bits(float v) {
++    __nv_bfloat16 b = __float2bfloat16_rn(v);
++    return *reinterpret_cast<uint16_t*>(&b);
++}
++
++__device__ __forceinline__ uint32_t bf16_pair_from_half(half h) {
++    return static_cast<uint32_t>(bf16_bits(__half2float(h))) * 0x00010001u;
++}
++
++__device__ __forceinline__ uint32_t neg_bf16_pair_from_half(half h) {
++    return static_cast<uint32_t>(bf16_bits(-__half2float(h))) * 0x00010001u;
++}
++
++// BF16-input prompt GEMM over PQ2 lane weights.  The stage keeps the original 4-bit room, but only half of the
++// weight bytes are loaded.  Weight math intentionally mirrors qmm_prefill: the fp16 PQ2 scale is rounded once to
++// bf16 when forming the temporary MMA weight bf16(scale * (code - 1)).
++template <int GS, int BM, int BN, int WM, int WN, int STAGES>
++struct TileBf16 {
++    static constexpr int THREADS = WM * WN * 32;
++    static constexpr int MT = BM / WM / 16;
++    static constexpr int NT = BN / WN / 8;
++    static constexpr int ROW = GS * 2;
++    static constexpr int CHUNKS = ROW / 16;
++    static constexpr int X = BM * ROW;
++    static constexpr int W = BN * GS / 2;       // 4-bit staging room
++    static constexpr int S = BN * 2;            // one fp16 scale per output column
++    static constexpr int STAGE = X + W + S;
++    static constexpr int SMEM = STAGES * STAGE;
++};
++
++template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
++__global__ void __launch_bounds__(WM * WN * 32) prefill_kernel(
++        const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const half* __restrict__ scales,
++        void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {
++    using T = TileBf16<GS, BM, BN, WM, WN, STAGES>;
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K / GS;
++    const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
++    const int m0 = at.x, n0 = at.y;
++    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    auto load = [&](int s, int g) {
++        unsigned char* p = stage(s);
++        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
++            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
++            const int row = min(m0 + r, M - 1);
++            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
++                  m0 + r < M);
++        }
++        unsigned char* pw = p + T::X;
++        constexpr int TILE_BYTES = 64 * GS / 4;          // PQ2 bytes for one 64-column tile and one 64-input group
++        constexpr int WB = T::W / 2;
++        for (int c = tid; c < WB / 16; c += T::THREADS) {
++            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
++            const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
++            if (n0 + t * 64 < npad) cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
++        }
++        unsigned char* ps = pw + T::W;
++        for (int c = tid; c < T::S / 16; c += T::THREADS) {
++            const int off = c % (T::S / 16);
++            const half* src = scales + static_cast<size_t>(g / 2) * npad + n0 + off * 8;
++            if (n0 + off * 8 < npad) cp16(ps + off * 16, src);
++        }
++    };
++
++    float acc[T::MT][T::NT][4];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++#pragma unroll
++    for (int s = 0; s < STAGES - 1; ++s) { if (s < KG) load(s, s); commit(); }
++    for (int it = 0; it < KG; ++it) {
++        wait<STAGES - 2>();
++        __syncthreads();
++        const int next = it + STAGES - 1;
++        if (next < KG) load(next % STAGES, next);
++        commit();
++        const unsigned char* p = stage(it % STAGES);
++        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
++        const half* ps = reinterpret_cast<const half*>(p + T::X + T::W);
++        uint32_t words[T::NT][GS / 32], sv[T::NT], bv[T::NT];
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const uint32_t w2 = pw[(wn * T::NT + j) * 32 + lane];
++            words[j][0] = spread2(w2);
++            words[j][1] = spread2(w2 >> 16);
++            const int col = wn * (BN / WN) + j * 8 + (lane >> 2);
++            const half h = ps[col];
++            sv[j] = bf16_pair_from_half(h);
++            bv[j] = neg_bf16_pair_from_half(h);
++        }
++#pragma unroll
++        for (int kt = 0; kt < GS / 16; ++kt) {
++            uint32_t a[T::MT][4];
++#pragma unroll
++            for (int i = 0; i < T::MT; ++i) {
++                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                const int ch = kt * 2 + (lane >> 4);
++                ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
++            }
++#pragma unroll
++            for (int j = 0; j < T::NT; ++j) {
++                const uint32_t b0 = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
++                const uint32_t b1 = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
++#pragma unroll
++                for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
++            }
++        }
++    }
++    wait<0>();
++    __syncthreads();
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++                if (row >= M) continue;
++                const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
++                if (F32) {
++                    float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col < N) dst[0] = v0;
++                    if (col + 1 < N) dst[1] = v1;
++                } else {
++                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col + 1 < N && (N & 1) == 0) *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++                    else { if (col < N) dst[0] = __float2bfloat16_rn(v0); if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1); }
++                }
++            }
++        }
++}
++
++template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
++void launch_prefill(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, at::Tensor& out, int N) {
++    using T = TileBf16<GS, BM, BN, WM, WN, STAGES>;
++    const int M = x.size(0), K = x.size(1);
++    auto kernel = prefill_kernel<GS, BM, BN, WM, WN, STAGES, F32>;
++    static bool configured = false;
++    if (!configured) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM); configured = true; }
++    const int rows_t = (M + BM - 1) / BM;
++    const int group = std::max(1, std::min(rows_t, static_cast<int>((12LL << 20) / (static_cast<long long>(BM) * K * 2))));
++    kernel<<<rows_t * ((N + BN - 1) / BN), T::THREADS, T::SMEM, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const uint32_t*>(w.data_ptr()),
++        reinterpret_cast<const half*>(scales.data_ptr()), out.data_ptr(), M, N, K, static_cast<int>(scales.stride(0)),
++        M == 1 ? K : static_cast<int>(x.stride(0)), group);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template <bool F32>
++void dispatch_prefill(int tile, const at::Tensor& x, const at::Tensor& w, const at::Tensor& s, at::Tensor& out, int N) {
++    switch (tile) {
++        case 0: launch_prefill<64, 128, 128, 2, 4, 3, F32>(x, w, s, out, N); break;
++        case 1: launch_prefill<64, 64, 128, 1, 4, 4, F32>(x, w, s, out, N); break;
++        case 2: launch_prefill<64, 128, 64, 2, 2, 4, F32>(x, w, s, out, N); break;
++        case 3: launch_prefill<64, 64, 64, 1, 4, 4, F32>(x, w, s, out, N); break;
++        case 5: launch_prefill<64, 128, 128, 2, 2, 3, F32>(x, w, s, out, N); break;
++        case 6: launch_prefill<64, 128, 128, 2, 2, 4, F32>(x, w, s, out, N); break;
++        case 7: launch_prefill<64, 128, 256, 2, 4, 3, F32>(x, w, s, out, N); break;
++        case 8: launch_prefill<64, 64, 256, 1, 4, 4, F32>(x, w, s, out, N); break;
++        case 9: launch_prefill<64, 128, 128, 2, 2, 2, F32>(x, w, s, out, N); break;
++        case 10: launch_prefill<64, 64, 128, 1, 2, 2, F32>(x, w, s, out, N); break;
++        case 11: launch_prefill<64, 128, 256, 2, 4, 2, F32>(x, w, s, out, N); break;
++        default: launch_prefill<64, 128, 128, 2, 4, 4, F32>(x, w, s, out, N); break;
++    }
++}
++
++__device__ __forceinline__ void mma8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++        "{%0, %1, %2, %3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void mma8z(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    const float z = 0.0f;
++    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++        "{%10, %10, %10, %10};\n"
++        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(z));
++}
++
++__device__ __forceinline__ uint32_t e4m3_pair(uint32_t w, int s) {
++    const uint32_t t = ((w >> s) & 0x000F000Fu) | 0x64006400u;
++    uint32_t h;
++    asm("sub.rn.f16x2 %0, %1, %2;\n" : "=r"(h) : "r"(t), "r"(0x64006400u));
++    uint16_t r;
++    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(r) : "r"(h));
++    return r;
++}
++
++__device__ __forceinline__ void weights8(uint32_t w, uint32_t& b0, uint32_t& b1) {
++    b0 = __byte_perm(e4m3_pair(w, 0), e4m3_pair(w, 4), 0x5410);
++    b1 = __byte_perm(e4m3_pair(w, 8), e4m3_pair(w, 12), 0x5410);
++}
++
++template <int GS, int BM, int BN, int WM, int WN, int STAGES>
++struct Tile8 {
++    static constexpr int THREADS = WM * WN * 32;
++    static constexpr int MT = BM / WM / 16;
++    static constexpr int NT = BN / WN / 8;
++    static constexpr int KS = GS / 32;
++    static constexpr int ROW = GS;
++    static constexpr int CHUNKS = ROW / 16;
++    static constexpr int PER128 = 128 / ROW;
++    static constexpr int X = BM * ROW;
++    static constexpr int W = BN * GS / 2;       // 4-bit staging room
++    static constexpr int S = BN * 2;            // fp16 scales
++    static constexpr int STAGE = X + W + S;
++    static constexpr int SMEM = STAGES * STAGE;
++};
++
++template <int CHUNKS, int PER128>
++__device__ __forceinline__ int swz8(int r, int c) { return c ^ ((r / PER128) % CHUNKS); }
++
++template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
++__global__ void __launch_bounds__(WM * WN * 32, 2) prefill8_kernel(
++        const uint8_t* __restrict__ x, const __nv_bfloat16* __restrict__ xs, const float* __restrict__ scale,
++        const uint32_t* __restrict__ w, const half* __restrict__ scales, void* __restrict__ out, int M, int N, int K,
++        int npad, int group) {
++    using T = Tile8<GS, BM, BN, WM, WN, STAGES>;
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K / GS;
++    const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
++    const int m0 = at.x, n0 = at.y;
++    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    auto load = [&](int s, int g) {
++        unsigned char* p = stage(s);
++#pragma unroll
++        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
++            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
++            cp16z(p + r * T::ROW + swz8<T::CHUNKS, T::PER128>(r, ch) * 16,
++                  x + static_cast<size_t>(min(m0 + r, M - 1)) * K + g * GS + ch * 16, m0 + r < M);
++        }
++        unsigned char* pw = p + T::X;
++        constexpr int TILE_BYTES = 64 * GS / 4;
++        constexpr int WB = T::W / 2;
++#pragma unroll
++        for (int c = tid; c < WB / 16; c += T::THREADS) {
++            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
++            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + (static_cast<size_t>(n0 / 64 + t) * KG + g) * TILE_BYTES + off * 16);
++        }
++        unsigned char* ps = pw + T::W;
++        for (int c = tid; c < T::S / 16; c += T::THREADS)
++            cp16(ps + c * 16, scales + static_cast<size_t>(g / 2) * npad + n0 + c * 8);
++    };
++
++    float acc[T::MT][T::NT][4];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++#pragma unroll
++    for (int s = 0; s < STAGES - 1; ++s) { if (s < KG) load(s, s); commit(); }
++    int arow[T::MT];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i) arow[i] = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++    const int wbase = wn * T::NT * 32 + lane;
++    const int scol = wn * (BN / WN) + (lane & 3) * 2;
++    for (int g = 0; g < KG; ++g) {
++        wait<STAGES - 2>();
++        __syncthreads();
++        if (g + STAGES - 1 < KG) load((g + STAGES - 1) % STAGES, g + STAGES - 1);
++        commit();
++        const unsigned char* p = stage(g % STAGES);
++        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
++        const half* ps = reinterpret_cast<const half*>(p + T::X + T::W);
++        uint32_t a[T::KS][T::MT][4];
++#pragma unroll
++        for (int ks = 0; ks < T::KS; ++ks)
++#pragma unroll
++            for (int i = 0; i < T::MT; ++i)
++                ldmatrix4(a[ks][i], p + arow[i] * T::ROW + swz8<T::CHUNKS, T::PER128>(arow[i], ks * 2 + (lane >> 4)) * 16);
++        float prev[T::MT][4];
++#pragma unroll
++        for (int j = 0; j <= T::NT; ++j) {
++            float cur[T::MT][4];
++            if (j < T::NT) {
++                const uint32_t w2 = pw[wbase + j * 32];
++                const uint32_t words[2] = {spread2(w2), spread2(w2 >> 16)};
++#pragma unroll
++                for (int ks = 0; ks < T::KS; ++ks) {
++                    uint32_t b0, b1;
++                    weights8(words[ks], b0, b1);
++#pragma unroll
++                    for (int i = 0; i < T::MT; ++i) { if (ks == 0) mma8z(cur[i], a[ks][i], b0, b1); else mma8(cur[i], a[ks][i], b0, b1); }
++                }
++            }
++            if (j > 0) {
++                const float s0 = __bfloat162float(__float2bfloat16_rn(__half2float(ps[scol + (j - 1) * 8])));
++                const float s1 = __bfloat162float(__float2bfloat16_rn(__half2float(ps[scol + (j - 1) * 8 + 1])));
++#pragma unroll
++                for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++                    for (int e = 0; e < 4; ++e) acc[i][j - 1][e] = __fmaf_rn(prev[i][e], (e & 1) ? s1 : s0, acc[i][j - 1][e]);
++            }
++            if (j < T::NT) {
++#pragma unroll
++                for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++                    for (int e = 0; e < 4; ++e) prev[i][e] = cur[i][e];
++            }
++        }
++    }
++    wait<0>();
++    const int c = lane & 3, gr = lane >> 2;
++    const unsigned short* xb = reinterpret_cast<const unsigned short*>(xs);
++    auto pair_xs = [&](const unsigned short* p, size_t stride, int k) -> uint32_t {
++        const uint32_t lo = k < KG ? p[static_cast<size_t>(k) * stride] : 0;
++        const uint32_t hi = k + 1 < KG ? p[static_cast<size_t>(k + 1) * stride] : 0;
++        return lo | (hi << 16);
++    };
++    auto pair_bias = [&](int col, int k) -> uint32_t {
++        const uint32_t lo = k < KG ? bf16_bits(-__half2float(scales[static_cast<size_t>(k / 2) * npad + col])) : 0;
++        const uint32_t hi = k + 1 < KG ? bf16_bits(-__half2float(scales[static_cast<size_t>((k + 1) / 2) * npad + col])) : 0;
++        return lo | (hi << 16);
++    };
++    for (int kb = 0; kb < KG; kb += 16) {
++        uint32_t af[T::MT][4];
++#pragma unroll
++        for (int i = 0; i < T::MT; ++i) {
++            const int r0 = min(m0 + wm * (BM / WM) + i * 16 + gr, M - 1), r1 = min(r0 + 8, M - 1);
++            const unsigned short* x0 = xb + static_cast<size_t>(r0) * KG;
++            const unsigned short* x1 = xb + static_cast<size_t>(r1) * KG;
++            af[i][0] = pair_xs(x0, 1, kb + 2 * c);
++            af[i][1] = pair_xs(x1, 1, kb + 2 * c);
++            af[i][2] = pair_xs(x0, 1, kb + 8 + 2 * c);
++            af[i][3] = pair_xs(x1, 1, kb + 8 + 2 * c);
++        }
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const int col = n0 + wn * (BN / WN) + j * 8 + gr;
++            const uint32_t b0 = pair_bias(col, kb + 2 * c), b1 = pair_bias(col, kb + 8 + 2 * c);
++#pragma unroll
++            for (int i = 0; i < T::MT; ++i) mma(acc[i][j], af[i], b0, b1);
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i) {
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++            if (row >= M) continue;
++            const float arow_scale = scale[row];
++#pragma unroll
++            for (int j = 0; j < T::NT; ++j) {
++                const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
++                const float v0 = acc[i][j][2 * h] * arow_scale, v1 = acc[i][j][2 * h + 1] * arow_scale;
++                if (F32) {
++                    float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col < N) dst[0] = v0;
++                    if (col + 1 < N) dst[1] = v1;
++                } else {
++                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col + 1 < N && (N & 1) == 0) *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++                    else { if (col < N) dst[0] = __float2bfloat16_rn(v0); if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1); }
++                }
++            }
++        }
++    }
++}
++
++template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
++void launch_prefill8(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
++                     const at::Tensor& scales, at::Tensor& out, int N) {
++    using T = Tile8<GS, BM, BN, WM, WN, STAGES>;
++    const int M = x.size(0), K = x.size(1);
++    auto kernel = prefill8_kernel<GS, BM, BN, WM, WN, STAGES, F32>;
++    static bool configured = false;
++    if (!configured) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM); configured = true; }
++    const int rows_t = (M + BM - 1) / BM;
++    const int group = std::max(1, std::min(rows_t, static_cast<int>((12LL << 20) / (static_cast<long long>(BM) * K))));
++    kernel<<<rows_t * ((N + BN - 1) / BN), T::THREADS, T::SMEM, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const uint8_t*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(xs.data_ptr()),
++        a.data_ptr<float>(), reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const half*>(scales.data_ptr()),
++        out.data_ptr(), M, N, K, static_cast<int>(scales.stride(0)), group);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template <bool F32>
++void dispatch_prefill8(int tile, const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
++                       const at::Tensor& s, at::Tensor& out, int N) {
++    switch (tile) {
++        case 1: launch_prefill8<64, 64, 128, 1, 4, 4, F32>(x, xs, a, w, s, out, N); break;
++        case 2: launch_prefill8<64, 128, 128, 2, 4, 3, F32>(x, xs, a, w, s, out, N); break;
++        default: launch_prefill8<64, 128, 128, 2, 2, 3, F32>(x, xs, a, w, s, out, N); break;
++    }
++}
++
++} // namespace pq2_prefill
++
++void qmm_tern_prefill_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, at::Tensor& out,
++                           int N, bool f32, int tile) {
++    if (f32) pq2_prefill::dispatch_prefill<true>(tile, x, w, scales, out, N);
++    else pq2_prefill::dispatch_prefill<false>(tile, x, w, scales, out, N);
++}
++
++void qmm_tern_prefill8_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& a, const at::Tensor& w,
++                            const at::Tensor& scales, at::Tensor& out, int N, bool f32, int tile) {
++    if (f32) pq2_prefill::dispatch_prefill8<true>(tile, x, xs, a, w, scales, out, N);
++    else pq2_prefill::dispatch_prefill8<false>(tile, x, xs, a, w, scales, out, N);
++}
+--- tensorfold/cuda/kernels/qmm_tern.cuh
++++ tensorfold/cuda/kernels/qmm_tern.cuh
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++namespace qmm_tern {
++
++// Lossless base-3 archival/prefill payload: 26 bytes per 128 trits plus one fp16 scale.
++static constexpr int TERN_GROUP = 128;
++static constexpr int TERN_PAYLOAD_BYTES = 26;
++static constexpr int TERN_MAIN_BYTES = 24;
++static constexpr int TERN_TAIL_BYTES = 2;
++
++__host__ __device__ __forceinline__ uint8_t tern_extract5(uint8_t packed, int i) {
++    static constexpr uint8_t pow3[5] = {1, 3, 9, 27, 81};
++    return (packed / pow3[i]) % 3;
++}
++
++__host__ __device__ __forceinline__ uint8_t tern_extract4(uint8_t packed, int i) {
++    static constexpr uint8_t pow3[4] = {1, 3, 9, 27};
++    return (packed / pow3[i]) % 3;
++}
++
++__device__ __forceinline__ uint8_t tern_payload_get(const uint8_t* payload, int k) {
++    if (k < 120) return tern_extract5(payload[k / 5], k % 5);
++    return tern_extract4(payload[24 + (k - 120) / 4], (k - 120) % 4);
++}
++
++// Fast decode fallback/recommended serving layout (PQ2): the exact qmm_group2 lane order.
++// Tensor shape is int32 [npad/64][K/64][8][32][1].  For one output-row tile and one
++// 64-input group, lane l loads one uint32: low 16 bits are eight 2-bit codes for
++// inputs 32*0 + 2*(l%4) + {0,8,16,24,1,9,17,25}; high 16 bits are the same for
++// inputs 32*1 + ... .  The CUDA kernel expands the two halves with spread2() into
++// qmm_group's nibble words and reuses its bf16 MMA path.  Scales are fp16
++// [K/128][npad], one scale for two adjacent 64-input groups; bias is implicit -scale.
++static constexpr int PQ2_GROUP = 128;
++static constexpr int PQ2_PAYLOAD_BITS = 256; // per 128 weights, plain 2-bit codes
++static constexpr int PQ2_TOTAL_BITS = 272;   // payload + one fp16 scale = 2.125 bpw
++
++} // namespace qmm_tern
+--- tensorfold/cuda/kernels/qmm_tern.py
++++ tensorfold/cuda/kernels/qmm_tern.py
+@@ -0,0 +1,353 @@
++"""Prism Bonsai ternary (PTQ1_0-style) decode kernels.
++
++The format keeps one fp16 scale per 128 weights and stores the ternary codes
++0/1/2 in 26 base-3 payload bytes, so each group is 28 bytes including scale
++(1.75 bits/weight total). Kernels support decode/speculative batches M=1..32.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++GROUP = 128
++PAYLOAD_BYTES = 26
++_POW5 = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int16)
++_POW4 = torch.tensor([1, 3, 9, 27], dtype=torch.int16)
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_qmm_tern_v3", sources=[str(here / "qmm_tern.cpp"), str(here / "qmm_tern.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++@dataclass
++class TQ:
++    """Packed ternary weight.
++
++    payload: uint8 (n, k/128, 26), row-major. scales: fp16 (n, k/128).
++    Both tensors may be row-slice views. ``n`` is logical rows; no row padding is
++    required by this extension, which makes odd row counts and views cheap.
++    """
++
++    payload: torch.Tensor | None
++    scales: torch.Tensor | None
++    n: int
++    k: int
++    row0: int = 0
++    pq2: torch.Tensor | None = None
++    pq2_scales: torch.Tensor | None = None
++
++    @property
++    def kg(self) -> int:
++        return self.k // GROUP
++
++    def nbytes(self) -> int:
++        if self.pq2 is not None and self.pq2_scales is not None:
++            return self.pq2.numel() * self.pq2.element_size() + self.pq2_scales.numel() * self.pq2_scales.element_size()
++        if self.payload is None or self.scales is None:
++            return 0
++        return self.payload.numel() * self.payload.element_size() + self.scales.numel() * self.scales.element_size()
++
++    def rows(self, a: int, b: int) -> "TQ":
++        return rows(self, a, b)
++
++
++def _as_i32_words(weight: torch.Tensor) -> torch.Tensor:
++    if weight.dtype not in (torch.int32, torch.uint32):
++        raise ValueError("weight words must be int32/uint32")
++    return weight.view(torch.int32) if weight.dtype != torch.int32 else weight
++
++
++def _codes_from_words(words: torch.Tensor) -> torch.Tensor:
++    shifts = torch.arange(0, 32, 2, dtype=torch.int32, device=words.device)
++    return ((words[..., None] >> shifts) & 3).to(torch.uint8).reshape(words.shape[0], words.shape[1] * 16)
++
++
++def _pack_codes(codes: torch.Tensor) -> torch.Tensor:
++    n, k = codes.shape
++    if k % GROUP:
++        raise ValueError("K must be a multiple of 128")
++    kg = k // GROUP
++    dev = codes.device
++    c = codes.reshape(n, kg, GROUP).to(torch.int16)
++    pow5 = _POW5.to(dev)
++    pow4 = _POW4.to(dev)
++    payload = torch.empty((n, kg, PAYLOAD_BYTES), dtype=torch.uint8, device=dev)
++    payload[:, :, :24] = (c[:, :, :120].reshape(n, kg, 24, 5) * pow5).sum(-1).to(torch.uint8)
++    payload[:, :, 24:] = (c[:, :, 120:].reshape(n, kg, 2, 4) * pow4).sum(-1).to(torch.uint8)
++    return payload.contiguous()
++
++
++
++
++def _to_int32(v: torch.Tensor) -> torch.Tensor:
++    return torch.where(v >= 2 ** 31, v - 2 ** 32, v).to(torch.int32)
++
++
++def _lane_offsets(device) -> torch.Tensor:
++    # Same order as tensorfold.cuda.kernels.qmm._offsets(64): input 32*v + 2*c + OFFSETS[p].
++    offs = torch.tensor([0, 8, 16, 24, 1, 9, 17, 25], device=device)
++    v = torch.arange(2, device=device)[:, None, None]
++    c = torch.arange(4, device=device)[None, :, None]
++    return 32 * v + 2 * c + offs[None, None, :]
++
++
++def _pack_pq2_lane(codes: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
++    """Codes (n,k) -> existing qmm_group2 lane layout [npad/64][k/64][8][32][1]."""
++    n, k = map(int, codes.shape)
++    npad = -(-n // 128) * 128
++    kg = k // 64
++    dev = codes.device
++    out = torch.empty((npad // 64, kg, 8, 32, 1), dtype=torch.int32, device=dev)
++    offs = _lane_offsets(dev)
++    shifts = (torch.arange(8, device=dev, dtype=torch.int64) * 2)
++    for start in range(0, npad, chunk):
++        stop = min(start + chunk, npad)
++        rows = stop - start
++        block = torch.zeros((rows, k), dtype=torch.uint8, device=dev)
++        if start < n:
++            block[:min(stop, n) - start] = codes[start:min(stop, n)]
++        q = block.reshape(rows, kg, 64).reshape(rows // 64, 8, 8, kg, 64)
++        picked = q[..., offs]  # (T,j,r,kg,V=2,c=4,p=8)
++        lo = ((picked[..., 0, :, :].to(torch.int64) << shifts).sum(-1))
++        hi = ((picked[..., 1, :, :].to(torch.int64) << shifts).sum(-1))
++        w = _to_int32(lo | (hi << 16))  # (T,j,r,kg,c)
++        out[start // 64:stop // 64] = w.permute(0, 3, 1, 2, 4).reshape(rows // 64, kg, 8, 32, 1)
++    return out.contiguous()
++
++
++def _major_scales(scales: torch.Tensor, n: int) -> torch.Tensor:
++    kg = scales.shape[1]
++    npad = -(-n // 128) * 128
++    out = torch.zeros((kg, npad), dtype=torch.float16, device=scales.device)
++    out[:, :n] = scales.to(torch.float16).t().contiguous()
++    return out.contiguous()
++
++
++def pack_codes(codes: torch.Tensor, scales_fp16: torch.Tensor, *, keep_base3: bool = True) -> TQ:
++    """Pack explicit uint8 codes (n, k) and fp16 scales (n, k/128)."""
++
++    if codes.dtype != torch.uint8 or codes.dim() != 2:
++        raise ValueError("codes must be uint8 (n, k)")
++    if bool((codes > 2).any()):
++        raise ValueError("ternary codes must be <= 2")
++    n, k = map(int, codes.shape)
++    if scales_fp16.shape != (n, k // GROUP):
++        raise ValueError("scales must be (n, k/128)")
++    sc = scales_fp16.to(torch.float16).contiguous()
++    payload = _pack_codes(codes) if keep_base3 else None
++    return TQ(payload, sc if keep_base3 else None, n, k, pq2=_pack_pq2_lane(codes), pq2_scales=_major_scales(sc, n))
++
++
++def pack_mlx(weight_int32: torch.Tensor, scales_fp16: torch.Tensor, biases_fp16: torch.Tensor, *, keep_base3: bool = False) -> TQ | None:
++    """MLX 2-bit affine words -> TQ, or None if the weight is not lossless ternary.
++
++    ``weight_int32`` is (n, k/16) with code p in bits 2p. ``scales`` and
++    ``biases`` are (n, k/128). Bonsai ternary requires all codes <= 2 and
++    bias == -scale bitwise/numerically after fp16 conversion.
++    """
++
++    words = _as_i32_words(weight_int32)
++    if words.dim() != 2:
++        raise ValueError("weight must be a 2-D word matrix")
++    n, w = map(int, words.shape)
++    k = w * 16
++    if k % GROUP or tuple(scales_fp16.shape) != (n, k // GROUP) or tuple(biases_fp16.shape) != (n, k // GROUP):
++        raise ValueError("shape mismatch for 2-bit group-128 affine weight")
++    s = scales_fp16.to(torch.float16)
++    b = biases_fp16.to(torch.float16)
++    if not bool((b == -s).all()):
++        return None
++    codes = _codes_from_words(words)
++    if bool((codes > 2).any()):
++        return None
++    sc = s.contiguous()
++    payload = _pack_codes(codes) if keep_base3 else None
++    return TQ(payload, sc if keep_base3 else None, n, k, pq2=_pack_pq2_lane(codes), pq2_scales=_major_scales(sc, n))
++
++
++def unpack(tq: TQ) -> tuple[torch.Tensor, torch.Tensor]:
++    """Reference unpack: returns codes uint8 (n, k) and scales fp16 bit-exact."""
++
++    p = tq.payload
++    if p is None or tq.scales is None:
++        raise ValueError("TQ was packed without base-3 payload; unpack is unavailable")
++    dev = p.device
++    out = torch.empty((tq.n, tq.k), dtype=torch.uint8, device=dev)
++    pow5 = _POW5.to(dev, dtype=torch.uint8)
++    pow4 = _POW4.to(dev, dtype=torch.uint8)
++    # Division is exact because every byte is < 243 (or < 81 for the tail).
++    main = ((p[:, :, :24, None] // pow5) % 3).reshape(tq.n, tq.k // GROUP, 120)
++    tail = ((p[:, :, 24:, None] // pow4) % 3).reshape(tq.n, tq.k // GROUP, 8)
++    out.reshape(tq.n, tq.k // GROUP, GROUP)[:, :, :120] = main
++    out.reshape(tq.n, tq.k // GROUP, GROUP)[:, :, 120:] = tail
++    return out, tq.scales.clone()
++
++
++def rows(tq: TQ, a: int, b: int) -> TQ:
++    """Cheap row view/copy for rows [a,b). Contiguous row ranges are zero-copy views."""
++
++    if not (0 <= a <= b <= tq.n):
++        raise ValueError("invalid row range")
++    pq2 = tq.pq2[a // 64:b // 64] if tq.pq2 is not None and a % 64 == 0 and (b - a) % 128 == 0 else None
++    pq2s = tq.pq2_scales[:, a:b] if tq.pq2_scales is not None else None
++    if pq2 is None and tq.pq2 is not None:
++        # Non tile-aligned row views are uncommon; repack the small base3 slice through explicit codes.
++        codes, scales = unpack(TQ(tq.payload[a:b], tq.scales[a:b], b - a, tq.k, tq.row0 + a))
++        return pack_codes(codes.contiguous(), scales.contiguous())
++    payload = None if tq.payload is None else tq.payload[a:b]
++    scales = None if tq.scales is None else tq.scales[a:b]
++    return TQ(payload, scales, b - a, tq.k, tq.row0 + a, pq2, pq2s)
++
++
++def stack(parts: list[TQ]) -> TQ:
++    """Stack several weights with the same K for grouped launches/fused projections."""
++
++    if not parts:
++        raise ValueError("need at least one TQ")
++    if len({p.k for p in parts}) != 1:
++        raise ValueError("all stacked ternary weights must share K")
++    n = sum(p.n for p in parts)
++    # Concatenating independently padded tiled layouts is only valid when every previous part ends on a 128-row pad
++    # boundary and the final padded tile count matches the logical stacked shape. Otherwise repack from base3 codes.
++    if all(p.pq2 is not None and p.pq2_scales is not None and p.n % 128 == 0 for p in parts[:-1]):
++        pq2 = torch.cat([p.pq2 for p in parts], dim=0).contiguous()
++        pq2s = torch.cat([p.pq2_scales[:, :p.n] for p in parts], dim=1)
++        pq2s = _major_scales(pq2s.t().contiguous(), n)
++        if pq2.shape[0] == -(-n // 128) * 2:
++            payload = (torch.cat([p.payload for p in parts], dim=0).contiguous()
++                               if all(p.payload is not None for p in parts) else None)
++            scales = (torch.cat([p.scales for p in parts], dim=0).contiguous()
++                              if all(p.scales is not None for p in parts) else None)
++            return TQ(payload, scales, n, parts[0].k, pq2=pq2, pq2_scales=pq2s)
++    codes_scales = [unpack(p) for p in parts]
++    return pack_codes(torch.cat([c for c, _ in codes_scales], dim=0).contiguous(),
++                      torch.cat([sc for _, sc in codes_scales], dim=0).contiguous())
++
++
++def _check_x(x: torch.Tensor, tq: TQ) -> torch.Tensor:
++    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != tq.k:
++        raise ValueError(f"x must be bf16 (M, {tq.k})")
++    if not (1 <= x.shape[0] <= 128):
++        raise ValueError("qmm_tern PQ2 decode supports 1 <= M <= 128; use the prefill GEMM above that")
++    if x.stride(1) != 1:
++        x = x.contiguous()
++    return x
++
++
++def matmul(x: torch.Tensor, tq: TQ, *, f32: bool = False, out: torch.Tensor | None = None,
++           int8: bool = False) -> torch.Tensor:
++    """x @ dequant(tq).T for decode M=1..32. Accumulation is fp32; output bf16 unless f32=True."""
++
++    x = _check_x(x, tq)
++    dtype = torch.float32 if f32 else torch.bfloat16
++    if out is None:
++        out = torch.empty((x.shape[0], tq.n), dtype=dtype, device=x.device)
++    if int8:
++        # Accuracy/reference path retained for tests; the fast serving path is PQ2 bf16.
++        xq, xscale = quantize_int8_groups(x, GROUP)
++        xf = (xq.float().reshape(x.shape[0], x.shape[1] // GROUP, GROUP) * xscale[..., None]).reshape_as(x.float())
++        out.copy_((xf @ dequant_weight(tq).t()).to(out.dtype))
++        return out
++    if tq.pq2 is None or tq.pq2_scales is None:
++        raise ValueError("TQ lacks PQ2 fast layout; repack with pack_mlx/pack_codes")
++    from tensorfold.cuda.kernels import qmm as shared
++    from .qmm_tiles import group_tile
++    xs = shared.group_sums(x, 64)
++    sk = shared.split_k(tq.n, tq.k, 64)
++    major, minor = torch.cuda.get_device_capability(x.device)
++    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
++    _ext().pq2_group(x, xs, [tq.pq2], [tq.pq2_scales], [out], [tq.n], [sk], f32,
++                     group_tile(x.shape[0], major, minor, sms), -1)
++    return out
++
++
++def matmul_group(x: torch.Tensor, qs: list[TQ], *, f32: bool = False, int8: bool = False) -> list[torch.Tensor]:
++    """Grouped API: same input against several TQ weights. Current v1 dispatches one kernel per part."""
++
++    if not qs:
++        return []
++    if len({q.k for q in qs}) != 1:
++        raise ValueError("all grouped ternary weights must share K")
++    if int8 or any(q.pq2 is None or q.pq2_scales is None for q in qs) or len(qs) > 4:
++        return [matmul(x, q, f32=f32, int8=int8) for q in qs]
++    x = _check_x(x, qs[0])
++    if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 8) or x.data_ptr() % 16:
++        x = x.clone(memory_format=torch.contiguous_format)
++    from tensorfold.cuda.kernels import qmm as shared
++    from .qmm_tiles import group_tile
++    xs = shared.group_sums(x, 64)
++    sks = [shared.split_k(q.n, q.k, 64) for q in qs]
++    dtype = torch.float32 if f32 else torch.bfloat16
++    outs = [torch.empty((x.shape[0], q.n), dtype=dtype, device=x.device) for q in qs]
++    major, minor = torch.cuda.get_device_capability(x.device)
++    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
++    _ext().pq2_group(x, xs, [q.pq2 for q in qs], [q.pq2_scales for q in qs], outs, [q.n for q in qs], sks, f32,
++                     group_tile(x.shape[0], major, minor, sms), -1)
++    return outs
++
++
++
++def _check_prefill_x(x: torch.Tensor, tq: TQ) -> torch.Tensor:
++    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != tq.k:
++        raise ValueError(f"x must be bf16 (M, {tq.k})")
++    if x.shape[0] < 1:
++        raise ValueError("prefill_matmul takes at least one row")
++    if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 8) or x.data_ptr() % 16:
++        x = x.clone(memory_format=torch.contiguous_format)
++    return x
++
++
++def prefill_matmul(x: torch.Tensor, tq: TQ, *, f32: bool = False, tile: int = 0,
++                   out: torch.Tensor | None = None) -> torch.Tensor:
++    """Large-M prompt GEMM: ``x @ dequant(tq).T`` using PQ2 weights directly, no widened Q4 copy."""
++
++    if tq.pq2 is None or tq.pq2_scales is None:
++        raise ValueError("TQ lacks PQ2 fast layout; repack with pack_mlx/pack_codes")
++    x = _check_prefill_x(x, tq)
++    if out is None:
++        out = torch.empty((x.shape[0], tq.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    _ext().prefill_matmul(x, tq.pq2, tq.pq2_scales, out, tq.n, f32, tile)
++    return out
++
++
++def prefill_matmul8(xq: tuple[torch.Tensor, torch.Tensor, torch.Tensor], tq: TQ, *, f32: bool = False, tile: int = 0,
++                    out: torch.Tensor | None = None) -> torch.Tensor:
++    """FP8-row prompt GEMM on ``tensorfold.cuda.kernels.qmm.quantize_rows`` output, reading PQ2 weights directly."""
++
++    if tq.pq2 is None or tq.pq2_scales is None:
++        raise ValueError("TQ lacks PQ2 fast layout; repack with pack_mlx/pack_codes")
++    x8, xs, a = xq
++    if x8.dim() != 2 or x8.shape[1] != tq.k:
++        raise ValueError(f"prefill_matmul8: inputs must be (M, {tq.k})")
++    if out is None:
++        out = torch.empty((x8.shape[0], tq.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x8.device)
++    _ext().prefill_matmul8(x8, xs, a, tq.pq2, tq.pq2_scales, out, tq.n, f32, tile)
++    return out
++
++
++def quantize_int8_groups(x: torch.Tensor, gs: int = GROUP) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-row, per-128 absmax int8 activations for the optional q8 path."""
++
++    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] % gs:
++        raise ValueError("x must be bf16 (M, K multiple of group size)")
++    xf = x.float().reshape(x.shape[0], x.shape[1] // gs, gs)
++    scale = (xf.abs().amax(dim=2) / 127.0).clamp_min(1.0e-8)
++    q = torch.round(xf / scale[..., None]).clamp(-127, 127).to(torch.int8).reshape_as(x).contiguous()
++    return q, scale.contiguous()
++
++
++def dequant_weight(tq: TQ) -> torch.Tensor:
++    """Slow reference dequantized weight (n, k) fp32."""
++
++    codes, scales = unpack(tq)
++    return (codes.float().reshape(tq.n, tq.k // GROUP, GROUP) - 1.0).mul_(
++        scales.float().unsqueeze(-1)).reshape(tq.n, tq.k)
+--- tensorfold/families/bonsai/__init__.py
++++ tensorfold/families/bonsai/__init__.py
+@@ -22,7 +22,7 @@
+ CUDA_AFFINE_BITS = (2,)
+ CUDA_AFFINE_GROUPS = (128,)
+ CUDA_CHECKPOINT_SLOTS = True
+-CUDA_PREFILL_FP8 = False
++CUDA_PREFILL_FP8 = True
+ 
+ 
+ 
+--- tensorfold/families/qwen3_5/cuda/dflash2.py
++++ tensorfold/families/qwen3_5/cuda/dflash2.py
+@@ -234,6 +234,8 @@
+                 raise ValueError("a two-rank drafter needs the MLX checkpoint's 4-bit head")
+             sub, self.head_cols = _exl3_sub_head(target.head.layer, spans)
+             self.sub_head = Exl3(sub)
++        elif world == 1 and hasattr(target.head, "pq2"):
++            self.sub_head = target.head
+         elif world == 1 and target.head.layout == "tiled":
+             self.sub_rows = [rows(target.head, a, b) for a, b in spans]
+         else:
+@@ -526,6 +528,8 @@
+             logits = self.sub_head(h.contiguous()).index_select(1, self.head_cols)
+         elif self.sub_rows is not None:
+             logits = matmul_rows(h, self.sub_rows)
++        elif hasattr(self.sub_head, "pq2"):
++            logits = matmul(h, self.sub_head).index_select(1, self.head_ids)
+         else:
+             logits = matmul(h, self.sub_head)
+         values, local_ids = torch.topk(logits.float(), k=16, dim=-1, sorted=False)
+--- tensorfold/families/qwen3_5/cuda/forward.py
++++ tensorfold/families/qwen3_5/cuda/forward.py
+@@ -11,22 +11,31 @@
+ from tensorfold.cuda import kv_fp8, moe
+ from tensorfold.cuda.kernels import attention as tree_attention
+ from tensorfold.cuda.kernels import gdn as deltanet
++from tensorfold.cuda.kernels import prism_rot
+ 
+ from . import glue
+-from .qmm_fast import matmul, matmul_group
++from .qmm_fast import matmul, matmul_group, matmul_group_rotated, matmul_rotated
+ from .weights import Plain, QLinear, Weights
+ 
+ 
+ def _mm(x: torch.Tensor, w: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
++    if hasattr(w, "pq2"):
++        return matmul(x, w, xs)
+     if not isinstance(w, QLinear):
+         return w(x)                                        # an EXL3 pack's weights run their own row-invariant kernels
+     return matmul(x, w, xs)
+ 
+ 
++def _mm_rotated(x: torch.Tensor, w: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
++    if not isinstance(w, QLinear) and not hasattr(w, "pq2"):
++        return w(x)
++    return matmul_rotated(x, w, xs)
++
++
+ def _mm_group(x: torch.Tensor, ws: list, xs: torch.Tensor | None = None) -> list[torch.Tensor]:
+     """Projections of one input, each with the bits of its own ``_mm``: one launch on sm_12x for tiled 4-bit weights."""
+ 
+-    if all(isinstance(w, QLinear) for w in ws):
++    if all(isinstance(w, QLinear) or hasattr(w, "pq2") for w in ws):
+         return matmul_group(x, ws, xs)
+     shared = [i for i, w in enumerate(ws) if getattr(w, "act", None) is not None]   # checkpoint math: quantize once
+     got = {}
+@@ -43,13 +52,28 @@
+     return [got[i] if i in got else _mm(x, w, xs) for i, w in enumerate(ws)]
+ 
+ 
++def _mm_group_rotated(x: torch.Tensor, ws: list, xs: torch.Tensor | None = None) -> list[torch.Tensor]:
++    if all(isinstance(w, QLinear) or hasattr(w, "pq2") for w in ws):
++        return matmul_group_rotated(x, ws, xs)
++    return [_mm_rotated(x, w, xs) for w in ws]
++
++
+ def _row_mm(x: torch.Tensor, w: QLinear, tp: bool,
+             xs: torch.Tensor | None = None) -> torch.Tensor:
+     if not tp:
+         return _mm(x, w, xs)
+     from .distributed import gather_rank_partials, row_partial
+ 
+-    return gather_rank_partials(row_partial(x, w, xs=xs if w.layout == "tiled" else None))
++    return gather_rank_partials(row_partial(x, w, xs=xs if getattr(w, "layout", None) == "tiled" else None))
++
++
++def _row_mm_rotated(x: torch.Tensor, w: QLinear, tp: bool,
++                    xs: torch.Tensor | None = None) -> torch.Tensor:
++    if not tp:
++        return _mm_rotated(x, w, xs)
++    from .distributed import gather_rank_partials, row_partial
++
++    return gather_rank_partials(row_partial(x, w, xs=xs if getattr(w, "layout", None) == "tiled" else None))
+ 
+ 
+ def _mlp(layer, h: torch.Tensor, xs: torch.Tensor, tp: bool) -> torch.Tensor:
+@@ -59,10 +83,29 @@
+         if tp:
+             raise ValueError("routed experts run on one GPU")
+         return moe.run(h, layer.moe)
++    signs = getattr(layer.down, "prism_signs", None)
++    if signs is not None:
++        act, act_xs = prism_rot.swiglu_rotate(*_mm_group(h, [layer.gate, layer.up], xs),
++                                              signs, return_xs=False)
++        return _row_mm_rotated(act, layer.down, tp, act_xs)
+     act, act_xs = glue.swiglu(*_mm_group(h, [layer.gate, layer.up], xs))
+     return _row_mm(act, layer.down, tp, act_xs)
+ 
+ 
++def _mlp_rotated(layer, h: torch.Tensor, xs: torch.Tensor | None, tp: bool) -> torch.Tensor:
++    if layer.moe is not None:
++        if tp:
++            raise ValueError("routed experts run on one GPU")
++        return moe.run(h, layer.moe)
++    signs = getattr(layer.down, "prism_signs", None)
++    if signs is not None:
++        act, act_xs = prism_rot.swiglu_rotate(*_mm_group_rotated(h, [layer.gate, layer.up], xs),
++                                              signs, return_xs=False)
++        return _row_mm_rotated(act, layer.down, tp, act_xs)
++    act, act_xs = glue.swiglu(*_mm_group_rotated(h, [layer.gate, layer.up], xs))
++    return _row_mm(act, layer.down, tp, act_xs)
++
++
+ def _paths(parents: Sequence[int]) -> tuple[list[int], bool]:
+     if not parents or parents[0] != -1:
+         raise ValueError("a verify window needs a root at row zero")
+@@ -247,8 +290,8 @@
+     record: list[Record] = []
+     taps: list[torch.Tensor] = []
+     for i, layer in enumerate(w.layers):
+-        x, h, xs = glue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+         if layer.linear:
++            x, h, xs = glue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+             gdn = layer.gdn
+             if gdn.zba is not None:
+                 qkv, zba = _mm_group(h, [gdn.qkv, gdn.zba], xs)
+@@ -263,37 +306,66 @@
+                                               gdn.A_log, gdn.dt_bias, kh=c.k_heads,
+                                               vh=c.v_heads, dk=c.dk)
+             yr = deltanet.tree(q, k, v, g, beta, plan, state=st.rec[i])
+-            out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
+-            r = _row_mm(out, gdn.out, tp, out_xs)
++            signs = getattr(gdn.out, "prism_signs", None)
++            if signs is not None:
++                out, out_xs = prism_rot.gated_norm_rotate(yr, z, gdn.norm, c.eps, signs, return_xs=False)
++                r = _row_mm_rotated(out, gdn.out, tp, out_xs)
++            else:
++                out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
++                r = _row_mm(out, gdn.out, tp, out_xs)
+             record.append(GDNRecord(q, k, v, g, beta, qkv))
+         else:
+             attn = layer.attn
++            signs = getattr(attn.q, "prism_signs", None)
++            if signs is not None:
++                x, h, xs = prism_rot.add_rmsnorm_rotate(x, pending, layer.input_norm, c.eps, signs,
++                                                        return_xs=False)
++                group = _mm_group_rotated
++            else:
++                x, h, xs = glue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
++                group = _mm_group
+             if attn.kv is not None:
+-                qg, kv = _mm_group(h, [attn.q, attn.kv], xs)
++                qg, kv = group(h, [attn.q, attn.kv], xs)
+                 kd = c.kv_heads * c.head_dim
+                 key = kv[:, :kd].contiguous()
+                 value = kv[:, kd:].contiguous().reshape(W, c.kv_heads, c.head_dim)
+             else:
+-                qg, key, value = _mm_group(h, [attn.q, attn.k, attn.v], xs)
++                qg, key, value = group(h, [attn.q, attn.k, attn.v], xs)
+                 value = value.reshape(W, c.kv_heads, c.head_dim)
+             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos,
+                                     w.inv_freq, c.eps, heads=c.heads, kv_heads=c.kv_heads,
+                                     head_dim=c.head_dim)
+             key, value = kv_fp8.round(key), kv_fp8.round(value)      # the rows as the cache holds them
+             out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+-            gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
+-            r = _row_mm(gated, attn.o, tp, out_xs)
++            signs = getattr(attn.o, "prism_signs", None)
++            if signs is not None:
++                gated, out_xs = prism_rot.gate_mul_rotate(out, qg, signs, heads=c.heads, head_dim=c.head_dim,
++                                                          return_xs=False)
++                r = _row_mm_rotated(gated, attn.o, tp, out_xs)
++            else:
++                gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
++                r = _row_mm(gated, attn.o, tp, out_xs)
+             record.append(AttentionRecord(key, value))
+-        x, h, xs = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
+-        pending = _mlp(layer, h, xs, tp)
++        signs = getattr(layer.gate, "prism_signs", None)
++        if signs is not None:
++            x, h, xs = prism_rot.add_rmsnorm_rotate(x, r, layer.post_norm, c.eps, signs, return_xs=False)
++            pending = _mlp_rotated(layer, h, xs, tp)
++        else:
++            x, h, xs = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
++            pending = _mlp(layer, h, xs, tp)
+         if capture_taps and i in (5, 19, 33, 47, 61):
+             taps.append((x.float() + pending.float()).to(torch.bfloat16))
+     if not finish:
+         if pending is None:
+             raise ValueError("pipeline stage must contain at least one layer")
+         return (x, pending), record
+-    _, h, xs = glue.add_rmsnorm(x, pending, w.norm, c.eps)
+-    logits = _mm(h, w.head, xs) if full_logits else h
++    signs = getattr(w.head, "prism_signs", None)
++    if signs is not None:
++        _, h, xs = prism_rot.add_rmsnorm_rotate(x, pending, w.norm, c.eps, signs, return_xs=False)
++        logits = _mm_rotated(h, w.head, xs) if full_logits else h
++    else:
++        _, h, xs = glue.add_rmsnorm(x, pending, w.norm, c.eps)
++        logits = _mm(h, w.head, xs) if full_logits else h
+     if capture_taps:
+         if len(taps) != 5:
+             raise ValueError("DFlash2 taps require the complete 64-layer target")
+@@ -354,8 +426,8 @@
+     record: list[Record] = []
+     taps: list[torch.Tensor] = []
+     for i, layer in enumerate(w.layers):
+-        x, h, xs = glue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+         if layer.linear:
++            x, h, xs = glue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+             gdn = layer.gdn
+             if gdn.zba is not None:
+                 qkv, zba = _mm_group(h, [gdn.qkv, gdn.zba], xs)
+@@ -370,33 +442,62 @@
+             q, k, v, g, beta = glue.gdn_pre(qkv, conv, gdn.conv, windows_t, a, b, gdn.A_log, gdn.dt_bias,
+                                             kh=c.k_heads, vh=c.v_heads, dk=c.dk, stream_ids=sid_t, nkeep=keep)
+             yr = deltanet.tree(q, k, v, g, beta, plan, table=tables[i])
+-            out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
+-            r = _row_mm(out, gdn.out, tp, out_xs)
++            signs = getattr(gdn.out, "prism_signs", None)
++            if signs is not None:
++                out, out_xs = prism_rot.gated_norm_rotate(yr, z, gdn.norm, c.eps, signs, return_xs=False)
++                r = _row_mm_rotated(out, gdn.out, tp, out_xs)
++            else:
++                out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
++                r = _row_mm(out, gdn.out, tp, out_xs)
+             record.append(GDNRecord(q, k, v, g, beta, qkv))
+         else:
+             attn = layer.attn
++            signs = getattr(attn.q, "prism_signs", None)
++            if signs is not None:
++                x, h, xs = prism_rot.add_rmsnorm_rotate(x, pending, layer.input_norm, c.eps, signs,
++                                                        return_xs=False)
++                group = _mm_group_rotated
++            else:
++                x, h, xs = glue.add_rmsnorm(x, pending, layer.input_norm, c.eps)
++                group = _mm_group
+             if attn.kv is not None:
+-                qg, kv = _mm_group(h, [attn.q, attn.kv], xs)
++                qg, kv = group(h, [attn.q, attn.kv], xs)
+                 kd = c.kv_heads * c.head_dim
+                 key = kv[:, :kd].contiguous()
+                 value = kv[:, kd:].contiguous().reshape(W, c.kv_heads, c.head_dim)
+             else:
+-                qg, key, value = _mm_group(h, [attn.q, attn.k, attn.v], xs)
++                qg, key, value = group(h, [attn.q, attn.k, attn.v], xs)
+                 value = value.reshape(W, c.kv_heads, c.head_dim)
+             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos,
+                                     w.inv_freq, c.eps, heads=c.heads, kv_heads=c.kv_heads,
+                                     head_dim=c.head_dim)
+             key, value = kv_fp8.round(key), kv_fp8.round(value)      # the rows as the cache holds them
+             out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+-            gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
+-            r = _row_mm(gated, attn.o, tp, out_xs)
++            signs = getattr(attn.o, "prism_signs", None)
++            if signs is not None:
++                gated, out_xs = prism_rot.gate_mul_rotate(out, qg, signs, heads=c.heads, head_dim=c.head_dim,
++                                                          return_xs=False)
++                r = _row_mm_rotated(gated, attn.o, tp, out_xs)
++            else:
++                gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
++                r = _row_mm(gated, attn.o, tp, out_xs)
+             record.append(AttentionRecord(key, value))
+-        x, h, xs = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
+-        pending = _mlp(layer, h, xs, tp)
++        signs = getattr(layer.gate, "prism_signs", None)
++        if signs is not None:
++            x, h, xs = prism_rot.add_rmsnorm_rotate(x, r, layer.post_norm, c.eps, signs, return_xs=False)
++            pending = _mlp_rotated(layer, h, xs, tp)
++        else:
++            x, h, xs = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
++            pending = _mlp(layer, h, xs, tp)
+         if capture_taps and i in (5, 19, 33, 47, 61):
+             taps.append((x.float() + pending.float()).to(torch.bfloat16))
+-    _, h, xs = glue.add_rmsnorm(x, pending, w.norm, c.eps)
+-    logits = _mm(h, w.head, xs) if full_logits else h
++    signs = getattr(w.head, "prism_signs", None)
++    if signs is not None:
++        _, h, xs = prism_rot.add_rmsnorm_rotate(x, pending, w.norm, c.eps, signs, return_xs=False)
++        logits = _mm_rotated(h, w.head, xs) if full_logits else h
++    else:
++        _, h, xs = glue.add_rmsnorm(x, pending, w.norm, c.eps)
++        logits = _mm(h, w.head, xs) if full_logits else h
+     if capture_taps:
+         if len(taps) != 5:
+             raise ValueError("DFlash2 taps require the complete 64-layer target")
+--- tensorfold/families/qwen3_5/cuda/prefill.py
++++ tensorfold/families/qwen3_5/cuda/prefill.py
+@@ -10,6 +10,7 @@
+ 
+ from tensorfold.cuda import kv_fp8, moe, prompt_precision
+ from tensorfold.cuda.kernels import gdn as deltanet
++from tensorfold.cuda.kernels import qmm_tern
+ from tensorfold.cuda.kernels import qmm as shared
+ from tensorfold.cuda.kernels.prefill_attention import attention
+ 
+@@ -28,10 +29,42 @@
+     """``x``: bf16 rows (``prefill_bf16``), or e4m3 rows with group sums and row scales (``prefill_glue``, FP8)."""
+ 
+     if isinstance(x, tuple):
++        if isinstance(w, qmm_tern.TQ):
++            return qmm_tern.prefill_matmul8(x, w, f32=f32, tile=shared.prompt_tile(x[0].shape[0], w.n))
+         return shared.prefill_matmul8(x, tile(w), f32=f32) if isinstance(w, QLinear) else w.prefill8(x)
+     if not isinstance(w, QLinear):
++        if isinstance(w, qmm_tern.TQ):
++            tile_size = shared.prompt_tile(x.shape[0], w.n)
++            signs = getattr(w, "prism_signs", None)
++            if signs is not None:
++                if prompt_precision.fp8():
++                    from tensorfold.cuda.kernels import prism_rot
++
++                    return qmm_tern.prefill_matmul8(prism_rot.rotate_quantize_rows(x, signs, 64), w,
++                                                    f32=f32, tile=tile_size)
++                from tensorfold.families.bonsai.cuda import rotate_rows
++
++                x = rotate_rows(x, signs)
++            elif prompt_precision.fp8():
++                return qmm_tern.prefill_matmul8(shared.quantize_rows(x, 64), w, f32=f32, tile=tile_size)
++            return qmm_tern.prefill_matmul(x, w, f32=f32, tile=tile_size)
+         return w.prefill(x)                               # an EXL3 pack's or an NVFP4 checkpoint's projection
+     packed = tile(w)
++    if isinstance(packed, qmm_tern.TQ):
++        tile_size = shared.prompt_tile(x.shape[0], packed.n)
++        signs = getattr(packed, "prism_signs", None)
++        if signs is not None:
++            if prompt_precision.fp8():
++                from tensorfold.cuda.kernels import prism_rot
++
++                return qmm_tern.prefill_matmul8(prism_rot.rotate_quantize_rows(x, signs, 64), packed,
++                                                f32=f32, tile=tile_size)
++            from tensorfold.families.bonsai.cuda import rotate_rows
++
++            x = rotate_rows(x, signs)
++        elif prompt_precision.fp8():
++            return qmm_tern.prefill_matmul8(shared.quantize_rows(x, 64), packed, f32=f32, tile=tile_size)
++        return qmm_tern.prefill_matmul(x, packed, f32=f32, tile=tile_size)
+     if packed.fast:                                       # each weight rounded once to bf16, one fp32 chain over K
+         if hasattr(packed, "prism_signs"):                # Prism Bonsai: rows into the weight's Hadamard basis
+             from tensorfold.families.bonsai.cuda import rotate_rows
+@@ -88,7 +121,7 @@
+     """Commit ``tokens`` at [st.pos, st.pos + W) into ``st`` without writing through its entries (``every``: all rows' final normed states; ``cut``: also the state after the first ``cut`` rows, the GDN chains run as two launches with one launch's bits)."""
+ 
+     c = w.config
+-    pg = prefill_glue if w.fast_prefill and prompt_precision.fp8() else prefill_bf16   # e4m3 rows when prompts take FP8
++    pg = (prefill_glue if w.fast_prefill and prompt_precision.fp8() and w.quant != "bonsai" else prefill_bf16)
+     W = int(tokens.shape[0])
+     if not 0 <= cut < W:
+         raise ValueError(f"cut {cut} is not inside a chunk of {W} rows")
+@@ -254,7 +287,7 @@
+     c = w.config
+     if any(layer.moe is not None for layer in w.layers):
+         raise ValueError("a batched prefill takes dense layers only")
+-    pg = prefill_glue if w.fast_prefill and prompt_precision.fp8() else prefill_bf16
++    pg = (prefill_glue if w.fast_prefill and prompt_precision.fp8() and w.quant != "bonsai" else prefill_bf16)
+     sts = [st for _, st, _ in items]
+     sizes = [len(ids) for ids, _, _ in items]
+     starts = np.concatenate([[0], np.cumsum(sizes)]).tolist()
+--- tensorfold/families/qwen3_5/cuda/qmm_fast.py
++++ tensorfold/families/qwen3_5/cuda/qmm_fast.py
+@@ -7,10 +7,13 @@
+ import torch
+ 
+ from tensorfold.cuda.kernels import qmm as shared
++from tensorfold.cuda.kernels import qmm_tern
+ 
+ from .qmm import lane_matmul
+ from .weights import QLinear, Weights
+ 
++PQ2_PREFILL_ROWS = 96
++
+ 
+ def _copy_prism(src: QLinear, dst: QLinear) -> QLinear:
+     if hasattr(src, "prism_signs"):
+@@ -21,6 +24,8 @@
+ 
+ 
+ def tile(q: QLinear) -> QLinear:
++    if isinstance(q, qmm_tern.TQ):
++        return q
+     if q.layout == "tiled" or not q.fast:
+         return q
+     p = shared.pack(q.weight, q.scales, q.biases, 64)
+@@ -35,6 +40,8 @@
+ def untile(q: QLinear) -> QLinear:
+     """The stored MLX layout again (for the fp32 reference, TP sharding or slicing rows)."""
+ 
++    if isinstance(q, qmm_tern.TQ):
++        raise ValueError("PQ2 weights are serving-only and cannot be untiled without the original checkpoint words")
+     if q.layout != "tiled":
+         return q
+     return _copy_prism(q, QLinear(*shared.unpack(shared.Q4(q.weight, q.scales, q.biases, q.n, q.k, 64))))
+@@ -43,6 +50,8 @@
+ def rows(q: QLinear, a: int, b: int) -> QLinear:
+     """Rows [a, b) of a tiled weight: a view when they are whole 128-row blocks from a tile edge, else a small copy."""
+ 
++    if isinstance(q, qmm_tern.TQ):
++        return _copy_prism(q, qmm_tern.rows(q, a, b))
+     if a % 64 == 0 and (b - a) % 128 == 0:
+         out = _copy_prism(q, QLinear(q.weight[a // 64:b // 64], q.scales[:, a:b], q.biases[:, a:b], layout="tiled",
+                                      rows=b - a))
+@@ -72,12 +81,17 @@
+     """``x`` against row blocks of one weight, with the bits of the stacked weight's matmul."""
+ 
+     x, _ = _rotate(x, parts[0], None)
++    if isinstance(parts[0], qmm_tern.TQ):
++        run = qmm_tern.prefill_matmul if x.shape[0] >= PQ2_PREFILL_ROWS else qmm_tern.matmul
++        return torch.cat([run(x, p) for p in parts], dim=1)
+     sk = shared.split_k(sum(p.n for p in parts), parts[0].k, parts[0].gs)
+     xs = shared.group_sums(x, parts[0].gs)
+     return torch.cat([shared.matmul(x, p, xs, sk=sk) for p in parts], dim=1)
+ 
+ 
+ def _matmul(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
++    if isinstance(q, qmm_tern.TQ):
++        return qmm_tern.prefill_matmul(x, q) if x.shape[0] >= PQ2_PREFILL_ROWS else qmm_tern.matmul(x, q)
+     if not q.fast:
+         from tensorfold.cuda.kernels.affine import matmul as affine_matmul
+ 
+@@ -94,6 +108,12 @@
+     return _matmul(x, q, xs)
+ 
+ 
++def matmul_rotated(x: torch.Tensor, q: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
++    """Matmul for inputs already transformed into ``q``'s Prism basis."""
++
++    return _matmul(x, q, xs)
++
++
+ def matmul_group(x: torch.Tensor, qs: list[QLinear], xs: torch.Tensor | None = None) -> list[torch.Tensor]:
+     """``[matmul(x, q, xs) for q in qs]`` with the same bits: one launch on sm_12x when all are tiled 4-bit."""
+ 
+@@ -101,7 +121,23 @@
+     if any(getattr(q, "prism_signs", None) is not signs for q in qs):
+         return [matmul(x, q, xs) for q in qs]          # projections in different bases: each rotates its own input
+     x, xs = _rotate(x, qs[0], xs)                       # one shared basis: rotate once for the group
+-    if all(q.layout == "tiled" and q.fast for q in qs):
++    if all(isinstance(q, qmm_tern.TQ) for q in qs):
++        if x.shape[0] >= PQ2_PREFILL_ROWS:
++            return [qmm_tern.prefill_matmul(x, q) for q in qs]
++        return qmm_tern.matmul_group(x, qs)
++    if all(isinstance(q, QLinear) and q.layout == "tiled" and q.fast for q in qs):
++        return shared.matmul_group(x, qs, xs)
++    return [_matmul(x, q, xs) for q in qs]
++
++
++def matmul_group_rotated(x: torch.Tensor, qs: list[QLinear], xs: torch.Tensor | None = None) -> list[torch.Tensor]:
++    """Grouped matmul for inputs already transformed into the shared Prism basis."""
++
++    if all(isinstance(q, qmm_tern.TQ) for q in qs):
++        if x.shape[0] >= PQ2_PREFILL_ROWS:
++            return [qmm_tern.prefill_matmul(x, q) for q in qs]
++        return qmm_tern.matmul_group(x, qs)
++    if all(isinstance(q, QLinear) and q.layout == "tiled" and q.fast for q in qs):
+         return shared.matmul_group(x, qs, xs)
+     return [_matmul(x, q, xs) for q in qs]
+ 
+@@ -110,6 +146,9 @@
+     """fp32 sums for a tiled weight, unrounded: a row-parallel rank's share of a projection."""
+ 
+     x, xs = _rotate(x, q, xs)
++    if isinstance(q, qmm_tern.TQ):
++        return (qmm_tern.prefill_matmul(x, q, f32=True) if x.shape[0] >= PQ2_PREFILL_ROWS
++                else qmm_tern.matmul(x, q, f32=True))
+     if not q.fast:
+         from tensorfold.cuda.kernels.affine import matmul as affine_matmul
+ 
+@@ -122,7 +161,13 @@
+ def stack(parts: list[QLinear]) -> QLinear:
+     """Several projections of the same input as one: stored-layout rows concatenated in order."""
+ 
+-    if any(q.layout != "mlx" for q in parts):
++    if all(isinstance(q, qmm_tern.TQ) for q in parts):
++        out = qmm_tern.stack(parts)
++        signs = [getattr(q, "prism_signs", None) for q in parts]
++        if signs[0] is not None and all(s is signs[0] for s in signs):
++            out.prism_signs = signs[0]
++        return out
++    if any(not isinstance(q, QLinear) or q.layout != "mlx" for q in parts):
+         raise ValueError("stack the stored layout, then tile")
+     if len({(q.bits, q.gs, q.k, q.scales.dtype, q.biases.dtype) for q in parts}) != 1:
+         raise ValueError("stacked projections must share an affine format and input width")
+@@ -135,7 +180,9 @@
+ 
+ 
+ def _stackable(parts: list[QLinear]) -> bool:
+-    return (all(q.layout == "mlx" for q in parts)
++    if all(isinstance(q, qmm_tern.TQ) for q in parts):
++        return all(q.n % 128 == 0 for q in parts[:-1])
++    return (all(isinstance(q, QLinear) and q.layout == "mlx" for q in parts)
+             and len({(q.bits, q.gs, q.k, q.scales.dtype, q.biases.dtype) for q in parts}) == 1)
+ 
+ 
+--- tensorfold/families/qwen3_5/cuda/weights.py
++++ tensorfold/families/qwen3_5/cuda/weights.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from dataclasses import dataclass
+ from functools import cached_property
+ from pathlib import Path
+@@ -220,7 +221,11 @@
+     def fast_prefill(self) -> bool:
+         """Whether every projection has an FP8 prompt kernel (run when prompts take FP8)."""
+ 
+-        if self.quant in ("exl3", "bonsai") or getattr(self, "precision", "full") == "checkpoint":
++        if self.quant == "bonsai":
++            from tensorfold.cuda.kernels import qmm_tern
++
++            return hasattr(qmm_tern, "prefill_matmul8")  # prefill.py keeps bf16 glue, then FP8-quantizes rotated rows
++        if self.quant == "exl3" or getattr(self, "precision", "full") == "checkpoint":
+             return False                             # EXL3 prompt glue stays bf16; checkpoint math has its own
+         for layer in self.layers:
+             modules = [m for m in (layer.gate, layer.up, layer.down) if m is not None]    # a MoE layer's are None
+@@ -320,15 +325,20 @@
+         if any(value.dtype not in (torch.bfloat16, torch.float16, torch.float32) for value in (scales, biases)):
+             raise ValueError(f"{name} needs floating-point affine scales and biases")
+         validate_shapes(w.shape, scales.shape, biases.shape, spec)
++        record = bonsai_records.get(name) if bonsai else None
+         if bonsai and (spec.bits, spec.group_size) == (2, 128):
+-            from tensorfold.families.bonsai.cuda import widen
++            q = None
++            if not (record and record.get("embedding")) and os.environ.get("TENSORFOLD_BONSAI_PQ2", "1") != "0":
++                from tensorfold.cuda.kernels import qmm_tern
++
++                q = qmm_tern.pack_mlx(w.contiguous(), scales, biases, keep_base3=False)
++            if q is None:
++                from tensorfold.families.bonsai.cuda import widen
+ 
+-            # same codes in the 4-bit g64 bf16 layout, so the fast lane kernels, tiling and grouping all apply
+-            q = QLinear(*widen(w.contiguous(), scales, biases, spec.group_size), gs=64, bits=4)
++                q = QLinear(*widen(w.contiguous(), scales, biases, spec.group_size), gs=64, bits=4)
+         else:
+             q = QLinear(w.contiguous(), scales.contiguous(), biases.contiguous(), gs=spec.group_size, bits=spec.bits)
+         if bonsai:
+-            record = bonsai_records.get(name)
+             if record and record.get("block") == BLOCK:
+                 signs = bonsai_signs.get(q.k)
+                 if signs is None:
