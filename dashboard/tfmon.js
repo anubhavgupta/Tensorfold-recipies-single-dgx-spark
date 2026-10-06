@@ -11,6 +11,11 @@
 // Keys (TUI mode): q quit · h help · g graphs · t theme
 
 import process from 'node:process';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const DEFAULT_PRICE_FILE = join(dirname(fileURLToPath(import.meta.url)), 'pricing.json');
 
 // ---------------------------------------------------------------- config
 
@@ -20,6 +25,7 @@ const DEFAULTS = {
   cli: false,
   theme: 'dark',
   model: '',
+  price: DEFAULT_PRICE_FILE,
 };
 
 const HELP = `tfmon — TensorFold engine dashboard
@@ -31,6 +37,7 @@ Options:
   --interval MS    poll period, ms        (default: 1000)
   --theme NAME     dark|light             (default: dark)
   --model NAME     label override for the header
+  --price FILE     pricing JSON, $/1M tokens (default: pricing.json next to tfmon.js)
   --cli            plain-text mode: print one table per poll, no TUI
   --help           show this help
 
@@ -59,6 +66,7 @@ function parseArgs(argv) {
         cfg.theme = val();
         break;
       case '--model': cfg.model = val(); break;
+      case '--price': cfg.price = val(); break;
       case '--cli': cfg.cli = true; break;
       case '--help':
         process.stdout.write(HELP);
@@ -98,13 +106,21 @@ function fmt(n, digits = 1) {
   return n.toFixed(digits);
 }
 
+// USD at any reasonable scale
+function fmtUsd(n) {
+  if (!Number.isFinite(n)) return '-';
+  if (n >= 1) return `$${n.toFixed(2)}`;
+  if (n >= 0.01) return `$${n.toFixed(3)}`;
+  return `$${n.toFixed(4)}`;
+}
+
 // Window diff of two samples { t, h }. Lifetime/util always from cur.
 function diff(prev, cur) {
   const out = {
     hasWindow: false, dt: 0,
     outTps: 0, prefillTps: 0, cacheHit: 0,
     accRate: 0, tokPerRound: 0, roundMs: 0,
-    reqRate: 0, util: 0, avgCtx: 0, avgOut: 0,
+    reqRate: 0, util: 0, avgCtx: 0, avgOut: 0, winCost: 0,
   };
   const ch = cur.h;
   if (ch.requestsTotal > 0) {
@@ -137,8 +153,32 @@ function diff(prev, cur) {
   out.tokPerRound = dAccepted / Math.max(EPS, dRounds);
   out.roundMs = dRounds > 0 ? (dDecodeS / dRounds) * 1000 : 0;
   out.reqRate = dReq / dt;
+  out.winCost = costOf(dPrompt - dCached, dCached, dComp);
   return out;
 }
+
+// pricing: USD per 1M tokens { input (uncached prompt), output, cache (cached prompt) }
+function loadPricing(path) {
+  const defs = { input: 2, output: 10, cache: 0.2, model: '' };
+  try {
+    const j = JSON.parse(readFileSync(path, 'utf8'));
+    const num = (v) => (Number.isFinite(+v) ? +v : null);
+    const out = { ...defs };
+    const a = num(j.input_per_mtok);
+    if (a != null) out.input = a;
+    const b = num(j.output_per_mtok);
+    if (b != null) out.output = b;
+    const c = num(j.cache_read_per_mtok ?? j.cache_per_mtok);
+    if (c != null) out.cache = c;
+    out.model = typeof j.model === 'string' ? j.model : '';
+    return out;
+  } catch (e) {
+    process.stderr.write(`tfmon: pricing file ${path}: ${e.message} — using built-in defaults ($2 / $10 / $0.20 per 1M tok)\n`);
+    return defs;
+  }
+}
+const costOf = (uncachedIn, cachedIn, outTok) =>
+  (Math.max(0, uncachedIn) * P.input + Math.max(0, cachedIn) * P.cache + Math.max(0, outTok) * P.output) / 1e6;
 
 // ------------------------------------------------------------------ health
 
@@ -177,6 +217,8 @@ try {
   process.stderr.write(`tfmon: ${e.message}\n\n${HELP}`);
   process.exit(2);
 }
+
+const P = loadPricing(cfg.price); // $/1M tokens: input (uncached prompt), output, cache
 
 const state = {
   sample: null,        // { t: seconds, h }
@@ -291,7 +333,7 @@ function frame() {
   }
   let host = cfg.url;
   try { host = new URL(cfg.url).host; } catch { /* keep raw url */ }
-  const title = cfg.model ? `TensorFold: ${cfg.model}` : `TensorFold @ ${host}`;
+  const title = cfg.model || P.model ? `TensorFold: ${cfg.model || P.model}` : `TensorFold @ ${host}`;
   const mid = '─'.repeat(Math.max(1, W - 2 - vlen(` ${title} `) - vlen(status)));
   const head = `┌${paint(` ${title} `, t.accent)}${paint(mid, t.dim)}${status}┐`;
 
@@ -320,11 +362,12 @@ function frame() {
     v(d && paint(` stream util ${(d.util * 100).toFixed(0)}%`, t.dim)),
   ], pw);
 
+  const lifeCost = h ? costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal) : 0;
   const bCa = box(' Cache', [
     v(d && paint(` hit ${(d.cacheHit * 100).toFixed(1)}% `, t.fg) + bar(d.cacheHit, Math.max(4, pwLast - 13))),
-    v(h && paint(` ${fmt(h.cachedTotal)} / ${fmt(h.promptTotal)} tok`, t.fg)),
-    v(h && paint(` uncached ${fmt(Math.max(0, h.promptTotal - h.cachedTotal))} tok`, t.dim)),
-    v(d && paint(` avg out ${fmt(d.avgOut)} tok/req`, t.dim)),
+    v(d && paint(` win  ${fmtUsd(d.winCost)}`, t.fg)),
+    v(h && paint(` total ${fmtUsd(lifeCost)}`, t.fg)),
+    v(h && paint(` ${fmt(h.cachedTotal)} / ${fmt(h.promptTotal)} tok`, t.dim)),
   ], pwLast);
 
   lines.push('│ ' + bTp[0] + ' ' + bSp[0] + ' ' + bCa[0] + pad('', Math.max(0, W - 5 - vlen(bTp[0]) - vlen(bSp[0]) - vlen(bCa[0]))) + '│');
@@ -348,7 +391,7 @@ function frame() {
     + (d ? paint(`   req ${d.reqRate.toFixed(1)}/s`, t.fg) : '')
     + paint(`   running ${h?.requestsRunning ?? 0}`, t.dim);
   const life = h
-    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${fmt(h.promptTotal)} · completion ${fmt(h.completionTotal)} · cached ${fmt(h.cachedTotal)} · ctx ${h.ctx}`
+    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${fmt(h.promptTotal)} · completion ${fmt(h.completionTotal)} · cost ${fmtUsd(costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal))} · ctx ${h.ctx}`
     : paint(' lifetime: — (no data yet)', t.dim);
   const keys = showHelp
     ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; lifetime is since engine start', t.dim)
@@ -397,6 +440,7 @@ function cliLine() {
     `round ${d ? d.roundMs.toFixed(0) + ' ms' : '-'}`,
     `streams ${s ? `${Math.min(s.max, s.decoding + s.prefilling)}/${s.max}` : '-'} (dec ${s?.decoding ?? 0} pre ${s?.prefilling ?? 0})`,
     `req/s ${d ? d.reqRate.toFixed(2) : '-'}`,
+    `cost ${h ? fmtUsd(costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal)) + (d ? ` (win ${fmtUsd(d.winCost)})` : '') : '-'}`,
     `lifetime ${h ? `req ${fmt(h.requestsTotal)} prompt ${fmt(h.promptTotal)} comp ${fmt(h.completionTotal)}` : '-'}`,
   ].join('  ');
 }

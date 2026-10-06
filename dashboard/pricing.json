@@ -1,0 +1,7 @@
+{
+  "model": "Qwen3.8-27B",
+  "input_per_mtok": 2.0,
+  "output_per_mtok": 10.0,
+  "cache_read_per_mtok": 0.2,
+  "_comment": "USD per 1M tokens. input = uncached prompt tokens, cache_read = cached prompt tokens, output = completion tokens. Optional 'model' is used as the header label. Defaults when a key is missing: input 2.0, output 10.0, cache_read 0.2."
+}
