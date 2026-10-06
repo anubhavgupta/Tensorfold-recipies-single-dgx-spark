@@ -95,14 +95,14 @@ const pad = (s, w) => s + ' '.repeat(Math.max(0, w - vlen(s)));
 function trunc(s, w) {
   if (vlen(s) <= w) return s;
   let vis = 0, i = 0;
-  while (i < s.length && vis < w - 1) {
+  while (i < s.length && vis < w - 2) {
     if (s[i] === '\x1b' && s[i + 1] === '[') {
       const m = /^\x1b\[[0-9;?]*[a-zA-Z]/.exec(s.slice(i));
       if (m) { i += m[0].length; continue; }
     }
     vis++; i++;
   }
-  return s.slice(0, i) + '…';
+  return s.slice(0, i) + '..';
 }
 
 // ------------------------------------------------------------- derivation
@@ -130,7 +130,7 @@ function diff(prev, cur) {
     hasWindow: false, dt: 0,
     outTps: 0, prefillTps: 0, cacheHit: 0,
     accRate: 0, tokPerRound: 0, roundMs: 0,
-    reqRate: 0, util: 0, avgCtx: 0, avgOut: 0, winCost: 0,
+    reqRate: 0, util: 0, avgCtx: 0, avgOut: 0, winCost: 0, spentPerSec: 0,
   };
   const ch = cur.h;
   if (ch.requestsTotal > 0) {
@@ -164,6 +164,7 @@ function diff(prev, cur) {
   out.roundMs = dRounds > 0 ? (dDecodeS / dRounds) * 1000 : 0;
   out.reqRate = dReq / dt;
   out.winCost = costOf(dPrompt - dCached, dCached, dComp);
+  out.spentPerSec = dt > 0 ? out.winCost / dt : 0;
   return out;
 }
 
@@ -332,13 +333,13 @@ function frame() {
   if (state.error) {
     status = paint('STALE', t.err);
     banner = state.have
-      ? `engine unreachable — last ok ${Math.round(age)}s ago`
-      : `engine unreachable — ${state.error}`;
+      ? `engine unreachable - last ok ${Math.round(age)}s ago`
+      : `engine unreachable - ${state.error}`;
   } else if (!state.have) {
-    status = paint('connecting…', t.dim);
+    status = paint('connecting...', t.dim);
   } else if (age > 3 * iv) {
     status = paint('STALE', t.err);
-    banner = `engine unreachable — last ok ${Math.round(age)}s ago`;
+    banner = `engine unreachable - last ok ${Math.round(age)}s ago`;
   } else {
     status = h.busy ? paint('OK · busy', t.warn) : paint('OK · idle', t.ok);
   }
@@ -354,29 +355,31 @@ function frame() {
   // ---- three panels
   const pw = Math.floor((W - 5) / 3);
   const pwLast = W - 5 - pw * 2;
-  const noData = paint(' waiting for data…', t.dim);
+  const noData = paint(' waiting for data...', t.dim);
   const v = (s) => (s != null ? s : noData);
 
   const bTp = box(' Throughput', [
     v(state.histOut.length
-      ? (showGraphs ? sparkline(state.histOut, pw - 4, t.graph) : paint(' (graphs off — g)', t.dim))
+      ? (showGraphs ? sparkline(state.histOut, Math.max(4, pw - 5), t.graph) : paint(' (graphs off - g)', t.dim))
       : noData),
     v(d && paint(` out ${d.outTps.toFixed(1)} tok/s`, t.fg)),
     v(d && paint(` prefill ${fmt(d.prefillTps)} tok/s`, t.fg)),
     v(d && paint(` avg in ${fmt(d.avgCtx)} tok/req`, t.dim)),
   ], pw);
 
+  const accPre = d ? ` acc ${(d.accRate * 100).toFixed(0)}% ` : '';
   const bSp = box(' Decode / Spec', [
-    v(d && paint(` acc ${(d.accRate * 100).toFixed(0)}% `, t.fg) + bar(d.accRate, Math.max(4, pw - 14))),
+    v(d && paint(accPre, t.fg) + bar(d.accRate, Math.max(4, (pw - 4) - vlen(accPre)))),
     v(d && paint(` ${d.tokPerRound.toFixed(1)} tok/round`, t.fg)),
     v(d && paint(` round ${d.roundMs.toFixed(0)} ms`, t.fg)),
     v(d && paint(` stream util ${(d.util * 100).toFixed(0)}%`, t.dim)),
   ], pw);
 
   const lifeCost = h ? costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal) : 0;
+  const hitPre = d ? ` hit ${(d.cacheHit * 100).toFixed(1)}% ` : '';
   const bCa = box(' Cache', [
-    v(d && paint(` hit ${(d.cacheHit * 100).toFixed(1)}% `, t.fg) + bar(d.cacheHit, Math.max(4, pwLast - 13))),
-    v(d && paint(' win  ', t.fg) + paint(fmtUsd(d.winCost), t.warn)),
+    v(d && paint(hitPre, t.fg) + bar(d.cacheHit, Math.max(4, (pwLast - 4) - vlen(hitPre)))),
+    v(d && paint(' spend/sec ', t.fg) + paint(fmtUsd(d.spentPerSec), t.warn)),
     v(h && paint(` ${fmt(h.cachedTotal)} / `, t.dim) + paint(fmt(h.promptTotal), t.accent) + paint(' tok', t.dim)),
   ], pwLast);
 
@@ -402,7 +405,7 @@ function frame() {
     + paint(`   running ${h?.requestsRunning ?? 0}`, t.dim);
   const life = h
     ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${paint(fmt(h.promptTotal), t.accent)} · completion ${paint(fmt(h.completionTotal), t.ok)} · cost ${paint(fmtUsd(lifeCost), t.warn)} · ctx ${h.ctx}`
-    : paint(' lifetime: — (no data yet)', t.dim);
+    : paint(' lifetime: - (no data yet)', t.dim);
   const keys = showHelp
     ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; lifetime is since engine start', t.dim)
     : paint(' q quit · h help · g graphs · t theme', t.dim);
@@ -450,7 +453,7 @@ function cliLine() {
     `round ${d ? d.roundMs.toFixed(0) + ' ms' : '-'}`,
     `streams ${s ? `${Math.min(s.max, s.decoding + s.prefilling)}/${s.max}` : '-'} (dec ${s?.decoding ?? 0} pre ${s?.prefilling ?? 0})`,
     `req/s ${d ? d.reqRate.toFixed(2) : '-'}`,
-    `cost ${h ? fmtUsd(costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal)) + (d ? ` (win ${fmtUsd(d.winCost)})` : '') : '-'}`,
+    `cost ${h ? fmtUsd(costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal)) + (d ? ` (spend/sec ${fmtUsd(d.spentPerSec)})` : '') : '-'}`,
     `lifetime ${h ? `req ${fmt(h.requestsTotal)} prompt ${fmt(h.promptTotal)} comp ${fmt(h.completionTotal)}` : '-'}`,
   ].join('  ');
 }

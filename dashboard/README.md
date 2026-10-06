@@ -33,8 +33,10 @@ layout stays on screen, dimmed — never blank).
 
 Cost is derived from the cumulative `/health` token counters:
 window cost = (Δprompt − Δcached) × input + Δcached × cache +
-Δcompletion × output. The Cache panel shows the per-window and
-lifetime cost, the footer shows lifetime cost, and `--cli` prints both.
+Δcompletion × output. The Cache panel shows `spend/sec` (window
+cost normalized to 1 s, so it is a true rate at any poll interval);
+the footer lifetime line shows the total `cost` since engine start,
+and `--cli` prints both.
 Pricing is read from a JSON file (`--price FILE`, default
 `pricing.json` next to `tfmon.js`):
 
