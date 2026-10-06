@@ -106,12 +106,10 @@ function fmt(n, digits = 1) {
   return n.toFixed(digits);
 }
 
-// USD at any reasonable scale
+// USD, fixed 6 decimal places
 function fmtUsd(n) {
   if (!Number.isFinite(n)) return '-';
-  if (n >= 1) return `$${n.toFixed(2)}`;
-  if (n >= 0.01) return `$${n.toFixed(3)}`;
-  return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(6)}`;
 }
 
 // Window diff of two samples { t, h }. Lifetime/util always from cur.
