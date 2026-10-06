@@ -106,10 +106,10 @@ function fmt(n, digits = 1) {
   return n.toFixed(digits);
 }
 
-// USD, fixed 6 decimal places
+// USD per 1M tokens, formatted with the configured currency symbol
 function fmtUsd(n) {
   if (!Number.isFinite(n)) return '-';
-  return `$${n.toFixed(6)}`;
+  return `${P.currency}${n.toFixed(6)}`;
 }
 
 // Window diff of two samples { t, h }. Lifetime/util always from cur.
@@ -157,11 +157,12 @@ function diff(prev, cur) {
 
 // pricing: USD per 1M tokens { input (uncached prompt), output, cache (cached prompt) }
 function loadPricing(path) {
-  const defs = { input: 2, output: 10, cache: 0.2, model: '' };
+  const defs = { input: 2, output: 10, cache: 0.2, model: '', currency: '$' };
   try {
     const j = JSON.parse(readFileSync(path, 'utf8'));
     const num = (v) => (Number.isFinite(+v) ? +v : null);
     const out = { ...defs };
+    out.currency = typeof j.currency === 'string' && j.currency ? j.currency : '$';
     const a = num(j.input_per_mtok);
     if (a != null) out.input = a;
     const b = num(j.output_per_mtok);
@@ -363,8 +364,8 @@ function frame() {
   const lifeCost = h ? costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal) : 0;
   const bCa = box(' Cache', [
     v(d && paint(` hit ${(d.cacheHit * 100).toFixed(1)}% `, t.fg) + bar(d.cacheHit, Math.max(4, pwLast - 13))),
-    v(d && paint(` win  ${fmtUsd(d.winCost)}`, t.fg)),
-    v(h && paint(` ${fmt(h.cachedTotal)} / ${fmt(h.promptTotal)} tok`, t.dim)),
+    v(d && paint(' win  ', t.fg) + paint(fmtUsd(d.winCost), t.warn)),
+    v(h && paint(` ${fmt(h.cachedTotal)} / `, t.dim) + paint(fmt(h.promptTotal), t.accent) + paint(' tok', t.dim)),
   ], pwLast);
 
   lines.push('│ ' + bTp[0] + ' ' + bSp[0] + ' ' + bCa[0] + pad('', Math.max(0, W - 5 - vlen(bTp[0]) - vlen(bSp[0]) - vlen(bCa[0]))) + '│');
@@ -388,7 +389,7 @@ function frame() {
     + (d ? paint(`   req ${d.reqRate.toFixed(1)}/s`, t.fg) : '')
     + paint(`   running ${h?.requestsRunning ?? 0}`, t.dim);
   const life = h
-    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${fmt(h.promptTotal)} · completion ${fmt(h.completionTotal)} · cost ${fmtUsd(lifeCost)} · ctx ${h.ctx}`
+    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${paint(fmt(h.promptTotal), t.accent)} · completion ${paint(fmt(h.completionTotal), t.ok)} · cost ${paint(fmtUsd(lifeCost), t.warn)} · ctx ${h.ctx}`
     : paint(' lifetime: — (no data yet)', t.dim);
   const keys = showHelp
     ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; lifetime is since engine start', t.dim)

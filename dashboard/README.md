@@ -41,16 +41,19 @@ Pricing is read from a JSON file (`--price FILE`, default
 ```json
 {
   "model": "Qwen3.8-27B",
+  "currency": "$",
   "input_per_mtok": 2.0,
   "output_per_mtok": 10.0,
   "cache_read_per_mtok": 0.2
 }
 ```
 
-Values are USD per 1M tokens: `input` = uncached prompt tokens,
+Values are per 1M tokens: `input` = uncached prompt tokens,
 `cache_read` = cached prompt tokens (a.k.a. cache-hit tokens),
-`output` = completion tokens. `model` (optional) is shown in the header.
-Missing file or missing/invalid keys fall back to the built-in defaults
+`output` = completion tokens. `model` (optional) is shown in the
+header; `currency` (optional, default `$`) is the symbol rendered
+before cost values (e.g. `"€"` or `"₹"`). Missing file or
+missing/invalid keys fall back to the built-in defaults
 ($2 / $10 / $0.20 per 1M tokens).
 
 ## Install (optional)
