@@ -391,7 +391,7 @@ function frame() {
     + (d ? paint(`   req ${d.reqRate.toFixed(1)}/s`, t.fg) : '')
     + paint(`   running ${h?.requestsRunning ?? 0}`, t.dim);
   const life = h
-    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${fmt(h.promptTotal)} · completion ${fmt(h.completionTotal)} · cost ${fmtUsd(costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal))} · ctx ${h.ctx}`
+    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${fmt(h.promptTotal)} · completion ${fmt(h.completionTotal)} · ctx ${h.ctx}`
     : paint(' lifetime: — (no data yet)', t.dim);
   const keys = showHelp
     ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; lifetime is since engine start', t.dim)
