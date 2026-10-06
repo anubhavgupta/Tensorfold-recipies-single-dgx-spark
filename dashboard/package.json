@@ -1,0 +1,10 @@
+{
+  "name": "tfmon",
+  "version": "0.1.0",
+  "description": "TensorFold engine /health dashboard (zero-dependency Node.js CLI + TUI)",
+  "type": "module",
+  "bin": { "tfmon": "tfmon.js" },
+  "scripts": { "start": "node tfmon.js" },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
