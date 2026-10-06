@@ -34,7 +34,7 @@
 #   PARALLEL (8) CONTEXT (262144) PREFILL_FP8 (1: FP8 prompt activations, ~35-50% faster prefill, lower prompt
 #     precision; 0: bf16) CHECKPOINT_SLOTS (empty: TensorFold's default)
 #   VISION (1) VISION_URLS (0) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384)
-#   THINKING (1) MAX_TOKENS (163840: TensorFold's own 4,096 can end a thinking reply before it answers);
+#   THINKING (1) MAX_TOKENS (131072: TensorFold's own 4,096 can end a thinking reply before it answers);
 #     sampling is Qwen's recommendation and switches with THINKING: thinking mode TEMPERATURE (1.0) TOP_P (0.95),
 #     instruct/non-thinking mode TEMPERATURE (0.7) TOP_P (0.80); TOP_K (20) and MIN_P (0.0) either way. Qwen also
 #     recommends a presence_penalty (1.5 in instruct mode) and a repetition_penalty, but TensorFold has neither
@@ -93,7 +93,7 @@ VISION_URLS="${VISION_URLS:-0}"
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"
 VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-16384}"
 THINKING="${THINKING:-1}"
-MAX_TOKENS="${MAX_TOKENS:-163840}"
+MAX_TOKENS="${MAX_TOKENS:-131072}"
 if [[ "$THINKING" == 1 ]]; then
   _default_temperature=1.0; _default_top_p=0.95
 else

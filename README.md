@@ -167,7 +167,7 @@ NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 ./tensorfold.sh \
 
 `start-qwen38-27b.sh` serves `Vontra/Qwen3.8-27B-MLX-4bit` with `--drafter z-lab/Qwen3.8-27B-DFlash2`, using the settings of
 the `Qwen3.8-27B-DGX-Spark-TensorFold` recipe that stock TensorFold supports: port 8888, model name
-`Qwen3.8-27B`, `--parallel 8 --context 262144`, FP8 KV cache (below), `--prefill-fp8 --vision --thinking`, `--max-tokens 163840`,
+`Qwen3.8-27B`, `--parallel 8 --context 262144`, FP8 KV cache (below), `--prefill-fp8 --vision --thinking`, `--max-tokens 131072`,
 `--vision-max-images 50 --vision-image-tokens 16384`, `TENSORFOLD_VIDEO_TOKENS=16384`, video input, 96 MiB request
 bodies, a 0 GiB memory reserve, a pinned KV pool and a 64 MiB stack limit. Sampling follows Qwen's recommendation and
 switches with `THINKING`: 1.0 / 0.95 in thinking mode, 0.7 / 0.80 with `THINKING=0`; top_k 20 and min_p 0.0 either way
@@ -267,7 +267,7 @@ the machine lower these numbers.
 > concurrency have been checked live.
 
 `start-bonsai-27b.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
-`--parallel 10 --context 262144`, FP8 KV cache, a 92 GiB pinned KV pool, `--max-tokens 163840`, and Qwen/Bonsai sampling
+`--parallel 10 --context 262144`, FP8 KV cache, a 92 GiB pinned KV pool, `--max-tokens 131072`, and Qwen/Bonsai sampling
 (THINKING=1: temperature 1.0, top_p 0.95; THINKING=0: temperature 0.7, top_p 0.80; top_k 20, min_p 0.0).
 `DRAFT_ID` defaults to `z-lab/Qwen3.8-27B-DFlash2`. Drafting is lossless (greedy outputs are identical with and without
 drafts) and roughly doubles single-stream speed; set `DRAFT_ID=` for `--no-drafts`. Text serving is the intended CUDA

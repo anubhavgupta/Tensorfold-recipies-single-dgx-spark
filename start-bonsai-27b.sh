@@ -21,7 +21,7 @@
 #   KV_POOL_GB    <n>: n GiB (default 92); auto: free-at-start minus 24 GiB, at most 90; 0: no pinned pool
 #   MEMORY_RESERVE_GIB (0), PARALLEL (10), CONTEXT (262144), PREFILL_FP8 (0), CHECKPOINT_SLOTS
 #   VISION (0 by default; text serving is the validated CUDA path), VISION_URLS, VISION_MAX_IMAGES, VISION_IMAGE_TOKENS
-#   THINKING (1), MAX_TOKENS (163840); sampling follows the Bonsai/Qwen recommendations and switches with THINKING:
+#   THINKING (1), MAX_TOKENS (131072); sampling follows the Bonsai/Qwen recommendations and switches with THINKING:
 #     thinking TEMPERATURE=1.0 TOP_P=0.95; non-thinking TEMPERATURE=0.7 TOP_P=0.80; TOP_K=20 MIN_P=0.0.
 #
 # Config file: .env.bonsai-27b beside this script, KEY=value lines (# comments, quotes both optional).
@@ -73,7 +73,7 @@ VISION_URLS="${VISION_URLS:-0}"
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"
 VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-16384}"
 THINKING="${THINKING:-1}"
-MAX_TOKENS="${MAX_TOKENS:-163840}"
+MAX_TOKENS="${MAX_TOKENS:-131072}"
 if [[ "$THINKING" == 1 ]]; then
   _default_temperature=1.0; _default_top_p=0.95
 else
