@@ -368,7 +368,7 @@ function frame() {
   ], pw);
 
   const accPre = d ? ` acc ${(d.accRate * 100).toFixed(0)}% ` : '';
-  const bSp = box(' Decode / Spec', [
+  const bSp = box(' Spec Decode', [
     v(d && paint(accPre, t.fg) + bar(d.accRate, Math.max(4, (pw - 4) - vlen(accPre)))),
     v(d && paint(` ${d.tokPerRound.toFixed(1)} tok/round`, t.fg)),
     v(d && paint(` round ${d.roundMs.toFixed(0)} ms`, t.fg)),
