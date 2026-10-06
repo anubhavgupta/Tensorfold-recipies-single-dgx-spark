@@ -17,14 +17,14 @@ version gets its own Docker image, built automatically the first time it is used
 | Path | Purpose |
 |---|---|
 | `tensorfold.sh` | The script |
-| `start-qwen38-27b.sh` / `stop-qwen38-27b.sh` | Start/stop Qwen3.8-27B (see [Qwen3.8-27B preset](#qwen38-27b-preset)) |
-| `.env.qwen3.8-27b` | Optional config file `start-qwen38-27b.sh` reads for its settings |
-| `patches/qwen38-27b/` | Patches for the 27B on v0.6.5 (FP8 KV cache, video and media limits, memory reserve 0, pinned KV pool), applied only in the image `start-qwen38-27b.sh` runs |
-| `start-bonsai-27b.sh` / `stop-bonsai-27b.sh` | Start/stop Ternary-Bonsai-2-27B (see [Ternary-Bonsai-2-27B preset](#ternary-bonsai-2-27b-preset)) |
-| `.env.bonsai-27b` | Optional config file `start-bonsai-27b.sh` reads for its settings |
-| `patches/bonsai-27b/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches, Prism 2-bit Hadamard CUDA loading, fast decode, single-copy PQ2 weights), applied only in the image `start-bonsai-27b.sh` runs |
-| `start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
-| `.env.flash-next` | Optional config file `start-qwen38-flash-next.sh` reads for its settings |
+| `qwen38-27b/start.sh` / `qwen38-27b/end.sh` | Start/stop Qwen3.8-27B (see [Qwen3.8-27B preset](#qwen38-27b-preset)) |
+| `qwen38-27b/.env` | Optional config file `qwen38-27b/start.sh` reads for its settings |
+| `qwen38-27b/patches/` | Patches for the 27B on v0.6.5 (FP8 KV cache, video and media limits, memory reserve 0, pinned KV pool), applied only in the image `qwen38-27b/start.sh` runs |
+| `bonsai-27b/start.sh` / `bonsai-27b/end.sh` | Start/stop Ternary-Bonsai-2-27B (see [Ternary-Bonsai-2-27B preset](#ternary-bonsai-2-27b-preset)) |
+| `bonsai-27b/.env` | Optional config file `bonsai-27b/start.sh` reads for its settings |
+| `bonsai-27b/patches/` | Patches for Bonsai on v0.6.5 (the 27B capacity patches, Prism 2-bit Hadamard CUDA loading, fast decode, single-copy PQ2 weights), applied only in the image `bonsai-27b/start.sh` runs |
+| `qwen38-flash-next/start.sh` / `qwen38-flash-next/end.sh` | Start/stop Qwen3.8-Flash-Next (see [Qwen3.8-Flash-Next preset](#qwen38-flash-next-preset)) |
+| `qwen38-flash-next/.env` | Optional config file `qwen38-flash-next/start.sh` reads for its settings |
 | `Dockerfile` | Image recipe: base image + `pip install tensorfold[vision]` at a given commit |
 | `~/.cache/huggingface` | Model cache, mounted at `/root/.cache/huggingface` in the container |
 | `~/.cache/tensorfold-docker/kernels/<commit>` | Compiled CUDA/Triton kernels, one folder per TensorFold commit |
@@ -165,7 +165,7 @@ NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 ./tensorfold.sh \
 
 ## Qwen3.8-27B preset
 
-`start-qwen38-27b.sh` serves `Vontra/Qwen3.8-27B-MLX-4bit` with `--drafter z-lab/Qwen3.8-27B-DFlash2`, using the settings of
+`qwen38-27b/start.sh` serves `Vontra/Qwen3.8-27B-MLX-4bit` with `--drafter z-lab/Qwen3.8-27B-DFlash2`, using the settings of
 the `Qwen3.8-27B-DGX-Spark-TensorFold` recipe that stock TensorFold supports: port 8888, model name
 `Qwen3.8-27B`, `--parallel 8 --context 262144`, FP8 KV cache (below), `--prefill-fp8 --vision --thinking`, `--max-tokens 131072`,
 `--vision-max-images 50 --vision-image-tokens 16384`, `TENSORFOLD_VIDEO_TOKENS=16384`, video input, 96 MiB request
@@ -174,7 +174,7 @@ switches with `THINKING`: 1.0 / 0.95 in thinking mode, 0.7 / 0.80 with `THINKING
 (TensorFold has no presence or repetition penalty).
 
 **Patches (`PATCHES=1`, the default).** Four of the old recipe's v0.6.0 patches are ported to v0.6.5 in
-`patches/qwen38-27b/`. The script runs them as `./tensorfold.sh --tf-patches patches/qwen38-27b`, which builds a derived
+`qwen38-27b/patches/`. The script runs them as `./tensorfold.sh --tf-patches qwen38-27b/patches`, which builds a derived
 image `tensorfold:<version>-<commit>-p<patch hash>` on top of the stock one (rebuilt when a patch changes). The stock
 image, Flash Next and every other command stay unpatched, and each patch only acts when its variable is set, which only
 this script does:
@@ -225,21 +225,21 @@ and repeated greedy replies are identical. The old recipe measured the quality c
 vs 3.316, KL 0.0031 (FP8 prompts, `PREFILL_FP8=1`, cost ~14x more).
 
 ```bash
-./start-qwen38-27b.sh                                   # background container tf-qwen38-27b
-./start-qwen38-27b.sh --parallel 4 --context 131072     # extra args override the defaults
-KV_DTYPE=bf16 PARALLEL=4 THINKING=0 ./start-qwen38-27b.sh  # bf16 cache
-KV_POOL_GB=0 ./start-qwen38-27b.sh                      # no pinned pool: caches grow on demand
-PATCHES=0 KV_DTYPE=bf16 ./start-qwen38-27b.sh           # plain stock image
-FOREGROUND=1 ./start-qwen38-27b.sh                      # attached; Ctrl+C stops it
+./qwen38-27b/start.sh                                   # background container tf-qwen38-27b
+./qwen38-27b/start.sh --parallel 4 --context 131072     # extra args override the defaults
+KV_DTYPE=bf16 PARALLEL=4 THINKING=0 ./qwen38-27b/start.sh  # bf16 cache
+KV_POOL_GB=0 ./qwen38-27b/start.sh                      # no pinned pool: caches grow on demand
+PATCHES=0 KV_DTYPE=bf16 ./qwen38-27b/start.sh           # plain stock image
+FOREGROUND=1 ./qwen38-27b/start.sh                      # attached; Ctrl+C stops it
 docker logs -f tf-qwen38-27b
-./stop-qwen38-27b.sh                                    # stop and remove the container
+./qwen38-27b/end.sh                                    # stop and remove the container
 ```
 
 Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (default DFlash2; empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
 `FOREGROUND`, `PATCHES`, `KV_DTYPE`, `KV_POOL_GB`, `MEMORY_RESERVE_GIB`, `REQUEST_BODY_MIB`, `IMAGE_TOTAL_MIB`,
 `VIDEO_MIB`, `VIDEO_TOTAL_MIB`, `PARALLEL`, `CONTEXT`, `PREFILL_FP8`, `CHECKPOINT_SLOTS`, `VISION`, `VISION_URLS`,
 `VISION_MAX_IMAGES`, `VISION_IMAGE_TOKENS`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`,
-plus any `TENSORFOLD_*` variable. They can also go in `.env.qwen3.8-27b` (every line commented out at its default;
+plus any `TENSORFOLD_*` variable. They can also go in `qwen38-27b/.env` (every line commented out at its default;
 `ENV_FILE` picks another file); a variable already in the environment wins over the file.
 
 Compared on this Spark with the old patched recipe (thinking off, 200-token replies, aggregate tok/s, both at
@@ -266,14 +266,14 @@ the machine lower these numbers.
 > **Status: experimental.** Correctness, drafting, long prompts (30K-token recall), thinking mode and full 262K
 > concurrency have been checked live.
 
-`start-bonsai-27b.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
+`bonsai-27b/start.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
 `--parallel 10 --context 262144`, FP8 KV cache, a 92 GiB pinned KV pool, `--max-tokens 131072`, and Qwen/Bonsai sampling
 (THINKING=1: temperature 1.0, top_p 0.95; THINKING=0: temperature 0.7, top_p 0.80; top_k 20, min_p 0.0).
 `DRAFT_ID` defaults to `z-lab/Qwen3.8-27B-DFlash2`. Drafting is lossless (greedy outputs are identical with and without
 drafts) and roughly doubles single-stream speed; set `DRAFT_ID=` for `--no-drafts`. Text serving is the intended CUDA
 path; `VISION=0` by default.
 
-**Patches.** `patches/bonsai-27b/` copies the four Qwen3.8-27B capacity patches, then adds three Bonsai patches. Stock
+**Patches.** `bonsai-27b/patches/` copies the four Qwen3.8-27B capacity patches, then adds three Bonsai patches. Stock
 v0.6.5 already recognizes `model_type: prism_hadamard_qwen35` for MLX, but has no CUDA serving entry point for this
 Prism pack. All three are gated to that model type; other models in the image are unchanged.
 
@@ -329,22 +329,22 @@ GiB). The cached copy of the shared prompt takes one window, so 11 may fit with 
 The defaults are `PARALLEL=10 KV_POOL_GB=92`: 10 full windows at once.
 
 ```bash
-./start-bonsai-27b.sh
-THINKING=0 ./start-bonsai-27b.sh
-DRAFT_ID= ./start-bonsai-27b.sh                 # no drafts
-KV_POOL_GB=0 ./start-bonsai-27b.sh              # no pinned pool
-KV_POOL_GB=auto PARALLEL=8 ./start-bonsai-27b.sh # smaller pool when memory is shared
-./stop-bonsai-27b.sh
+./bonsai-27b/start.sh
+THINKING=0 ./bonsai-27b/start.sh
+DRAFT_ID= ./bonsai-27b/start.sh                 # no drafts
+KV_POOL_GB=0 ./bonsai-27b/start.sh              # no pinned pool
+KV_POOL_GB=auto PARALLEL=8 ./bonsai-27b/start.sh # smaller pool when memory is shared
+./bonsai-27b/end.sh
 ```
 
 Settings: `TF_VERSION`, `MODEL_ID`, `DRAFT_ID` (default DFlash2; empty: `--no-drafts`), `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
 `FOREGROUND`, `PATCHES` (must remain 1 for CUDA), `KV_DTYPE`, `KV_POOL_GB`, `MEMORY_RESERVE_GIB`, `PARALLEL`,
 `CONTEXT`, `PREFILL_FP8` (default 0), `CHECKPOINT_SLOTS`, `VISION`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`,
-`TOP_K`, `MIN_P`, plus any `TENSORFOLD_*` variable. They can also go in `.env.bonsai-27b`; environment variables win.
+`TOP_K`, `MIN_P`, plus any `TENSORFOLD_*` variable. They can also go in `bonsai-27b/.env`; environment variables win.
 
 ## Qwen3.8-Flash-Next preset
 
-`start-qwen38-flash-next.sh` / `stop-qwen38-flash-next.sh` serve `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`,
+`qwen38-flash-next/start.sh` / `qwen38-flash-next/end.sh` serve `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`,
 using the settings of the `Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold` recipe - but with **stock**
 TensorFold (no image patches): by v0.6.5, everything that recipe's patches added for v0.6.1 is upstream
 (`--vision-max-images`, `--vision-image-tokens`, `--kv-dtype`, `--mtp-drafts`/`--mtp-confidence`,
@@ -367,26 +367,26 @@ prose and code (2026-10-05) found these three - MTP confidence, prefill rows and
 fully closed the throughput gap against the old patched recipe; with them matched the two are on par.
 
 ```bash
-./start-qwen38-flash-next.sh                                 # background container tf-qwen38-flash-next
-./start-qwen38-flash-next.sh --parallel 3 --kv-dtype bf16     # extra args override the defaults
-PORT=9000 TF_VERSION=v0.6.5 ./start-qwen38-flash-next.sh
-FOREGROUND=1 ./start-qwen38-flash-next.sh                     # attached; Ctrl+C stops it
+./qwen38-flash-next/start.sh                                 # background container tf-qwen38-flash-next
+./qwen38-flash-next/start.sh --parallel 3 --kv-dtype bf16     # extra args override the defaults
+PORT=9000 TF_VERSION=v0.6.5 ./qwen38-flash-next/start.sh
+FOREGROUND=1 ./qwen38-flash-next/start.sh                     # attached; Ctrl+C stops it
 docker logs -f tf-qwen38-flash-next
-./stop-qwen38-flash-next.sh
+./qwen38-flash-next/end.sh
 ```
 
 Settings read from the environment: `TF_VERSION`, `MODEL_ID`, `SERVED_NAME`, `HOST`, `PORT`, `NAME`,
 `FOREGROUND`, `PARALLEL`, `CONTEXT`, `KV_DTYPE`, `PLE_ON_SSD`, `VISION`, `VISION_MAX_IMAGES`,
 `VISION_IMAGE_TOKENS`, `THINKING`, `MAX_TOKENS`, `TEMPERATURE`, `TOP_P`, `TOP_K`, `MIN_P`, `MTP_DRAFTS`,
-`MTP_CONFIDENCE`, plus any `TENSORFOLD_*` variable. `stop-qwen38-flash-next.sh` reads `NAME`, `HOST`,
+`MTP_CONFIDENCE`, plus any `TENSORFOLD_*` variable. `qwen38-flash-next/end.sh` reads `NAME`, `HOST`,
 `PORT` (must match the start script's) and `STOP_TIMEOUT`.
 
-**Config file:** `.env.flash-next`, beside the script, is read before the defaults above (so it only
+**Config file:** `qwen38-flash-next/.env`, beside the script, is read before the defaults above (so it only
 changes what it sets) - `KEY=value` lines, `#` comments, quotes optional, never executed. A variable
 already in the environment wins over the file either way. Ships with every setting commented out at
 its current default; uncomment and edit a line to persist an override without passing env vars on
 every start. `ENV_FILE=/path/to/other.env` points at a different file; `ENV_FILE=/dev/null` (or
-deleting `.env.flash-next`) runs on pure script defaults.
+deleting `qwen38-flash-next/.env`) runs on pure script defaults.
 
 ## Chat template (Qwen3.8-27B and Flash-Next)
 
@@ -434,7 +434,7 @@ noted. Throughput is aggregate decode tok/s across N clients sending the same pr
 (`chat_template_kwargs: {"enable_thinking": false}`), greedy. "Old" is the earlier patched recipe on this Spark
 (`Qwen3.8-27B-DGX-Spark-TensorFold` on v0.6.0, `Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold` on v0.6.1).
 
-### Qwen3.8-27B (`start-qwen38-27b.sh`)
+### Qwen3.8-27B (`qwen38-27b/start.sh`)
 
 Throughput, 200-token replies, `--parallel 8`, no KV pool:
 
@@ -466,7 +466,7 @@ Memory and long context (fp8 KV, 78 GiB pool):
 | Video, 6 s 1280x720 clip | described correctly (4,399 prompt tokens) |
 | Images | 44 MiB body with 33 MiB of images answered; 50 images accepted, a 51st refused |
 
-### Qwen3.8-Flash-Next (`start-qwen38-flash-next.sh`)
+### Qwen3.8-Flash-Next (`qwen38-flash-next/start.sh`)
 
 Throughput, 200-token replies, `--parallel 5`, int8 KV, `--ple-on-ssd`, MTP drafts 6 / confidence 0.60; new (stock
 v0.6.5) vs old (patched v0.6.1):
@@ -483,7 +483,7 @@ MTP accept rate on code: 73.9%. With stock TensorFold defaults (MTP confidence 0
 workspace), prose was 45.9 / 65.4 / 112.5 / 114.4 / 165.8 tok/s at 1-5 clients; the preset's three settings close that
 gap. Concurrent full-context streams were not measured for Flash Next.
 
-### Ternary-Bonsai-2-27B (`start-bonsai-27b.sh`)
+### Ternary-Bonsai-2-27B (`bonsai-27b/start.sh`)
 
 Throughput, 200-token replies (`ignore_eos`), `--parallel 8`, fp8 KV, default pool; 0007 and the 0006 path
 (`TENSORFOLD_BONSAI_PQ2=0`) measured back to back with the same script:

@@ -8,7 +8,7 @@
 # because stock TensorFold has no equivalent: the DRAFT_LANGUAGE MTP-vocabulary patch and TENSORFOLD_MTP_COPY
 # (prompt-lookup drafts ahead of MTP).
 #
-# Usage: ./start-qwen38-flash-next.sh [extra tensorfold serve args]
+# Usage: ./qwen38-flash-next/start.sh [extra tensorfold serve args]
 #   Extra args are appended, so they override the defaults below (e.g. --parallel 3 --kv-dtype bf16).
 #   --parallel 5 --context 262144 --kv-dtype int8 is ~102.6 GiB (~4.5 GiB/stream); other fits: 4 streams
 #   bf16 is tighter, 3 streams bf16 at 262k, 6-8 streams int8/int4 at a shorter --context.
@@ -34,17 +34,17 @@
 #     video encodes, freeing ~4 GiB for the KV cache pool instead of a standing reservation)
 #   and any other TENSORFOLD_* variable are passed to the server.
 #
-# Config file: .env.flash-next beside this script, KEY=value lines (# comments, quotes both optional).
+# Config file: .env beside this script, KEY=value lines (# comments, quotes both optional).
 #   Read before the defaults above, so it only changes what it sets; a variable already in the environment
-#   (e.g. `PARALLEL=3 ./start-qwen38-flash-next.sh`) wins over the file either way. It is yours, never
+#   (e.g. `PARALLEL=3 ./qwen38-flash-next/start.sh`) wins over the file either way. It is yours, never
 #   executed as a script, and not required - delete it to go back to pure script defaults.
 #
-# Logs: docker logs -f tf-qwen38-flash-next      Stop: ./stop-qwen38-flash-next.sh (or docker stop tf-qwen38-flash-next)
+# Logs: docker logs -f tf-qwen38-flash-next      Stop: ./qwen38-flash-next/end.sh (or docker stop tf-qwen38-flash-next)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.flash-next}"
+ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env}"
 if [[ -f "$ENV_FILE" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ "$_line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
@@ -96,7 +96,7 @@ export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-0}"
 [[ "$PLE_ON_SSD" != 1 ]] || export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS:-2048}"
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
-  echo "container $NAME already exists; stop it first: ./stop-qwen38-flash-next.sh" >&2
+  echo "container $NAME already exists; stop it first: ./qwen38-flash-next/end.sh" >&2
   exit 1
 fi
 
@@ -113,11 +113,11 @@ if [[ "$THINKING" == 1 ]]; then serve_args+=(--thinking); else serve_args+=(--no
 [[ -z "${MTP_DRAFTS:-}" ]] || serve_args+=(--mtp-drafts "$MTP_DRAFTS")
 [[ -z "${MTP_CONFIDENCE:-}" ]] || serve_args+=(--mtp-confidence "$MTP_CONFIDENCE")
 
-"$SCRIPT_DIR/tensorfold.sh" "${wrapper[@]}" \
+"$SCRIPT_DIR/../tensorfold.sh" "${wrapper[@]}" \
   serve "$MODEL_ID" "${serve_args[@]}" \
   "$@"
 
 if [[ "$FOREGROUND" != 1 ]]; then
   echo "started $NAME on http://$HOST:$PORT/v1 (model: $SERVED_NAME)"
-  echo "logs: docker logs -f $NAME    stop: ./stop-qwen38-flash-next.sh"
+  echo "logs: docker logs -f $NAME    stop: ./qwen38-flash-next/end.sh"
 fi

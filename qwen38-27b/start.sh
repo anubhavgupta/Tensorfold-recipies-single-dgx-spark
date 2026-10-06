@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Serve Qwen3.8-27B (Vontra/Qwen3.8-27B-MLX-4bit + z-lab/Qwen3.8-27B-DFlash2 drafter) with stock TensorFold through
 # ./tensorfold.sh. Settings follow the Qwen3.8-27B-DGX-Spark-TensorFold recipe (TensorFold v0.6.0 + patches), but
-# stock TensorFold v0.6.5 plus the patches in patches/qwen38-27b, which go into a derived image
+# stock TensorFold v0.6.5 plus the patches in qwen38-27b/patches, which go into a derived image
 # (tensorfold.sh --tf-patches) that only this script runs; PATCHES=0 runs the plain stock image instead. Each patch
 # does nothing unless its setting is on. That recipe's image patches map as follows:
 #   0001 many images / video        -> stock --vision-max-images, --vision-image-tokens, TENSORFOLD_VIDEO_TOKENS;
@@ -13,13 +13,13 @@
 #   0004 memory reserve below 2 GiB -> our 0003 (MEMORY_RESERVE_GIB=0; stock floor 2)
 #   0005 pinned KV pool             -> our 0004 (KV_POOL_GB=auto; stock: caches grow and shrink on demand)
 #
-# Usage: ./start-qwen38-27b.sh [extra tensorfold serve args]
+# Usage: ./qwen38-27b/start.sh [extra tensorfold serve args]
 #   Extra args are appended, so they override the defaults below (e.g. --parallel 4 --context 131072).
 #   The KV pool (auto: free memory at start - 31 GiB, at most 78) holds ~2.5M tokens with fp8 KV, so 8 streams can
 #   all use a full 262k window at once (bf16 KV: ~1.25M, 4-5 full windows). Past that, new requests wait and, at
 #   worst, the newest running one is stopped with "ran out of memory".
 #
-# Settings (environment, or .env.qwen3.8-27b; the environment wins):
+# Settings (environment, or qwen38-27b/.env; the environment wins):
 #   TF_VERSION    TensorFold version (default: latest)      PORT         port (default: 8888)
 #   HOST          bind address (default: 0.0.0.0)           SERVED_NAME  model id clients see (default: Qwen3.8-27B)
 #   NAME          container name (default: tf-qwen38-27b)   FOREGROUND   1: run attached instead of in the background
@@ -41,17 +41,17 @@
 #     setting (it always decodes as if both were off), so they cannot be set here.
 #   TENSORFOLD_VIDEO_TOKENS (default 16384) and any other TENSORFOLD_* variable are passed to the server.
 #
-# Config file: .env.qwen3.8-27b beside this script, KEY=value lines (# comments, quotes both optional).
+# Config file: .env beside this script, KEY=value lines (# comments, quotes both optional).
 #   Read before the defaults above, so it only changes what it sets; a variable already in the environment
-#   (e.g. `PARALLEL=4 ./start-qwen38-27b.sh`) wins over the file either way. It is yours, never executed as a
+#   (e.g. `PARALLEL=4 ./qwen38-27b/start.sh`) wins over the file either way. It is yours, never executed as a
 #   script, and not required. ENV_FILE=/path/to/other.env reads another file instead.
 #
-# Logs: docker logs -f tf-qwen38-27b      Stop: ./stop-qwen38-27b.sh
+# Logs: docker logs -f tf-qwen38-27b      Stop: ./qwen38-27b/end.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.qwen3.8-27b}"
+ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env}"
 if [[ -f "$ENV_FILE" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ "$_line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
@@ -107,7 +107,7 @@ MIN_P="${MIN_P:-0.0}"
 die() { echo "start-qwen38-27b: $*" >&2; exit 1; }
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
-  die "container $NAME already exists; stop it first: ./stop-qwen38-27b.sh"
+  die "container $NAME already exists; stop it first: ./qwen38-27b/end.sh"
 fi
 
 case "$KV_DTYPE" in
@@ -130,7 +130,7 @@ fi
 wrapper=(--tf-name "$NAME" --tf-docker-arg=--ulimit=stack=67108864)
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
 if [[ "$PATCHES" == 1 ]]; then
-  wrapper+=(--tf-patches "$SCRIPT_DIR/patches/qwen38-27b")
+  wrapper+=(--tf-patches "$SCRIPT_DIR/patches")
   if [[ "$KV_POOL_GB" =~ ^0*([.]0*)?$ ]]; then unset TENSORFOLD_KV_POOL_GIB; else export TENSORFOLD_KV_POOL_GIB="$KV_POOL_GB"; fi
   export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
   export TENSORFOLD_REQUEST_BODY_MIB="$REQUEST_BODY_MIB" TENSORFOLD_IMAGE_TOTAL_MIB="$IMAGE_TOTAL_MIB"
@@ -158,11 +158,11 @@ if [[ "$VISION" == 1 ]]; then
 fi
 if [[ "$THINKING" == 1 ]]; then serve_args+=(--thinking); else serve_args+=(--no-thinking); fi
 
-"$SCRIPT_DIR/tensorfold.sh" "${wrapper[@]}" \
+"$SCRIPT_DIR/../tensorfold.sh" "${wrapper[@]}" \
   serve "$MODEL_ID" "${serve_args[@]}" \
   "$@"
 
 if [[ "$FOREGROUND" != 1 ]]; then
   echo "started $NAME on http://$HOST:$PORT/v1 (model: $SERVED_NAME)"
-  echo "logs: docker logs -f $NAME    stop: ./stop-qwen38-27b.sh"
+  echo "logs: docker logs -f $NAME    stop: ./qwen38-27b/end.sh"
 fi

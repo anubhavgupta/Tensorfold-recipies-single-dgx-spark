@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Stop the Qwen3.8-Flash-Next server started by ./start-qwen38-flash-next.sh and remove its container,
+# Stop the Ternary-Bonsai-2-27B server started by ./bonsai-27b/start.sh and remove its container,
 # freeing its GPU memory. Gives it STOP_TIMEOUT seconds (default 30) to shut down; requests still running
 # are cut off (no draining), so this warns when there are any.
-# Usage: ./stop-qwen38-flash-next.sh      Env: NAME, HOST, PORT (must match the start script's), STOP_TIMEOUT
+# Usage: ./bonsai-27b/end.sh      Env: NAME, HOST, PORT (must match the start script's), STOP_TIMEOUT
 set -euo pipefail
 
-NAME="${NAME:-tf-qwen38-flash-next}"
+NAME="${NAME:-tf-bonsai-27b}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
