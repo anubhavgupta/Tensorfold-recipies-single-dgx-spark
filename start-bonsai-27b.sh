@@ -18,8 +18,8 @@
 #   DRAFT_ID      DFlash2 drafter (default: z-lab/Qwen3.8-27B-DFlash2; empty: --no-drafts)
 #   PATCHES       must be 1: the patched image with patches/bonsai-27b
 #   KV_DTYPE      fp8 (default; half-size cache) or bf16
-#   KV_POOL_GB    auto: free-at-start minus 24 GiB, at most 90; <n>: n GiB; 0: no pinned pool
-#   MEMORY_RESERVE_GIB (0), PARALLEL (8), CONTEXT (262144), PREFILL_FP8 (0), CHECKPOINT_SLOTS
+#   KV_POOL_GB    <n>: n GiB (default 92); auto: free-at-start minus 24 GiB, at most 90; 0: no pinned pool
+#   MEMORY_RESERVE_GIB (0), PARALLEL (10), CONTEXT (262144), PREFILL_FP8 (0), CHECKPOINT_SLOTS
 #   VISION (0 by default; text serving is the validated CUDA path), VISION_URLS, VISION_MAX_IMAGES, VISION_IMAGE_TOKENS
 #   THINKING (1), MAX_TOKENS (163840); sampling follows the Bonsai/Qwen recommendations and switches with THINKING:
 #     thinking TEMPERATURE=1.0 TOP_P=0.95; non-thinking TEMPERATURE=0.7 TOP_P=0.80; TOP_K=20 MIN_P=0.0.
@@ -55,7 +55,7 @@ FOREGROUND="${FOREGROUND:-0}"
 PATCHES="${PATCHES:-1}"
 KV_DTYPE="${KV_DTYPE:-fp8}"
 if [[ "$PATCHES" == 1 ]]; then
-  KV_POOL_GB="${KV_POOL_GB-auto}"; MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-0}"
+  KV_POOL_GB="${KV_POOL_GB-92}"; MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-0}"
 else
   echo "start-bonsai-27b: PATCHES=0 cannot serve Bonsai on CUDA with stock TensorFold v0.6.5" >&2
   exit 1
@@ -64,7 +64,7 @@ REQUEST_BODY_MIB="${REQUEST_BODY_MIB:-96}"
 IMAGE_TOTAL_MIB="${IMAGE_TOTAL_MIB:-64}"
 VIDEO_MIB="${VIDEO_MIB:-64}"
 VIDEO_TOTAL_MIB="${VIDEO_TOTAL_MIB:-96}"
-PARALLEL="${PARALLEL:-8}"
+PARALLEL="${PARALLEL:-10}"
 CONTEXT="${CONTEXT:-262144}"
 PREFILL_FP8="${PREFILL_FP8:-0}"
 CHECKPOINT_SLOTS="${CHECKPOINT_SLOTS:-}"

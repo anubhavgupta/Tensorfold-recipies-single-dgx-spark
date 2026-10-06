@@ -267,7 +267,7 @@ the machine lower these numbers.
 > concurrency have been checked live.
 
 `start-bonsai-27b.sh` serves `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` as `Ternary-Bonsai-2-27B` on port 8888 with
-`--parallel 8 --context 262144`, FP8 KV cache, a pinned KV pool, `--max-tokens 163840`, and Qwen/Bonsai sampling
+`--parallel 10 --context 262144`, FP8 KV cache, a 92 GiB pinned KV pool, `--max-tokens 163840`, and Qwen/Bonsai sampling
 (THINKING=1: temperature 1.0, top_p 0.95; THINKING=0: temperature 0.7, top_p 0.80; top_k 20, min_p 0.0).
 `DRAFT_ID` defaults to `z-lab/Qwen3.8-27B-DFlash2`. Drafting is lossless (greedy outputs are identical with and without
 drafts) and roughly doubles single-stream speed; set `DRAFT_ID=` for `--no-drafts`. Text serving is the intended CUDA
@@ -310,7 +310,8 @@ The MLX pack stores ternary values as 2-bit affine codes in little-endian `uint3
 **First start is slow.** Any patch change rebuilds the image and the CUDA extensions. The first request after that
 takes ~70 s while the kernels compile; they are cached in `~/.cache/tensorfold-docker/kernels/`, so restarts are fast.
 
-**Memory.** `KV_POOL_GB=auto` is free memory minus 24 GiB (minus 1 GiB per stream over 8), capped at 90 GiB. The pinned
+**Memory.** The default `KV_POOL_GB=92` needs ~114 GiB free at start (stop other GPU workloads first).
+`KV_POOL_GB=auto` is free memory minus 24 GiB (minus 1 GiB per stream over 8), capped at 90 GiB. The pinned
 pool is most of the footprint: with it the server uses ~110 GB of the Spark; with `KV_POOL_GB=0` the startup estimate
 is ~17 GiB (weights 7 GiB, DFlash2 drafter, workspace) and caches grow on demand. FP8 KV is 32 KiB/token, so a full
 262,144-token stream costs 8 GiB.
@@ -325,14 +326,14 @@ times at once with 5,126-token replies (each stream runs to 262,136 tokens, gree
 
 **Last successful: 10 concurrent full 262K streams** (`PARALLEL=12 KV_POOL_GB=92`, startup estimate 113.9 of 115.9
 GiB). The cached copy of the shared prompt takes one window, so 11 may fit with different prompts (not measured).
-The default `PARALLEL=8` serves 8 full windows with room to spare.
+The defaults are `PARALLEL=10 KV_POOL_GB=92`: 10 full windows at once.
 
 ```bash
 ./start-bonsai-27b.sh
 THINKING=0 ./start-bonsai-27b.sh
 DRAFT_ID= ./start-bonsai-27b.sh                 # no drafts
 KV_POOL_GB=0 ./start-bonsai-27b.sh              # no pinned pool
-PARALLEL=12 KV_POOL_GB=92 ./start-bonsai-27b.sh # 10 full 262K streams
+KV_POOL_GB=auto PARALLEL=8 ./start-bonsai-27b.sh # smaller pool when memory is shared
 ./stop-bonsai-27b.sh
 ```
 
