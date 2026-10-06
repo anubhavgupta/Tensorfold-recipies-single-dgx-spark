@@ -91,7 +91,19 @@ const paint = (s, code) => (code == null ? s : `\x1b[38;5;${code}m${s}${R}`);
 // visible length, ignoring ANSI codes
 const vlen = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').length;
 const pad = (s, w) => s + ' '.repeat(Math.max(0, w - vlen(s)));
-const trunc = (s, w) => (vlen(s) <= w ? s : s.slice(0, Math.max(0, w - 1)) + '…');
+// truncate to w visible chars, never splitting an ANSI escape
+function trunc(s, w) {
+  if (vlen(s) <= w) return s;
+  let vis = 0, i = 0;
+  while (i < s.length && vis < w - 1) {
+    if (s[i] === '\x1b' && s[i + 1] === '[') {
+      const m = /^\x1b\[[0-9;?]*[a-zA-Z]/.exec(s.slice(i));
+      if (m) { i += m[0].length; continue; }
+    }
+    vis++; i++;
+  }
+  return s.slice(0, i) + '…';
+}
 
 // ------------------------------------------------------------- derivation
 
