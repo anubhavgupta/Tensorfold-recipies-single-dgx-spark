@@ -21,6 +21,7 @@ node tfmon.js --url http://host:port/health --interval 500 --model my-engine
 | `--theme NAME`  | `dark` \| `light` (default `dark`)             |
 | `--model NAME`  | header label override                          |
 | `--price FILE`  | pricing JSON, $/1M tokens (default: `pricing.json` next to `tfmon.js`) |
+| `--state FILE`  | cost accumulator JSON (default: `cost.json` next to `tfmon.js`) |
 | `--cli`         | plain-text mode, no TUI                        |
 | `--help`        | usage                                         |
 
@@ -34,9 +35,21 @@ layout stays on screen, dimmed — never blank).
 Cost is derived from the cumulative `/health` token counters:
 window cost = (Δprompt − Δcached) × input + Δcached × cache +
 Δcompletion × output. The Cache panel shows `spend/sec` (window
-cost normalized to 1 s, so it is a true rate at any poll interval);
-the footer lifetime line shows the total `cost` since engine start,
-and `--cli` prints both.
+cost normalized to 1 s, so it is a true rate at any poll interval).
+
+The footer lifetime line and `--cli` print the **running total** cost,
+which persists across tfmon runs in a small state file (`--state FILE`,
+default `cost.json` next to `tfmon.js`, shape `{ cost, engineCost, ts }`).
+The running total covers:
+
+- cost accrued **while tfmon was down** — on the first sample after a
+  start it is picked up from the engine's lifetime counters;
+- **engine restarts** — when the lifetime counters reset below the saved
+  value, the finished session is folded into the carried cost and the new
+  session accumulates on top of it (shown as `cost ₹X (engine ₹Y)`).
+
+If pricing or currency changes between runs, the carried total keeps the
+old price basis — delete the state file to reset the total.
 Pricing is read from a JSON file (`--price FILE`, default
 `pricing.json` next to `tfmon.js`):
 

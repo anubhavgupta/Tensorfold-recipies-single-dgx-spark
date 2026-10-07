@@ -3,7 +3,8 @@
 //
 // Polls GET /health (default http://localhost:8888/health, 1 Hz) and renders
 // an htop-style dashboard: throughput sparkline, decode/spec stats, cache
-// gauge, stream utilization, lifetime counters. Single-server scope.
+// gauge, stream utilization, lifetime counters, and a running cost total
+// persisted across runs in cost.json. Single-server scope.
 //
 // Usage:
 //   tfmon [--url URL] [--interval MS] [--theme dark|light] [--model NAME] [--cli] [--help]
@@ -11,11 +12,12 @@
 // Keys (TUI mode): q quit · h help · g graphs · t theme
 
 import process from 'node:process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DEFAULT_PRICE_FILE = join(dirname(fileURLToPath(import.meta.url)), 'pricing.json');
+const DEFAULT_STATE_FILE = join(dirname(fileURLToPath(import.meta.url)), 'cost.json');
 
 // ---------------------------------------------------------------- config
 
@@ -26,6 +28,7 @@ const DEFAULTS = {
   theme: 'dark',
   model: '',
   price: DEFAULT_PRICE_FILE,
+  state: DEFAULT_STATE_FILE,
 };
 
 const HELP = `tfmon — TensorFold engine dashboard
@@ -38,6 +41,7 @@ Options:
   --theme NAME     dark|light             (default: dark)
   --model NAME     label override for the header
   --price FILE     pricing JSON, $/1M tokens (default: pricing.json next to tfmon.js)
+  --state FILE     cost accumulator JSON, persists across runs (default: cost.json next to tfmon.js)
   --cli            plain-text mode: print one table per poll, no TUI
   --help           show this help
 
@@ -67,6 +71,7 @@ function parseArgs(argv) {
         break;
       case '--model': cfg.model = val(); break;
       case '--price': cfg.price = val(); break;
+      case '--state': cfg.state = val(); break;
       case '--cli': cfg.cli = true; break;
       case '--help':
         process.stdout.write(HELP);
@@ -191,6 +196,41 @@ function loadPricing(path) {
 }
 const costOf = (uncachedIn, cachedIn, outTok) =>
   (Math.max(0, uncachedIn) * P.input + Math.max(0, cachedIn) * P.cache + Math.max(0, outTok) * P.output) / 1e6;
+// engine-lifetime cost from a health sample
+const lifetimeCost = (h) => costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal);
+
+// ------------------------------------------- persisted cost accumulator
+// cost.json holds { cost, engineCost, ts }. `cost` is the running total as of
+// the last save (inclusive of the engine session then running); `engineCost`
+// is that engine session's lifetime cost at save time. On the first sample of
+// a run the total resolves against the engine's lifetime cost: if it grew,
+// cost accrued while tfmon was down is added; if the engine restarted
+// (lifetime counters reset below the saved value), the new session's cost is
+// added on top of the previous total.
+function loadCostState(path) {
+  const defs = { cost: 0, engineCost: 0 };
+  try {
+    const j = JSON.parse(readFileSync(path, 'utf8'));
+    const num = (v) => (Number.isFinite(+v) && +v >= 0 ? +v : 0);
+    return { cost: num(j.cost), engineCost: num(j.engineCost) };
+  } catch {
+    return defs;
+  }
+}
+let lastStateSave = 0;
+function saveCostState(force = false) {
+  const now = Date.now() / 1000;
+  if (!force && now - lastStateSave < 10) return;
+  lastStateSave = now;
+  try {
+    writeFileSync(cfg.state, JSON.stringify({
+      cost: state.costAccrual,
+      engineCost: state.lastEngineCost,
+      model: cfg.model || P.model || '',
+      ts: now,
+    }, null, 2) + '\n');
+  } catch { /* state file is best-effort; never crash the dashboard */ }
+}
 
 // ------------------------------------------------------------------ health
 
@@ -240,9 +280,18 @@ const state = {
   derived: null,       // last window diff
   histOut: [],         // capped ring, back = newest
   histPrefill: [],
+  carried: 0,          // cost before the current engine session (loaded from state)
+  lastEngineCost: 0,   // engine-lifetime cost at the last successful poll
+  costAccrual: 0,      // carried + current session = running total
 };
 const HIST_MAX = 120;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// restore the running cost total from the previous run
+const savedCostState = loadCostState(cfg.state);
+state.carried = Math.max(0, savedCostState.cost - savedCostState.engineCost);
+state.lastEngineCost = savedCostState.engineCost;
+state.costAccrual = savedCostState.cost; // running total as of the last save
 
 async function pollOnce() {
   const t0 = Date.now() / 1000;
@@ -271,9 +320,20 @@ async function pollOnce() {
       }
     }
     state.sample = { t: t0, h };
-    state.have = true;
     state.lastSuccessT = t0;
     state.error = '';
+    const lNow = lifetimeCost(h);
+    const reset = lNow < state.lastEngineCost; // engine restarted: lifetime counters reset
+    if (!state.have) {
+      // first sample this run: resolve the saved state against the current engine session
+      state.carried = reset ? savedCostState.cost : Math.max(0, savedCostState.cost - savedCostState.engineCost);
+    } else if (reset) {
+      state.carried += state.lastEngineCost; // fold the finished engine session into the carried cost
+    }
+    state.lastEngineCost = lNow;
+    state.costAccrual = state.carried + lNow;
+    state.have = true;
+    saveCostState();
   } catch (e) {
     state.error = e.name === 'AbortError' ? 'timeout after 3s'
       : (e?.cause?.message && e.cause.message !== e.message ? `${e.message}: ${e.cause.message}` : String(e?.message || e));
@@ -375,7 +435,7 @@ function frame() {
     v(d && paint(` stream util ${(d.util * 100).toFixed(0)}%`, t.dim)),
   ], pw);
 
-  const lifeCost = h ? costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal) : 0;
+  const lifeCost = h ? lifetimeCost(h) : 0;
   const hitPre = d ? ` hit ${(d.cacheHit * 100).toFixed(1)}% ` : '';
   const bCa = box(' Cache', [
     v(d && paint(hitPre, t.fg) + bar(d.cacheHit, Math.max(4, (pwLast - 4) - vlen(hitPre)))),
@@ -403,11 +463,12 @@ function frame() {
   const streamsLine = ` Streams: ${sBar} ${dec + pre}/${s.max} (decoding ${s.decoding} · prefilling ${s.prefilling})`
     + (d ? paint(`   req ${d.reqRate.toFixed(1)}/s`, t.fg) : '')
     + paint(`   running ${h?.requestsRunning ?? 0}`, t.dim);
+  const cum = state.costAccrual;
   const life = h
-    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${paint(fmt(h.promptTotal), t.accent)} · completion ${paint(fmt(h.completionTotal), t.ok)} · cost ${paint(fmtUsd(lifeCost), t.warn)} · ctx ${h.ctx}`
+    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${paint(fmt(h.promptTotal), t.accent)} · completion ${paint(fmt(h.completionTotal), t.ok)} · cost ${paint(fmtUsd(cum), t.warn)}${state.carried > 0 ? paint(` (engine ${fmtUsd(lifeCost)})`, t.dim) : ''} · ctx ${h.ctx}`
     : paint(' lifetime: - (no data yet)', t.dim);
   const keys = showHelp
-    ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; lifetime is since engine start', t.dim)
+    ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; cost is a running total (persisted)', t.dim)
     : paint(' q quit · h help · g graphs · t theme', t.dim);
 
   const dimOn = age > 3 * iv; // includes never-succeeded (lastSuccessT = 0)
@@ -453,7 +514,7 @@ function cliLine() {
     `round ${d ? d.roundMs.toFixed(0) + ' ms' : '-'}`,
     `streams ${s ? `${Math.min(s.max, s.decoding + s.prefilling)}/${s.max}` : '-'} (dec ${s?.decoding ?? 0} pre ${s?.prefilling ?? 0})`,
     `req/s ${d ? d.reqRate.toFixed(2) : '-'}`,
-    `cost ${h ? fmtUsd(costOf(h.promptTotal - h.cachedTotal, h.cachedTotal, h.completionTotal)) + (d ? ` (spend/sec ${fmtUsd(d.spentPerSec)})` : '') : '-'}`,
+    `cost ${h || state.costAccrual > 0 ? fmtUsd(state.costAccrual) + (state.carried > 0 && h ? ` (engine ${fmtUsd(lifetimeCost(h))})` : '') + (d ? ` (spend/sec ${fmtUsd(d.spentPerSec)})` : '') : '-'}`,
     `lifetime ${h ? `req ${fmt(h.requestsTotal)} prompt ${fmt(h.promptTotal)} comp ${fmt(h.completionTotal)}` : '-'}`,
   ].join('  ');
 }
@@ -470,9 +531,12 @@ function restoreTerm() {
 function quit() {
   if (uiStop) return;
   uiStop = true;
+  saveCostState(true);
   restoreTerm();
   process.exit(0);
 }
+
+process.on('exit', () => saveCostState(true));
 
 function runTui() {
   tuiMode = true;
