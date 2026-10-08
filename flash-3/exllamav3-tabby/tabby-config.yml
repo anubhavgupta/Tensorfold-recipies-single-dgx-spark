@@ -52,7 +52,7 @@ model:
 draft_model:
   # The model's own MTP head. Up to 5 drafts, cut early by confidence (the 0.6 target is read by
   # the fork from EXL3_DRAFT_CONFIDENCE, which serve.sh exports).
-  draft_mode: mtp
+  draft_mode: ${DRAFT_MODE}
   draft_cache_mode: "8,8"
   draft_num_tokens: ${DRAFT_NUM_TOKENS}
   dynamic_draft: true

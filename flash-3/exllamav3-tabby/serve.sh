@@ -37,6 +37,7 @@ PORT="${PORT:-8899}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-262144}"
 DRAFT_NUM_TOKENS="${DRAFT_NUM_TOKENS:-5}"
 VISION="${VISION:-false}"
+DRAFT_MODE="${DRAFT_MODE:-mtp}"
 
 # Sanity on the sizing, because this is where "the context is tiny" reports come from.
 (( CACHE_SIZE % 256 == 0 )) || die "CACHE_SIZE must be a multiple of 256"
@@ -61,7 +62,7 @@ mkdir -p "$MODEL_PARENT"
 find "$MODEL_PARENT" -mindepth 1 -maxdepth 1 -type l -delete
 ln -sfn "$MODEL_DIR" "$MODEL_PARENT/$MODEL_NAME"
 export STATE_DIR HOST PORT DISABLE_AUTH MODEL_PARENT MODEL_NAME MAX_SEQ_LEN CACHE_SIZE MAX_BATCH_SIZE \
-       NGRAM_RAM VISION DRAFT_NUM_TOKENS
+       NGRAM_RAM VISION DRAFT_NUM_TOKENS DRAFT_MODE
 
 CONFIG="$STATE_DIR/config.yml"
 RENDER_PY="$VENV/bin/python"; [[ -x "$RENDER_PY" ]] || RENDER_PY="$PYTHON_BIN"

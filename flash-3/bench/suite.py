@@ -139,7 +139,7 @@ def main():
     if mode == "content":
         Ns = [int(x) for x in sys.argv[3].split(",")]
         gen = int(sys.argv[4]) if len(sys.argv) > 4 else 512
-        for cls, prompts in CONTENT.items():
+        for cls, prompts in [(c,v) for c,v in CONTENT.items() if c in os.environ.get('CLS','code,prose,devops,json').split(',')]:
             for N in Ns:
                 # two rounds; round 0 also warms the engine, so report the better-known second one
                 for r in range(2):

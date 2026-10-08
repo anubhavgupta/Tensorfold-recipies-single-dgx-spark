@@ -70,3 +70,24 @@ Raw JSON is in `flash-3/results/`.
 | Streams that load at 262K each | 9 (42.7 GiB free for caches, 4.47 GiB per stream) | 9 (pool 9 x 262144; ~1 GiB free) |
 
 Later rounds (per content class, prefill rate, full-context concurrency) are appended below.
+
+## Round 2: content classes, prefill, full 262K concurrency
+Model: `turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6`, MTP on, greedy, 256 generated tokens, chat prompts. Aggregate decode tok/s.
+
+| Class | N | TensorFold | Tabby (stock) | Tabby (patched) |
+|---|---|---|---|---|
+| code | 1 / 4 / 9 | 93 / 177 / 254 | 79 / 49 / 64 | 76 / 131 / 133 |
+| prose | 1 / 4 / 9 | 54 / 106 / 158 | 50 / 36 / 44 | 50 / 91 / 117 |
+| devops | 1 / 4 / 9 | 98 / 172 / 254 | 80 / 47 / 64 | not rerun |
+| json | 1 / 4 / 9 | 97 / 188 / 274 | 88 / 55 / 74 | not rerun |
+
+Prefill (one stream, cold): TensorFold 859 / 846 / 790 / 748 tok/s at 4K / 33K / 131K / 249K; Tabby ~534 at 4K, 821 / 800 / 781 at 33K / 131K / 249K.
+
+Full capacity, 9 streams x ~249K prompt + 256 generated, all engines: 9/9 succeeded.
+- Tabby: wall 2818 s, prefill 798 tok/s aggregate, steady decode ~55 tok/s aggregate (prefill overlaps decode).
+- TensorFold: wall 3034 s, prefill 740 tok/s aggregate (prefills are serialised), per-stream decode 8-49 tok/s depending on when each stream started.
+
+### Why concurrency did not scale
+- TensorFold: it does scale. The earlier flat result came from `concurrency.py` (identical repetitive prompts, prefill inside the timing window). Use `bench/suite.py`.
+- Tabby: the fused MoE decode kernel handles at most `MAX_BSZN=8` rows per forward. With MTP, rows = streams x (1+drafts), so 2+ streams fell onto the slow path. Patch `flash-3/patches/exllamav3-fused-decode-rows.patch` raises `MAX_BSZN` to 25 (the kernel limit is 256 slots / 10 experts per token) and shortens the draft window so rows stay <= 25 (`EXL3_FUSED_DECODE_ROWS`, 0 disables). Apply it in `flash-3/runtime/exllamav3` and rebuild (`pip install --no-build-isolation -e .`, ~45 min without ninja). It is already applied and built in the local runtime.
+- Remaining gap: TensorFold still wins at N>=4 because Tabby's verify path above 8 rows is less efficient.
