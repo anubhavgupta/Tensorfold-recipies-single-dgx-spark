@@ -1,2 +1,4 @@
 *.log
 *.tmp
+flash-3/runtime/
+__pycache__/

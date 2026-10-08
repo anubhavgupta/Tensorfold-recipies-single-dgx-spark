@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-Flash-Next (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) with stock TensorFold through
+# Serve Qwen3.8-Flash-Next (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) with TensorFold v0.6.5 through
 # ./tensorfold.sh. Settings follow the Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold recipe, but every
-# knob below is a stock TensorFold flag or TENSORFOLD_* environment variable as of v0.6.5 - no patches
-# needed (that recipe's image patches up to v0.6.1 are now upstream: --vision-max-images,
+# knob below is a stock TensorFold flag or TENSORFOLD_* environment variable as of v0.6.5 (that recipe's image patches up to v0.6.1 are now upstream: --vision-max-images,
 # --vision-image-tokens, --kv-dtype, --mtp-drafts/--mtp-confidence, --ple-on-ssd, TENSORFOLD_PREFILL_ROWS,
 # TENSORFOLD_VIDEO_TOKENS and TENSORFOLD_MEMORY_RESERVE_GIB all exist in stock TensorFold now). Left out
-# because stock TensorFold has no equivalent: the DRAFT_LANGUAGE MTP-vocabulary patch and TENSORFOLD_MTP_COPY
-# (prompt-lookup drafts ahead of MTP).
+# because stock TensorFold has no equivalent: the DRAFT_LANGUAGE MTP-vocabulary patch. The recipe's
+# TENSORFOLD_MTP_COPY (prompt-lookup drafts ahead of MTP), n-gram read-ahead and draft-ordering changes are ported
+# to v0.6.5 in qwen38-flash-next/patches (tensorfold.sh --tf-patches).
 #
 # Usage: ./qwen38-flash-next/start.sh [extra tensorfold serve args]
 #   Extra args are appended, so they override the defaults below (e.g. --parallel 3 --kv-dtype bf16).
@@ -17,16 +17,20 @@
 #   TF_VERSION    TensorFold version (default: latest)      PORT         port (default: 8888)
 #   HOST          bind address (default: 0.0.0.0)           SERVED_NAME  model id clients see (default: Qwen3.8-Flash-Next)
 #   NAME          container name (default: tf-qwen38-flash-next)   FOREGROUND   1: run attached instead of in the background
+#   PATCHES       1 (default): run the derived image with qwen38-flash-next/patches (built on first start);
+#                 0: plain stock image (TENSORFOLD_MTP_COPY then does nothing)
 #   MODEL_ID      target model (default: Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)
 #   PARALLEL (5) CONTEXT (262144) KV_DTYPE (int8: bf16|int8|int4) PLE_ON_SSD (1)
 #   VISION (1) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384)
 #   MTP_DRAFTS (6) / MTP_CONFIDENCE (0.60): TensorFold's own Flash Next default is 6 / 0.70, but the
 #     recipe's swept 0.60 beat it ~3-4% with identical output, so this script matches it; empty: TensorFold's own default
-#   THINKING (1) MAX_TOKENS (131072); sampling is Qwen's recommendation and switches with THINKING:
+#   THINKING (1) MAX_TOKENS (32768); sampling is Qwen's recommendation and switches with THINKING:
 #     thinking mode TEMPERATURE (1.0) TOP_P (0.95), instruct/non-thinking mode TEMPERATURE (0.7)
-#     TOP_P (0.80); TOP_K (20) and MIN_P (0.0) are the same either way. Qwen also recommends a
+#     TOP_P (0.80); TOP_K (20) is the same either way. Qwen also recommends a
 #     presence_penalty (1.5 in instruct mode) and a repetition_penalty, but TensorFold has neither
 #     setting (it always decodes as if both were off), so they cannot be set here.
+#   TENSORFOLD_MTP_COPY (default 1: prompt-lookup drafts ahead of MTP, from patches/; stock ignores it),
+#   TENSORFOLD_NO_UPDATE_CHECK (default 1),
 #   TENSORFOLD_VIDEO_TOKENS (default 16384), TENSORFOLD_MEMORY_RESERVE_GIB (default 2),
 #   TENSORFOLD_PREFILL_ROWS (default 2048 when PLE_ON_SSD=1, matching the recipe's measured-faster choice
 #     with the n-gram tables on SSD; empty: TensorFold's own choice),
@@ -64,6 +68,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 NAME="${NAME:-tf-qwen38-flash-next}"
 FOREGROUND="${FOREGROUND:-0}"
+PATCHES="${PATCHES:-1}"
 
 PARALLEL="${PARALLEL:-5}"
 CONTEXT="${CONTEXT:-262144}"
@@ -73,9 +78,9 @@ VISION="${VISION:-1}"
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"
 VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-16384}"
 THINKING="${THINKING:-1}"
-MAX_TOKENS="${MAX_TOKENS:-131072}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
 # Qwen's recommended sampling: thinking mode (temperature 1.0, top_p 0.95) vs instruct/non-thinking
-# mode (0.7, 0.80). top_k 20 and min_p 0.0 are the same in both. presence_penalty 1.5 (instruct mode)
+# mode (0.7, 0.80). top_k 20 is the same in both. presence_penalty 1.5 (instruct mode)
 # and repetition_penalty are also Qwen's recommendation, but TensorFold has neither setting (it always
 # decodes as if both were off), so they cannot be applied here.
 if [[ "$THINKING" == 1 ]]; then
@@ -86,11 +91,12 @@ fi
 TEMPERATURE="${TEMPERATURE:-$_default_temperature}"
 TOP_P="${TOP_P:-$_default_top_p}"
 TOP_K="${TOP_K:-20}"
-MIN_P="${MIN_P:-0.0}"
 MTP_DRAFTS="${MTP_DRAFTS:-6}"
 MTP_CONFIDENCE="${MTP_CONFIDENCE:-0.60}"
 
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
+export TENSORFOLD_MTP_COPY="${TENSORFOLD_MTP_COPY:-1}"
+export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-2}"
 export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-0}"
 [[ "$PLE_ON_SSD" != 1 ]] || export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS:-2048}"
@@ -101,11 +107,12 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
 fi
 
 wrapper=(--tf-name "$NAME" --tf-docker-arg=--ulimit=stack=67108864)
+[[ "$PATCHES" != 1 ]] || wrapper+=(--tf-patches "$SCRIPT_DIR/patches")
 [[ "$FOREGROUND" == 1 ]] || wrapper+=(--tf-detach)
 
 serve_args=(--name "$SERVED_NAME" --host "$HOST" --port "$PORT"
             --parallel "$PARALLEL" --context "$CONTEXT" --kv-dtype "$KV_DTYPE"
-            --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" --min-p "$MIN_P"
+            --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K"
             --max-tokens "$MAX_TOKENS")
 [[ "$PLE_ON_SSD" == 1 ]] && serve_args+=(--ple-on-ssd)
 [[ "$VISION" == 1 ]] && serve_args+=(--vision --vision-max-images "$VISION_MAX_IMAGES" --vision-image-tokens "$VISION_IMAGE_TOKENS")
