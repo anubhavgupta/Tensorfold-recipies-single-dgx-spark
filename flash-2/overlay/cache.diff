@@ -1,0 +1,83 @@
+--- a/multi.py	2026-10-09 18:13:02.150147560 +0530
++++ b/multi.py	2026-10-09 18:13:02.160715418 +0530
+@@ -253,10 +253,11 @@
+         if self.w.comm is not None and any(x is not None for x in (s.constraint, s.vision, s.probabilities)):
+             raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
+         t0 = time.perf_counter()
++        s.key = prefixes.keyed(s)                        # image prompts match kept prefixes by their images' hashes
+         if self.w.comm is not None:
+             st, resume, s.cached = self._prepare_admission(s, told)
+         else:
+-            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
++            st, resume, s.cached = self._slot_for(s.key, s.draft)
+         if self.w.comm is None:
+             try:
+                 if not self._grow(st, len(s.prompt) + self.depth + 2,
+@@ -266,7 +267,7 @@
+                 if resume is None:
+                     self.free.append(st)
+                 else:
+-                    self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
++                    self._remember(s.key[:s.cached], st, resume["state"], resume["tail"])
+                 raise
+         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+@@ -281,7 +282,7 @@
+             e.stops = list(s.stops)
+         else:
+             e.stops = sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)}) \
+-                if s.draft and st.image_positions is None and self.points is not None else []
++                if s.draft and self.points is not None else []
+         s.sid, s.st = self.next_id, st
+         self.next_id += 1
+         s.prefill_s = time.perf_counter() - t0
+--- a/multi_fill.py	2026-10-09 18:13:02.150954594 +0530
++++ b/multi_fill.py	2026-10-09 18:13:02.160832254 +0530
+@@ -122,12 +122,12 @@
+     def _keep_at(s: Stream) -> int | None:
+         """Where a drafting stream's prompt state is kept: one token before its end, which a next turn extends."""
+ 
+-        return entry_end(s.prompt) if s.draft and s.st.image_positions is None else None
++        return entry_end(s.prompt) if s.draft else None
+ 
+     def _point(self, s: Stream, start: int) -> int | None:
+         """The next message-start or prompt-end snapshot this prompt piece can reach."""
+ 
+-        if not s.draft or s.st.image_positions is not None:
++        if not s.draft:
+             return None
+         return next((p for p in self.fills[s.sid][0].stops if p > start), self._keep_at(s))
+ 
+@@ -191,7 +191,7 @@
+             e, mtp, _, kept = self.fills[s.sid]
+             self.fills[s.sid][2] = a + n
+             if kept is not None and a < kept[0]["pos"] <= a + n:
+-                self._remember(list(s.prompt[:kept[0]["pos"]]), s.st, *kept)
++                self._remember(s.key[:kept[0]["pos"]], s.st, *kept)
+             self.fills[s.sid][3] = None
+             if a + n < len(s.prompt):
+                 continue
+--- a/prefixes.py	2026-10-09 18:13:02.151882160 +0530
++++ b/prefixes.py	2026-10-09 18:13:02.160534500 +0530
+@@ -1,5 +1,21 @@
+ """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
+ 
++import hashlib
++
++
++def keyed(s) -> list[int]:
++    """The prompt as a prefix-cache key: each image's placeholder run becomes a token only that image's bytes make."""
++
++    ids, v = list(s.prompt), s.vision
++    if v is None:
++        return ids
++    for kind, spans, hashes in (("i", v.image_spans, v.image_hashes),
++                                ("v", getattr(v, "video_spans", ()), getattr(v, "video_hashes", ()))):
++        for (a, b), h in zip(spans, hashes):
++            tag = -1 - int.from_bytes(hashlib.sha256(f"{kind}:{h}".encode()).digest()[:16], "big")
++            ids[a:b] = [tag] * (b - a)
++    return ids
++
+ 
+ def _best(kept, prompt, busy=()):
+     return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)

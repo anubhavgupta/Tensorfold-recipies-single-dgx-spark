@@ -12,7 +12,7 @@
 #   VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (32768) TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
 #   OVERLAY (1: mount overlay/exl3, the faster prompt kernels; 0: stock)  TENSORFOLD_MTL (5)
 #   MTP_DRAFTS (6) MTP_CONFIDENCE (0.60)  PATCHES (0: use ../qwen38-flash-next/patches, untested on EXL3)
-#   PORT (8888) HOST (0.0.0.0) NAME (tf-flash-2-exl3) SERVED_NAME (Qwen3.8-Flash-Next) FOREGROUND (0)
+#   VISION_CACHE (1: overlay/cache, prefix caching for image requests)  PORT (8888) HOST (0.0.0.0) NAME (tf-flash-2-exl3) SERVED_NAME (Qwen3.8-Flash-Next) FOREGROUND (0)
 # Not available for EXL3 packs: --ple-on-ssd, --tp 2. Logs: docker logs -f tf-flash-2-exl3   Stop: ./flash-2/end.sh
 set -euo pipefail
 
@@ -98,6 +98,13 @@ if [[ "${OVERLAY:-1}" == 1 && "$TF_VERSION" == 0.6.5 ]]; then
   for _f in experts_grouped.cuh experts.cu experts.py; do
     wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/exl3/$_f:$_ex/$_f:ro")
   done
+  # Prefix caching for image requests (overlay/cache): kept prefixes are keyed by the images' hashes. VISION_CACHE=0 turns it off.
+  if [[ "${VISION_CACHE:-1}" == 1 ]]; then
+    _qc=/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda
+    for _f in multi.py multi_fill.py prefixes.py; do
+      wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/cache/$_f:$_qc/$_f:ro")
+    done
+  fi
 fi
 [[ "$PATCHES" != 1 ]] || wrapper+=(--tf-patches "$SCRIPT_DIR/../qwen38-flash-next/patches")
 [[ "$FOREGROUND" == 1 ]] || wrapper+=(--tf-detach)
