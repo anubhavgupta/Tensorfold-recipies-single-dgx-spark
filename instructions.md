@@ -125,4 +125,13 @@ Further gains need a different expert design (for example dequantising to fp16 t
 
 ## flash-4 (MiaAI-Lab Zig recipe, INT4-AutoRound checkpoint)
 
-Set up in `flash-4/` (`./flash-4/start.sh`, `./flash-4/stop.sh`, port 8888). The smoke test passed (8 streams, 262K, MTP). Not benchmarked yet.
+Set up in `flash-4/` (`./flash-4/start.sh`, `./flash-4/stop.sh`, port 8888). The smoke test passed (8 streams, 262K, MTP). Benchmarked with `flash-3/bench/suite.py` (checkpoint `azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`, a different quant, 8 streams max):
+
+| Test | Result |
+|---|---|
+| Prefill 4K / 32K (first requests, likely warm-up) | 350 / 600 tok/s |
+| Prefill 131K / 249K | 1336 / 1286 tok/s |
+| Code N=1 / 4 / 8 (steady aggregate) | 90 / 204 / 304 tok/s |
+| Prose N=1 / 4 / 8 (steady aggregate) | 53 / 125 / 186 tok/s |
+
+Full-window concurrency was not run.
