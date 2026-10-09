@@ -1,0 +1,56 @@
+# TabbyAPI config for GLM-5.3-Flash EXL3 (turboderp/GLM-5.3-Flash-exl3, 2.05bpw) on one DGX Spark.
+# serve.sh renders it into glm5.3/state/config.yml, filling the dollar-brace fields from its variables.
+
+network:
+  host: ${HOST}
+  port: ${PORT}
+  disable_auth: ${DISABLE_AUTH}
+  api_servers: ["OAI"]
+
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+
+model:
+  model_dir: ${MODEL_PARENT}
+  model_name: ${MODEL_NAME}
+  backend: exllamav3
+  inline_model_loading: false
+
+  max_seq_len: ${MAX_SEQ_LEN}
+  cache_size: ${CACHE_SIZE}
+  cache_mode: "${CACHE_MODE}"
+  chunk_size: ${CHUNK_SIZE}
+  max_batch_size: ${MAX_BATCH_SIZE}
+
+  vision: ${VISION}
+  warmup: true
+
+  # GLM's <tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value></tool_call> format and <think> reasoning.
+  tool_format: glm4_5
+  reasoning: true
+  template_vars_default:
+    reasoning_effort: ${REASONING_EFFORT}
+
+draft_model:
+  draft_mode: ${DRAFT_MODE}
+  draft_cache_mode: "${CACHE_MODE}"
+  draft_num_tokens: ${DRAFT_NUM_TOKENS}
+  dynamic_draft: true
+
+# The pack's generation_config.json has temperature 1.0 and top_p 0.95 (what Z.ai evaluates with).
+# TabbyAPI does not read it, and without a sampling section it draws from the full vocabulary.
+sampling:
+  temperature:
+    override: 1.0
+    force: false
+  top_p:
+    override: 0.95
+    force: false
+  top_k:
+    override: 0
+    force: false
+  min_p:
+    override: 0.0
+    force: false
