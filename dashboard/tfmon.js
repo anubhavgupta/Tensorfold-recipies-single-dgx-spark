@@ -25,7 +25,7 @@ const DEFAULTS = {
   url: 'http://localhost:8888/health',
   intervalMs: 1000,
   cli: false,
-  theme: 'dark',
+  theme: 'auto',
   model: '',
   price: DEFAULT_PRICE_FILE,
   state: DEFAULT_STATE_FILE,
@@ -38,7 +38,7 @@ const HELP = `tfmon — TensorFold engine dashboard
 Options:
   --url URL        health endpoint        (default: ${DEFAULTS.url})
   --interval MS    poll period, ms        (default: 1000)
-  --theme NAME     dark|light             (default: dark)
+  --theme NAME     auto|dark|light        (default: auto - asks the terminal for its background colour)
   --model NAME     label override for the header
   --price FILE     pricing JSON, $/1M tokens (default: pricing.json next to tfmon.js)
   --state FILE     cost accumulator JSON, persists across runs (default: cost.json next to tfmon.js)
@@ -67,7 +67,7 @@ function parseArgs(argv) {
       }
       case '--theme': {
         const v = val();
-        if (v !== 'dark' && v !== 'light') throw new Error('--theme must be dark|light');
+        if (v !== 'auto' && v !== 'dark' && v !== 'light') throw new Error('--theme must be auto|dark|light');
         cfg.theme = v;
         break;
       }
@@ -89,8 +89,9 @@ function parseArgs(argv) {
 // ---------------------------------------------------------------- themes
 
 const THEMES = {
+  // "dark" reads well on a dark terminal background, "light" on a light one
   dark: { fg: 252, dim: 241, accent: 45, ok: 46, warn: 214, err: 196, graph: 51 },
-  light: { fg: 234, dim: 247, accent: 21, ok: 28, warn: 166, err: 160, graph: 21 },
+  light: { fg: 234, dim: 243, accent: 21, ok: 28, warn: 166, err: 160, graph: 21 },
 };
 const R = '\x1b[0m';
 const paint = (s, code) => (code == null ? s : `\x1b[38;5;${code}m${s}${R}`);
@@ -359,6 +360,41 @@ let showGraphs = true;
 let showHelp = false;
 const theme = () => THEMES[themeIdx === 1 ? 'light' : 'dark'];
 
+// The "light" theme paints near-black text: invisible on a dark background. Ask the
+// terminal what its background actually is (OSC 11) and start with the matching theme.
+// Resolves { theme: 'dark'|'light'|null, extra } - extra is whatever the user typed
+// while we were waiting, handed back so those keystrokes are not lost.
+function detectTheme(timeoutMs = 250) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    let buf = '';
+    const finish = (theme) => {
+      clearTimeout(timer);
+      stdin.off('data', onData);
+      resolve({ theme, extra: buf.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '') });
+    };
+    const onData = (d) => {
+      buf += d;
+      const reply = /\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\)/.exec(buf);
+      if (reply) finish(themeForBg(reply[0]));
+      else if (buf.length > 256) finish(null); // chatter, not a colour reply
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    stdin.setEncoding('utf8');
+    stdin.resume();
+    stdin.on('data', onData);
+    process.stdout.write('\x1b]11;?\x1b\\');
+  });
+}
+
+function themeForBg(reply) {
+  const m = /rgb:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})/i.exec(reply);
+  if (!m) return null;
+  const byte = (h) => Math.round((parseInt(h, 16) / (16 ** h.length - 1)) * 255); // 1-4 hex digits -> 0..255
+  const [r, g, b] = m.slice(1).map(byte);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 140 ? 'light' : 'dark';
+}
+
 const BLOCKS = '▁▂▃▄▅▆▇█';
 function sparkline(values, width, code) {
   const t = theme();
@@ -496,8 +532,10 @@ function frame() {
   // box(' Cost', .., W - 4) lines are W - 4 visible chars wide -> W with the frame's "│ .. │"
   const costBox = box(' Cost', [costBase + (W - 8 - vlen(costBase) >= vlen(rates) ? paint(rates, t.dim) : '')], W - 4);
   const keys = showHelp
-    ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; cost is a running total (persisted)', t.dim)
-    : paint(' q quit · h help · g graphs · t theme', t.dim);
+    ? paint(' q quit · h hide help · g toggle graphs · t theme (light = for a light-background terminal) — rates are per poll window; cost is a running total', t.dim)
+    : themeIdx === 1
+      ? paint(' light suits light terminals - t for dark · q quit · h help · g graphs', t.warn)
+      : paint(' q quit · h help · g graphs · t theme', t.dim);
 
   const dimOn = age > 3 * iv; // includes never-succeeded (lastSuccessT = 0)
   const dimmed = (l) => (dimOn ? paint(l, t.dim) : l);
@@ -577,23 +615,30 @@ process.stdout.on('error', (e) => {
   process.exit(1);
 });
 
-function runTui() {
+async function runTui() {
   tuiMode = true;
   const out = process.stdout;
   process.on('SIGINT', quit);
   process.on('SIGTERM', quit);
   process.on('exit', restoreTerm);
   out.write('\x1b[?1049h\x1b[2J\x1b[?25l');
+  const handleKey = (k) => {
+    if (k === 'q' || k === '\x03') quit();
+    else if (k === 'h') showHelp = !showHelp;
+    else if (k === 'g') showGraphs = !showGraphs;
+    else if (k === 't') themeIdx = 1 - themeIdx;
+  };
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
-    process.stdin.on('data', (k) => {
-      if (k === 'q' || k === '\x03') quit();
-      else if (k === 'h') showHelp = !showHelp;
-      else if (k === 'g') showGraphs = !showGraphs;
-      else if (k === 't') themeIdx = 1 - themeIdx;
-    });
+    if (cfg.theme === 'auto') {
+      const { theme, extra } = await detectTheme();
+      if (uiStop) return;
+      if (theme) themeIdx = theme === 'light' ? 1 : 0;
+      if (extra) handleKey(extra); // typed during the probe
+    }
+    process.stdin.on('data', handleKey);
     process.stdin.on('end', quit);
   }
   let lastDraw = 0;

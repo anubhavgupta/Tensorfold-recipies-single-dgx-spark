@@ -42,7 +42,7 @@ node tfmon.js --url http://host:port/health --interval 500 --model my-engine
 |-----------------|------------------------------------------------|
 | `--url URL`     | health endpoint (default `http://localhost:8888/health`) |
 | `--interval MS` | poll period, ≥ 50 ms (default 1000)            |
-| `--theme NAME`  | `dark` \| `light` (default `dark`)             |
+| `--theme NAME`  | `auto` \| `dark` \| `light` (default `auto`, see Themes) |
 | `--model NAME`  | header label override                          |
 | `--price FILE`  | pricing JSON, $/1M tokens (default: `pricing.json` next to `tfmon.js`) |
 | `--state FILE`  | cost accumulator JSON (default: `cost.json` next to `tfmon.js`) |
@@ -56,6 +56,19 @@ layout stays on screen, dimmed — never blank).
 
 Piping `--cli` output is safe: `tfmon` exits quietly (after saving the cost
 state) as soon as the reader closes, e.g. `tfmon --cli | head -20`.
+
+### Themes
+
+`dark` is for a dark terminal background, `light` paints near-black text for
+a light one — on the wrong background either one is unreadable, so the
+default is `auto`: before the first frame tfmon asks the terminal for its
+background colour (OSC 11 — answered by xterm, GNOME Terminal, kitty, alacritty,
+iTerm, Windows Terminal, …), computes its luminance and picks the theme.
+No answer within 250 ms means `dark`; keystrokes typed while waiting are
+not lost. `--theme dark|light` skips the question. `t` still switches by
+hand — in `light` the key hints say so, since that theme only makes sense
+on a light background. `--cli` never probes (its stdin is not in raw mode)
+and starts in `dark`.
 
 ## Cost tracking
 
