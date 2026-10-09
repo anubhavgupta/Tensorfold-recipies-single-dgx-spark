@@ -9,11 +9,18 @@ def keyed(s) -> list[int]:
     ids, v = list(s.prompt), s.vision
     if v is None:
         return ids
-    for kind, spans, hashes in (("i", v.image_spans, v.image_hashes),
-                                ("v", getattr(v, "video_spans", ()), getattr(v, "video_hashes", ()))):
-        for (a, b), h in zip(spans, hashes):
-            tag = -1 - int.from_bytes(hashlib.sha256(f"{kind}:{h}".encode()).digest()[:16], "big")
-            ids[a:b] = [tag] * (b - a)
+
+    def tag(kind, h):
+        return -1 - int.from_bytes(hashlib.sha256(f"{kind}:{h}".encode()).digest()[:16], "big")
+
+    for (a, b), h in zip(v.image_spans, v.image_hashes):
+        ids[a:b] = [tag("i", h)] * (b - a)
+    spans, grids = list(getattr(v, "video_spans", ())), getattr(v, "video_grid_thw", None)
+    first = 0
+    for h, grid in zip(getattr(v, "video_hashes", ()), () if grids is None else grids):
+        for a, b in spans[first:first + int(grid[0])]:       # a video is one span a frame group
+            ids[a:b] = [tag("v", h)] * (b - a)
+        first += int(grid[0])
     return ids
 
 
