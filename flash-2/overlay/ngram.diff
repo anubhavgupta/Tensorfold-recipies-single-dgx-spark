@@ -1,0 +1,20 @@
+--- a/engine.py	2026-10-09 21:25:06.442386375 +0530
++++ b/engine.py	2026-10-09 21:25:25.287319715 +0530
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import time
+ from datetime import timedelta
+ from pathlib import Path
+@@ -205,6 +206,9 @@
+             size = sum(lock_bytes(t) for t in tables.values())
+             # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for
+             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
++            cap = os.environ.get("TENSORFOLD_NGRAM_LOCK_GIB", "").strip()
++            if cap:                                   # pin at most this much of the tables; the rest stays reclaimable page cache
++                room = min(room, int(float(cap) * 2**30))
+             for table in tables.values():
+                 if not tables_read:
+                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one

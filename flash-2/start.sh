@@ -57,6 +57,7 @@ TOP_K="${TOP_K:-20}"
 MTP_DRAFTS="${MTP_DRAFTS:-6}"
 MTP_CONFIDENCE="${MTP_CONFIDENCE:-0.60}"
 
+export TENSORFOLD_NGRAM_LOCK_GIB="${TENSORFOLD_NGRAM_LOCK_GIB:-0}"
 export TENSORFOLD_MAX_BODY_MIB="${TENSORFOLD_MAX_BODY_MIB:-192}"
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
@@ -108,6 +109,10 @@ if [[ "${OVERLAY:-1}" == 1 && "$TF_VERSION" == 0.6.5 ]]; then
     done
   fi
   # Prefix caching for image requests (overlay/cache): kept prefixes are keyed by the images' hashes. VISION_CACHE=0 turns it off.
+  # TENSORFOLD_NGRAM_LOCK_GIB (default 0: leave the n-gram tables as reclaimable page cache; N: pin at most N GiB; "stock": pin all, as TensorFold does).
+  if [[ "${TENSORFOLD_NGRAM_LOCK_GIB:-0}" != stock ]]; then
+    wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/ngram/engine.py:/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/engine.py:ro")
+  fi
   if [[ "${VISION_CACHE:-1}" == 1 ]]; then
     _qc=/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda
     for _f in multi.py multi_fill.py prefixes.py state.py; do

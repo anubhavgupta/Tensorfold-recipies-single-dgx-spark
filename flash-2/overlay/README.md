@@ -40,3 +40,17 @@ Ported from the Qwen3.8-27B TensorFold patch. Stock 0.6.5 limits -> overlay:
 | Images, total decode timeout | 30 s | 60 s |
 
 Still 50 images (`--vision-max-images`) per request. Tested: a 23 MB video (13K tokens, 23 s) and 50 images of 1080p (15.7K tokens, 24 s); the 51st is refused. `limits.diff` holds the diff.
+
+## n-gram table pinning (`ngram/`, `TENSORFOLD_NGRAM_LOCK_GIB`)
+
+Stock TensorFold `mlock`s the 39 GiB `ngram_embedding.safetensors` (27 GiB of it) into RAM at startup, which pins that memory and leaves ~5 GiB of `MemAvailable` for KV caches. The overlay caps the pin: `0` (default) leaves the tables as reclaimable page cache, `N` pins at most N GiB, `stock` keeps the original behaviour (the overlay is not mounted). `ngram.diff` holds the diff.
+
+Measured on this Spark (same prompts, three restarts):
+
+| Lock | `MemAvailable` after start | Decode | Cold 35K prefill | 6 x 80K concurrent |
+|---|---|---|---|---|
+| stock (all pinned) | 7.5 GiB | 47.0 tok/s | 33.4 s | 501 s, no errors |
+| 16 GiB | 29.5 GiB | 47.0 tok/s | 33.1 s | 512 s, no errors |
+| 0 | 45.0 GiB | 46.9 tok/s | 33.5 s | 493 s, no errors |
+
+A 6 x 100K hold test (700 new tokens each) also passed with no errors in both stock (618 s) and 0 (678 s).
