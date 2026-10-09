@@ -12,38 +12,43 @@ Requires Node ≥ 18 (uses global `fetch`).
 ```
 ┌ TensorFold: Qwen3.8-27B ───────────────────────────────────────────OK · idle┐
 │ ┌─  Throughput ────────┐ ┌─  Spec Decode ───────┐ ┌─  Cache ───────────────┐│
-│ │             ▁▁▁▁▁▁▁  │ │  acc   0% ░░░░░░░░░░ │ │  hit   0.0% ░░░░░░░░░░ ││
-│ │  decode 0.0 tok/s    │ │  0.0 tok/round       │ │  all  97.0% ██████████ ││
-│ │  prefill 0.0 tok/s   │ │  round 0 ms          │ │  spend/sec ₹0.000000   ││
-│ │  avg in 55.1K tok/.. │ │  stream util 0%      │ │  8.50M / 8.76M tok     ││
+│ │             ▁▁▁▁▁▁▁  │ │  Acc   0% ░░░░░░░░░░ │ │  Hit   0.0% ░░░░░░░░░░ ││
+│ │  Decode 0.0 tok/s    │ │  0.0 tok/round       │ │  All  97.3% ██████████ ││
+│ │  Prefill 0.0 tok/s   │ │  Round 0 ms          │ │  Spend/sec ₹0.000000   ││
+│ │  Avg in 59.3K tok/.. │ │  Stream util 0%      │ │  9.76M / 10.02M tok    ││
 │ └──────────────────────┘ └──────────────────────┘ └────────────────────────┘│
 │ ┌─  Streams ──────────────────────────────────────────────────────────────┐ │
 │ │ ░░░░░░░░░ 0/9   Decoding 0   Prefilling 0   Req 0.0/s   Running 0       │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │ ┌─  Lifetime ─────────────────────────────────────────────────────────────┐ │
-│ │ Requests 159.0   Prompt 8.76M   Completion 81.9K   Ctx 262144           │ │
+│ │ Requests 169.0   Prompt 10.02M   Completion 88.4K   Ctx 262144          │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │ ┌─  Cost ─────────────────────────────────────────────────────────────────┐ │
-│ │ Total ₹5753.12   Session ₹291.78   Earlier ₹5461.34                     │ │
+│ │ Total ₹5785.13   Session ₹323.79   Earlier ₹5461.34                     │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │  q quit · h help · g graphs · t theme                                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-`hit` and `all` are the same gauge over two horizons: `hit` = Δcached ÷
-Δprompt for the last poll window (jumpy, that is the point), `all` = cached
+`Hit` and `All` are the same gauge over two horizons: `Hit` = Δcached ÷
+Δprompt for the last poll window (jumpy, that is the point), `All` = cached
 ÷ prompt over the engine's whole lifetime — it barely moves and tells you
 what the prefix cache has actually been worth since the server booted.
 
 An idle window measures 0 tok/s, which looks like a stalled engine, so
-`decode` and `prefill` keep showing the last rate they actually measured for
+`Decode` and `Prefill` keep showing the last rate they actually measured for
 up to 60 s afterwards — dimmed and marked `*` — before falling back to 0.0.
 
-Colours follow the Lifetime box: `decode` is green like Completion, `prefill`
-cyan like Prompt, labels and units are dim. The percent gauges (`hit`, `all`,
-`acc`) right-align their number to the width of `100.0`, so the bar keeps one
+Colours follow the Lifetime box: `Decode` is green like Completion, `Prefill`
+cyan like Prompt, labels and units are dim. The percent gauges (`Hit`, `All`,
+`Acc`) right-align their number to the width of `100.0`, so the bar keeps one
 start column and one length instead of sliding and resizing every time a
 digit appears.
+
+Labels inside the boxes are capitalised (`Decode`, `Spend/sec`, `Stream util`).
+The `--cli` single-line fields stay lowercase (`decode`, `cache`, `cost`) so
+they remain easy to grep, and the key hints keep the literal keys
+(`q quit · h help`).
 
 ## Usage
 
@@ -89,7 +94,7 @@ and starts in `dark`.
 
 Cost is derived from the cumulative `/health` token counters:
 window cost = (Δprompt − Δcached) × input + Δcached × cache +
-Δcompletion × output. The Cache panel shows `spend/sec` (window
+Δcompletion × output. The Cache panel shows `Spend/sec` (window
 cost normalized to 1 s, so it is a true rate at any poll interval).
 
 The `Cost` box above the key hints (and `--cli`) prints the

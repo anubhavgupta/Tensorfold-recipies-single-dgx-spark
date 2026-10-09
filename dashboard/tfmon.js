@@ -452,13 +452,13 @@ function frame() {
   if (state.error) {
     status = paint('STALE', t.err);
     banner = state.have
-      ? `engine unreachable - last ok ${Math.round(age)}s ago`
-      : `engine unreachable - ${state.error}`;
+      ? `Engine unreachable - last ok ${Math.round(age)}s ago`
+      : `Engine unreachable - ${state.error}`;
   } else if (!state.have) {
-    status = paint('connecting...', t.dim);
+    status = paint('Connecting...', t.dim);
   } else if (age > 3 * iv) {
     status = paint('STALE', t.err);
-    banner = `engine unreachable - last ok ${Math.round(age)}s ago`;
+    banner = `Engine unreachable - last ok ${Math.round(age)}s ago`;
   } else {
     status = h.busy ? paint('OK · busy', t.warn) : paint('OK · idle', t.ok);
   }
@@ -474,7 +474,7 @@ function frame() {
   // ---- three panels
   const pw = Math.floor((W - 5) / 3);
   const pwLast = W - 5 - pw * 2;
-  const noData = paint(' waiting for data...', t.dim);
+  const noData = paint(' Waiting for data...', t.dim);
   const v = (s) => (s != null ? s : noData);
 
   const [outV, outHold] = shownRate(d?.outTps ?? 0, state.lastOut, now);
@@ -496,25 +496,25 @@ function frame() {
   };
   const bTp = box(' Throughput', [
     v(state.histOut.length
-      ? (showGraphs ? sparkline(state.histOut, Math.max(4, pw - 5), t.graph) : paint(' (graphs off - g)', t.dim))
+      ? (showGraphs ? sparkline(state.histOut, Math.max(4, pw - 5), t.graph) : paint(' Graphs off (g)', t.dim))
       : noData),
-    v(d && rateLine('decode', outV, outHold, (x) => x.toFixed(1), t.ok)),
-    v(d && rateLine('prefill', preV, preHold, fmt, t.accent)),
-    v(d && paint(` avg in ${fmt(d.avgCtx)} tok/req`, t.dim)),
+    v(d && rateLine('Decode', outV, outHold, (x) => x.toFixed(1), t.ok)),
+    v(d && rateLine('Prefill', preV, preHold, fmt, t.accent)),
+    v(d && paint(` Avg in ${fmt(d.avgCtx)} tok/req`, t.dim)),
   ], pw);
 
   const bSp = box(' Spec Decode', [
-    v(d && pctLine('acc', d.accRate, 0, pw)),
+    v(d && pctLine('Acc', d.accRate, 0, pw)),
     v(d && paint(` ${d.tokPerRound.toFixed(1)} tok/round`, t.fg)),
-    v(d && paint(` round ${d.roundMs.toFixed(0)} ms`, t.fg)),
-    v(d && paint(` stream util ${(d.util * 100).toFixed(0)}%`, t.dim)),
+    v(d && paint(` Round ${d.roundMs.toFixed(0)} ms`, t.fg)),
+    v(d && paint(` Stream util ${(d.util * 100).toFixed(0)}%`, t.dim)),
   ], pw);
 
   const lifeCost = h ? lifetimeCost(h) : 0;
   const bCa = box(' Cache', [
-    v(d && pctLine('hit', d.cacheHit, 1, pwLast)),
-    v(d && pctLine('all', d.allHit, 1, pwLast)),
-    v(d && paint(' spend/sec ', t.fg) + paint(fmtUsd(d.spentPerSec), t.warn)),
+    v(d && pctLine('Hit', d.cacheHit, 1, pwLast)),
+    v(d && pctLine('All', d.allHit, 1, pwLast)),
+    v(d && paint(' Spend/sec ', t.fg) + paint(fmtUsd(d.spentPerSec), t.warn)),
     v(h && paint(` ${fmt(h.cachedTotal)} / `, t.dim) + paint(fmt(h.promptTotal), t.accent) + paint(' tok', t.dim)),
   ], pwLast);
 
@@ -549,7 +549,7 @@ function frame() {
       + paint('   Prompt ', t.dim) + paint(fmt(h.promptTotal), t.accent)
       + paint('   Completion ', t.dim) + paint(fmt(h.completionTotal), t.ok)
       + paint('   Ctx ', t.dim) + paint(String(h.ctx), t.fg)
-    : paint('- (no data yet)', t.dim);
+    : paint(' No data yet', t.dim);
   const lifeBox = box(' Lifetime', [life], W - 4);
   // cost box: running total, the live engine session's share, and what earlier sessions carried
   const rt = (v) => String(+v.toFixed(4)); // 192 / 19.2 / 0.2 without trailing zeros
