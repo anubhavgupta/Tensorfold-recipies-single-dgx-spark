@@ -99,7 +99,7 @@ if [[ "${OVERLAY:-1}" == 1 && "$TF_VERSION" == 0.6.5 ]]; then
   for _f in experts_grouped.cuh experts.cu experts.py; do
     wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/exl3/$_f:$_ex/$_f:ro")
   done
-  # Larger media limits (overlay/limits): request bodies up to TENSORFOLD_MAX_BODY_MIB (128), videos 64 MiB each / 96 MiB in all, 64 MiB of images. VISION_LIMITS=0 keeps stock.
+  # Larger media limits (overlay/limits): request bodies up to TENSORFOLD_MAX_BODY_MIB (128), 4 videos (64 MiB each / 128 MiB in all), 64 MiB of images. VISION_LIMITS=0 keeps stock.
   if [[ "${VISION_LIMITS:-1}" == 1 ]]; then
     _tf=/usr/local/lib/python3.12/dist-packages/tensorfold
     wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/limits/request_body.py:$_tf/server/request_body.py:ro")
