@@ -81,3 +81,14 @@
  
  def _best(kept, prompt, busy=()):
      return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
+--- a/state.py	2026-10-09 19:27:24.351945391 +0530
++++ b/state.py	2026-10-09 19:27:24.365497192 +0530
+@@ -289,6 +289,8 @@
+         if other.capacity > self.capacity:
+             raise ValueError(f"copy_from: {other.capacity} cache rows do not fit {self.capacity}")
+         for name, value in vars(other).items():
++            if name in ("image_positions", "image_rows", "image_features"):
++                continue                       # a kept prefix's image state is re-attached by image_rows.begin on reuse
+             mine = getattr(self, name)
+             if isinstance(value, torch.Tensor):
+                 into(mine, value)

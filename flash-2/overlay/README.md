@@ -16,7 +16,7 @@ The first start compiles the kernels (a few extra minutes). `patch.diff` is the 
 ## Prefix cache for image requests (`overlay/cache`)
 
 Stock 0.6.5 never keeps or reuses a prompt prefix when the request has an image, so every turn of an image chat
-re-prefills the whole history. `multi.py`, `multi_fill.py` and `prefixes.py` (mounted over the image's copies;
+re-prefills the whole history. `multi.py`, `multi_fill.py`, `prefixes.py` and `state.py` (mounted over the image's copies;
 `VISION_CACHE=0` turns it off, `cache.diff` is the change) now:
 
 - key kept prefixes by the prompt with each image's placeholder run replaced by a token derived from that image's

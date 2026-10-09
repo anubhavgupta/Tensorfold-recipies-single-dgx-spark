@@ -101,7 +101,7 @@ if [[ "${OVERLAY:-1}" == 1 && "$TF_VERSION" == 0.6.5 ]]; then
   # Prefix caching for image requests (overlay/cache): kept prefixes are keyed by the images' hashes. VISION_CACHE=0 turns it off.
   if [[ "${VISION_CACHE:-1}" == 1 ]]; then
     _qc=/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda
-    for _f in multi.py multi_fill.py prefixes.py; do
+    for _f in multi.py multi_fill.py prefixes.py state.py; do
       wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/cache/$_f:$_qc/$_f:ro")
     done
   fi
