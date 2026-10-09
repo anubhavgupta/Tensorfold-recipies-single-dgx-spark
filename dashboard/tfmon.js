@@ -65,10 +65,12 @@ function parseArgs(argv) {
         cfg.intervalMs = Math.round(ms);
         break;
       }
-      case '--theme':
-        if (val() !== 'dark' && val() !== 'light') throw new Error('--theme must be dark|light');
-        cfg.theme = val();
+      case '--theme': {
+        const v = val();
+        if (v !== 'dark' && v !== 'light') throw new Error('--theme must be dark|light');
+        cfg.theme = v;
         break;
+      }
       case '--model': cfg.model = val(); break;
       case '--price': cfg.price = val(); break;
       case '--state': cfg.state = val(); break;
@@ -127,6 +129,14 @@ function fmt(n, digits = 1) {
 function fmtUsd(n) {
   if (!Number.isFinite(n)) return '-';
   return `${P.currency}${n.toFixed(6)}`;
+}
+
+// cost totals for the cost row: 6 decimals only make sense for tiny rates
+function fmtCost(n) {
+  if (!Number.isFinite(n)) return '-';
+  const a = Math.abs(n);
+  if (a >= 1e6) return `${P.currency}${fmt(n)}`;
+  return `${P.currency}${a >= 1 ? n.toFixed(2) : n.toFixed(4)}`;
 }
 
 // Window diff of two samples { t, h }. Lifetime/util always from cur.
@@ -422,7 +432,7 @@ function frame() {
     v(state.histOut.length
       ? (showGraphs ? sparkline(state.histOut, Math.max(4, pw - 5), t.graph) : paint(' (graphs off - g)', t.dim))
       : noData),
-    v(d && paint(` out ${d.outTps.toFixed(1)} tok/s`, t.fg)),
+    v(d && paint(` decode ${d.outTps.toFixed(1)} tok/s`, t.fg)),
     v(d && paint(` prefill ${fmt(d.prefillTps)} tok/s`, t.fg)),
     v(d && paint(` avg in ${fmt(d.avgCtx)} tok/req`, t.dim)),
   ], pw);
@@ -454,19 +464,37 @@ function frame() {
     lines.push('│ ' + a + ' ' + b + ' ' + c + pad('', Math.max(0, W - 5 - vlen(a) - vlen(b) - vlen(c))) + '│');
   }
 
-  // ---- footer: streams, request rate, lifetime, keys
+  // ---- footer: Streams / Lifetime / Cost boxes, then the key hints
   const s = h?.streams ?? { decoding: 0, prefilling: 0, max: 8 };
   const dec = Math.min(s.max, s.decoding);
   const pre = Math.min(Math.max(0, s.max - dec), s.prefilling);
   const free = Math.max(0, s.max - dec - pre);
   const sBar = paint('▓'.repeat(dec), t.ok) + paint('▒'.repeat(pre), t.accent) + '░'.repeat(free);
-  const streamsLine = ` Streams: ${sBar} ${dec + pre}/${s.max} (decoding ${s.decoding} · prefilling ${s.prefilling})`
-    + (d ? paint(`   req ${d.reqRate.toFixed(1)}/s`, t.fg) : '')
-    + paint(`   running ${h?.requestsRunning ?? 0}`, t.dim);
+  // streams box: the bar is the live picture, the labels spell out the counts
+  const streamsBox = box(' Streams', [
+    sBar + paint(` ${dec + pre}/${s.max}`, t.fg)
+    + paint('   Decoding ', t.dim) + paint(String(s.decoding), t.ok)
+    + paint('   Prefilling ', t.dim) + paint(String(s.prefilling), t.accent)
+    + (d ? paint('   Req ', t.dim) + paint(`${d.reqRate.toFixed(1)}/s`, t.fg) : '')
+    + paint('   Running ', t.dim) + paint(String(h?.requestsRunning ?? 0), t.fg),
+  ], W - 4);
   const cum = state.costAccrual;
   const life = h
-    ? ` lifetime: requests ${fmt(h.requestsTotal)} · prompt ${paint(fmt(h.promptTotal), t.accent)} · completion ${paint(fmt(h.completionTotal), t.ok)} · cost ${paint(fmtUsd(cum), t.warn)}${state.carried > 0 ? paint(` (engine ${fmtUsd(lifeCost)})`, t.dim) : ''} · ctx ${h.ctx}`
-    : paint(' lifetime: - (no data yet)', t.dim);
+    ? paint('Requests ', t.dim) + paint(fmt(h.requestsTotal), t.fg)
+      + paint('   Prompt ', t.dim) + paint(fmt(h.promptTotal), t.accent)
+      + paint('   Completion ', t.dim) + paint(fmt(h.completionTotal), t.ok)
+      + paint('   Ctx ', t.dim) + paint(String(h.ctx), t.fg)
+    : paint('- (no data yet)', t.dim);
+  const lifeBox = box(' Lifetime', [life], W - 4);
+  // cost box: running total, the live engine session's share, and what earlier sessions carried
+  const rt = (v) => String(+v.toFixed(4)); // 192 / 19.2 / 0.2 without trailing zeros
+  const costBase = paint('Total ', t.fg) + paint(fmtCost(cum), t.warn)
+    + paint('   Session ', t.dim) + paint(h ? fmtCost(lifeCost) : '-', t.fg)
+    + paint('   Earlier ', t.dim) + paint(fmtCost(state.carried), t.dim);
+  // rates only when they fit whole - never truncate a price in half
+  const rates = `   @ ${P.currency}${rt(P.input)} in/${P.currency}${rt(P.cache)} cache/${P.currency}${rt(P.output)} out /M`;
+  // box(' Cost', .., W - 4) lines are W - 4 visible chars wide -> W with the frame's "│ .. │"
+  const costBox = box(' Cost', [costBase + (W - 8 - vlen(costBase) >= vlen(rates) ? paint(rates, t.dim) : '')], W - 4);
   const keys = showHelp
     ? paint(' q quit · h hide help · g toggle graphs · t theme — rates are per poll window; cost is a running total (persisted)', t.dim)
     : paint(' q quit · h help · g graphs · t theme', t.dim);
@@ -474,8 +502,9 @@ function frame() {
   const dimOn = age > 3 * iv; // includes never-succeeded (lastSuccessT = 0)
   const dimmed = (l) => (dimOn ? paint(l, t.dim) : l);
   const foot = (s) => dimmed('│ ' + pad(trunc(s, W - 4), W - 4) + ' │');
-  lines.push(foot(streamsLine));
-  lines.push(foot(life));
+  for (const l of streamsBox) lines.push(dimmed('│ ' + l + ' │'));
+  for (const l of lifeBox) lines.push(dimmed('│ ' + l + ' │'));
+  for (const l of costBox) lines.push(dimmed('│ ' + l + ' │'));
   lines.push(foot(keys));
   lines.push(`└${'─'.repeat(W - 2)}┘`);
   return lines.join('\n');
@@ -507,14 +536,14 @@ function cliLine() {
   return [
     new Date().toTimeString().slice(0, 8),
     st,
-    `out ${d ? d.outTps.toFixed(1) : '-'} t/s`,
+    `decode ${d ? d.outTps.toFixed(1) : '-'} t/s`,
     `prefill ${d ? fmt(d.prefillTps) : '-'} t/s`,
     `cache ${d ? (d.cacheHit * 100).toFixed(1) + '%' : '-'}`,
     `acc ${d ? (d.accRate * 100).toFixed(0) + '%' : '-'}`,
     `round ${d ? d.roundMs.toFixed(0) + ' ms' : '-'}`,
     `streams ${s ? `${Math.min(s.max, s.decoding + s.prefilling)}/${s.max}` : '-'} (dec ${s?.decoding ?? 0} pre ${s?.prefilling ?? 0})`,
     `req/s ${d ? d.reqRate.toFixed(2) : '-'}`,
-    `cost ${h || state.costAccrual > 0 ? fmtUsd(state.costAccrual) + (state.carried > 0 && h ? ` (engine ${fmtUsd(lifetimeCost(h))})` : '') + (d ? ` (spend/sec ${fmtUsd(d.spentPerSec)})` : '') : '-'}`,
+    `cost ${h || state.costAccrual > 0 ? fmtCost(state.costAccrual) + (state.carried > 0 && h ? ` (session ${fmtCost(lifetimeCost(h))})` : '') + (d ? ` (spend/sec ${fmtUsd(d.spentPerSec)})` : '') : '-'}`,
     `lifetime ${h ? `req ${fmt(h.requestsTotal)} prompt ${fmt(h.promptTotal)} comp ${fmt(h.completionTotal)}` : '-'}`,
   ].join('  ');
 }
@@ -537,6 +566,16 @@ function quit() {
 }
 
 process.on('exit', () => saveCostState(true));
+
+// the reader is gone (`tfmon --cli | head`): stop quietly instead of crashing on EPIPE
+process.stdout.on('error', (e) => {
+  if (e.code === 'EPIPE') { quit(); return; } // quit() saves state, restores the term, exits 0
+  try {
+    process.stderr.write(`tfmon: stdout: ${e.message}\n`);
+  } catch { /* stderr gone too */ }
+  restoreTerm();
+  process.exit(1);
+});
 
 function runTui() {
   tuiMode = true;

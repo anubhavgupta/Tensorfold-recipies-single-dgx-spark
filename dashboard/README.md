@@ -3,8 +3,32 @@
 Zero-dependency Node.js dashboard for the TensorFold engine. Polls
 `GET /health` (default `http://localhost:8888/health`, 1 Hz) and renders an
 htop-style view: throughput sparkline, decode/spec stats, cache gauge,
-stream utilization, lifetime counters. Requires Node ≥ 18 (uses global
-`fetch`).
+stream utilization, lifetime counters. Below the three panels are
+full-width `Streams`, `Lifetime` and `Cost` boxes, then the key hints.
+Requires Node ≥ 18 (uses global `fetch`).
+
+## Layout
+
+```
+┌ TensorFold: Qwen3.8-27B ───────────────────────────────────────────OK · idle┐
+│ ┌─  Throughput ────────┐ ┌─  Spec Decode ───────┐ ┌─  Cache ───────────────┐│
+│ │              ▁▁▁▁▁▁  │ │  acc 0% ░░░░░░░░░░░░ │ │  hit 0.0% ░░░░░░░░░░░░ ││
+│ │  decode 0.0 tok/s    │ │  0.0 tok/round       │ │  spend/sec ₹0.000000   ││
+│ │  prefill 0.0 tok/s   │ │  round 0 ms          │ │  2.92M / 3.12M tok     ││
+│ │  avg in 31.5K tok/.. │ │  stream util 0%      │ └────────────────────────┘│
+│ └──────────────────────┘ └──────────────────────┘                           │
+│ ┌─  Streams ──────────────────────────────────────────────────────────────┐ │
+│ │ ░░░░░░░░░ 0/9   Decoding 0   Prefilling 0   Req 0.0/s   Running 0       │ │
+│ └─────────────────────────────────────────────────────────────────────────┘ │
+│ ┌─  Lifetime ─────────────────────────────────────────────────────────────┐ │
+│ │ Requests 99.0   Prompt 3.12M   Completion 40.0K   Ctx 262144            │ │
+│ └─────────────────────────────────────────────────────────────────────────┘ │
+│ ┌─  Cost ─────────────────────────────────────────────────────────────────┐ │
+│ │ Total ₹5594.77   Session ₹133.43   Earlier ₹5461.34                     │ │
+│ └─────────────────────────────────────────────────────────────────────────┘ │
+│  q quit · h help · g graphs · t theme                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Usage
 
@@ -30,6 +54,9 @@ If the engine goes silent for 3× the poll interval, a red
 `engine unreachable — last ok Ns ago` banner is shown (the last known
 layout stays on screen, dimmed — never blank).
 
+Piping `--cli` output is safe: `tfmon` exits quietly (after saving the cost
+state) as soon as the reader closes, e.g. `tfmon --cli | head -20`.
+
 ## Cost tracking
 
 Cost is derived from the cumulative `/health` token counters:
@@ -37,16 +64,34 @@ window cost = (Δprompt − Δcached) × input + Δcached × cache +
 Δcompletion × output. The Cache panel shows `spend/sec` (window
 cost normalized to 1 s, so it is a true rate at any poll interval).
 
-The footer lifetime line and `--cli` print the **running total** cost,
-which persists across tfmon runs in a small state file (`--state FILE`,
-default `cost.json` next to `tfmon.js`, shape `{ cost, engineCost, ts }`).
+The `Cost` box above the key hints (and `--cli`) prints the
+**running total** cost, which persists across tfmon runs in a small state
+file (`--state FILE`, default `cost.json` next to `tfmon.js`, shape
+`{ cost, engineCost, ts }`):
+
+```
+│ ┌─  Cost ─────────────────────────────────────────────────────────────────┐ │
+│ │ Total ₹5594.77   Session ₹133.43   Earlier ₹5461.34                     │ │
+│ └─────────────────────────────────────────────────────────────────────────┘ │
+```
+
+- `Total` — running total: `Earlier + Session`;
+- `Session` — the cost of the **live engine process** only, recomputed from
+  its lifetime counters, so it restarts at ₹0 with the server (`-` before
+  the first successful poll);
+- `Earlier` — what previous engine sessions accrued (₹0 until an engine
+  session has ended — it is folded in when a restart is detected);
+- the `@ …` price basis (per 1M tokens, from `--price FILE`) is appended
+  only when it fits whole — on narrower terminals it is left out rather
+  than truncated mid-rate.
+
 The running total covers:
 
 - cost accrued **while tfmon was down** — on the first sample after a
   start it is picked up from the engine's lifetime counters;
 - **engine restarts** — when the lifetime counters reset below the saved
-  value, the finished session is folded into the carried cost and the new
-  session accumulates on top of it (shown as `cost ₹X (engine ₹Y)`).
+  value, the finished session is folded into `Earlier` and the new
+  session accumulates on top of it.
 
 If pricing or currency changes between runs, the carried total keeps the
 old price basis — delete the state file to reset the total.
