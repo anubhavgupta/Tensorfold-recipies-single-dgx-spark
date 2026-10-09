@@ -480,34 +480,40 @@ function frame() {
   const [outV, outHold] = shownRate(d?.outTps ?? 0, state.lastOut, now);
   const [preV, preHold] = shownRate(d?.prefillTps ?? 0, state.lastPrefill, now);
   // `*` marks a held (idle) rate; the short unit beats dropping that marker
-  const rateLine = (label, val, hold, f) => {
-    let s = ` ${label} ${f(val)} tok/s${hold ? '*' : ''}`;
-    if (vlen(s) > pw - 4) s = ` ${label} ${f(val)} t/s${hold ? '*' : ''}`;
-    return paint(s, hold ? t.dim : t.fg);
+  const rateLine = (label, val, hold, f, code) => {
+    const num = `${f(val)}${hold ? '*' : ''}`;
+    const body = (unit) => paint(` ${label} `, t.dim) + paint(num, hold ? t.dim : code) + paint(` ${unit}`, t.dim);
+    let line = body('tok/s');
+    if (vlen(line) > pw - 4) line = body('t/s'); // short unit beats dropping the marker
+    return line;
+  };
+  // percent + bar on a fixed-width label: right-align the number so the bar cannot
+  // slide sideways and change length every time a digit appears
+  const pctLine = (label, frac, digits, boxW) => {
+    const field = (100).toFixed(digits).length; // widest possible value: 100 / 100.0
+    const pre = ` ${label} ${(frac * 100).toFixed(digits).padStart(field)}% `;
+    return paint(pre, t.fg) + bar(frac, Math.max(4, boxW - 4 - vlen(pre)));
   };
   const bTp = box(' Throughput', [
     v(state.histOut.length
       ? (showGraphs ? sparkline(state.histOut, Math.max(4, pw - 5), t.graph) : paint(' (graphs off - g)', t.dim))
       : noData),
-    v(d && rateLine('decode', outV, outHold, (x) => x.toFixed(1))),
-    v(d && rateLine('prefill', preV, preHold, fmt)),
+    v(d && rateLine('decode', outV, outHold, (x) => x.toFixed(1), t.ok)),
+    v(d && rateLine('prefill', preV, preHold, fmt, t.accent)),
     v(d && paint(` avg in ${fmt(d.avgCtx)} tok/req`, t.dim)),
   ], pw);
 
-  const accPre = d ? ` acc ${(d.accRate * 100).toFixed(0)}% ` : '';
   const bSp = box(' Spec Decode', [
-    v(d && paint(accPre, t.fg) + bar(d.accRate, Math.max(4, (pw - 4) - vlen(accPre)))),
+    v(d && pctLine('acc', d.accRate, 0, pw)),
     v(d && paint(` ${d.tokPerRound.toFixed(1)} tok/round`, t.fg)),
     v(d && paint(` round ${d.roundMs.toFixed(0)} ms`, t.fg)),
     v(d && paint(` stream util ${(d.util * 100).toFixed(0)}%`, t.dim)),
   ], pw);
 
   const lifeCost = h ? lifetimeCost(h) : 0;
-  const hitPre = d ? ` hit ${(d.cacheHit * 100).toFixed(1)}% ` : '';
-  const allPre = d ? ` all ${(d.allHit * 100).toFixed(1)}% ` : '';
   const bCa = box(' Cache', [
-    v(d && paint(hitPre, t.fg) + bar(d.cacheHit, Math.max(4, (pwLast - 4) - vlen(hitPre)))),
-    v(d && paint(allPre, t.fg) + bar(d.allHit, Math.max(4, (pwLast - 4) - vlen(allPre)))),
+    v(d && pctLine('hit', d.cacheHit, 1, pwLast)),
+    v(d && pctLine('all', d.allHit, 1, pwLast)),
     v(d && paint(' spend/sec ', t.fg) + paint(fmtUsd(d.spentPerSec), t.warn)),
     v(h && paint(` ${fmt(h.cachedTotal)} / `, t.dim) + paint(fmt(h.promptTotal), t.accent) + paint(' tok', t.dim)),
   ], pwLast);

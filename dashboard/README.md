@@ -12,19 +12,19 @@ Requires Node ≥ 18 (uses global `fetch`).
 ```
 ┌ TensorFold: Qwen3.8-27B ───────────────────────────────────────────OK · idle┐
 │ ┌─  Throughput ────────┐ ┌─  Spec Decode ───────┐ ┌─  Cache ───────────────┐│
-│ │             ▁▁▁▁▁▁▁  │ │  acc 0% ░░░░░░░░░░░░ │ │  hit 0.0% ░░░░░░░░░░░░ ││
-│ │  decode 0.0 tok/s    │ │  0.0 tok/round       │ │  all 95.6% ███████████ ││
+│ │             ▁▁▁▁▁▁▁  │ │  acc   0% ░░░░░░░░░░ │ │  hit   0.0% ░░░░░░░░░░ ││
+│ │  decode 0.0 tok/s    │ │  0.0 tok/round       │ │  all  97.0% ██████████ ││
 │ │  prefill 0.0 tok/s   │ │  round 0 ms          │ │  spend/sec ₹0.000000   ││
-│ │  avg in 41.2K tok/.. │ │  stream util 0%      │ │  4.92M / 5.15M tok     ││
+│ │  avg in 55.1K tok/.. │ │  stream util 0%      │ │  8.50M / 8.76M tok     ││
 │ └──────────────────────┘ └──────────────────────┘ └────────────────────────┘│
 │ ┌─  Streams ──────────────────────────────────────────────────────────────┐ │
 │ │ ░░░░░░░░░ 0/9   Decoding 0   Prefilling 0   Req 0.0/s   Running 0       │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │ ┌─  Lifetime ─────────────────────────────────────────────────────────────┐ │
-│ │ Requests 125.0   Prompt 5.15M   Completion 59.9K   Ctx 262144           │ │
+│ │ Requests 159.0   Prompt 8.76M   Completion 81.9K   Ctx 262144           │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │ ┌─  Cost ─────────────────────────────────────────────────────────────────┐ │
-│ │ Total ₹5657.29   Session ₹195.95   Earlier ₹5461.34                     │ │
+│ │ Total ₹5753.12   Session ₹291.78   Earlier ₹5461.34                     │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │  q quit · h help · g graphs · t theme                                       │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -38,6 +38,12 @@ what the prefix cache has actually been worth since the server booted.
 An idle window measures 0 tok/s, which looks like a stalled engine, so
 `decode` and `prefill` keep showing the last rate they actually measured for
 up to 60 s afterwards — dimmed and marked `*` — before falling back to 0.0.
+
+Colours follow the Lifetime box: `decode` is green like Completion, `prefill`
+cyan like Prompt, labels and units are dim. The percent gauges (`hit`, `all`,
+`acc`) right-align their number to the width of `100.0`, so the bar keeps one
+start column and one length instead of sliding and resizing every time a
+digit appears.
 
 ## Usage
 
