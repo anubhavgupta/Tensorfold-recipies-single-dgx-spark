@@ -3,7 +3,7 @@
 import hashlib
 import os
 
-KEEP_MAX = int(os.environ.get("TENSORFOLD_KEEP_MAX", "64"))
+KEEP_MAX = int(os.environ.get("TENSORFOLD_KEEP_MAX", "256"))
 HEADROOM = int(float(os.environ.get("TENSORFOLD_KEEP_HEADROOM_GIB", "4")) * 2**30)
 
 
