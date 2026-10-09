@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
 from tensorfold.server.errors import RequestError
 
-LIMIT = 96 * 1024**2
+LIMIT = int(os.environ.get("TENSORFOLD_MAX_BODY_MIB") or 128) * 1024**2
 _METADATA_LIMIT = 65536
 
 
