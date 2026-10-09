@@ -17,7 +17,7 @@
      max_url_chars: int = 4096
      max_visual_tokens: int = 4096        # the tokens a request's images share (CUDA Qwen: --vision-image-tokens)
 --- a/videos.py	2026-10-09 20:07:46.350115615 +0530
-+++ b/videos.py	2026-10-09 20:49:03.510660691 +0530
++++ b/videos.py	2026-10-09 20:54:03.899954525 +0530
 @@ -19,9 +19,9 @@
  
  @dataclass(frozen=True, slots=True)
@@ -27,12 +27,12 @@
 -    max_total_encoded_bytes: int = 20 * 1024 * 1024
 +    max_videos: int = 4
 +    max_encoded_bytes: int = 64 * 1024 * 1024         # base64 makes it a third larger in the 96 MiB request body
-+    max_total_encoded_bytes: int = 128 * 1024 * 1024
++    max_total_encoded_bytes: int = 192 * 1024 * 1024
      max_dimension: int = 8192
      max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
      fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)
 --- a/request_body.py	2026-10-09 20:08:00.196800502 +0530
-+++ b/request_body.py	2026-10-09 20:39:31.278944042 +0530
++++ b/request_body.py	2026-10-09 20:54:03.899760589 +0530
 @@ -2,12 +2,13 @@
  
  from __future__ import annotations
@@ -44,7 +44,7 @@
  from tensorfold.server.errors import RequestError
  
 -LIMIT = 32 * 1024**2
-+LIMIT = int(os.environ.get("TENSORFOLD_MAX_BODY_MIB") or 128) * 1024**2
++LIMIT = int(os.environ.get("TENSORFOLD_MAX_BODY_MIB") or 192) * 1024**2
  _METADATA_LIMIT = 65536
  
  

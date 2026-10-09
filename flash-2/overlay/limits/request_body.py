@@ -8,7 +8,7 @@ from typing import Any
 
 from tensorfold.server.errors import RequestError
 
-LIMIT = int(os.environ.get("TENSORFOLD_MAX_BODY_MIB") or 128) * 1024**2
+LIMIT = int(os.environ.get("TENSORFOLD_MAX_BODY_MIB") or 192) * 1024**2
 _METADATA_LIMIT = 65536
 
 

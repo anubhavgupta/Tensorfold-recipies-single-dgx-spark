@@ -33,8 +33,8 @@ Ported from the Qwen3.8-27B TensorFold patch. Stock 0.6.5 limits -> overlay:
 
 | Limit | Stock | Overlay |
 |---|---|---|
-| Request body (`server/request_body.py`) | 32 MiB | 128 MiB, set with `TENSORFOLD_MAX_BODY_MIB` |
-| Video, each / total (`vision/videos.py`) | 16 / 20 MiB | 64 / 128 MiB |
+| Request body (`server/request_body.py`) | 32 MiB | 192 MiB, set with `TENSORFOLD_MAX_BODY_MIB` |
+| Video, each / total (`vision/videos.py`) | 16 / 20 MiB | 64 / 192 MiB |
 | Videos per request | 2 | 4 |
 | Images, total bytes / pixels (`vision/images.py`) | 20 MiB / 32 MP | 64 MiB / 400 MP |
 | Images, total decode timeout | 30 s | 60 s |
