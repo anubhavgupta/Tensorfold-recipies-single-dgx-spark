@@ -7,6 +7,11 @@ stream utilization, lifetime counters. Below the three panels are
 full-width `Streams`, `Lifetime` and `Cost` boxes, then the key hints.
 Requires Node ≥ 18 (uses global `fetch`).
 
+![tfmon dashboard: three panels over Streams, Lifetime and Cost boxes](screenshot.png)
+
+*A live capture — spec decode holding an 84 % accept rate, the window serving
+99.9 % cached prompt tokens, 97.8 % over the engine's lifetime.*
+
 ## Layout
 
 ```
