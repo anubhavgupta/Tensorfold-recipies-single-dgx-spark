@@ -292,11 +292,21 @@ const state = {
   derived: null,       // last window diff
   histOut: [],         // capped ring, back = newest
   histPrefill: [],
+  lastOut: { v: 0, t: 0 },      // last non-zero decode / prefill rate, for idle windows
+  lastPrefill: { v: 0, t: 0 },
   carried: 0,          // cost before the current engine session (loaded from state)
   lastEngineCost: 0,   // engine-lifetime cost at the last successful poll
   costAccrual: 0,      // carried + current session = running total
 };
 const HIST_MAX = 120;
+const IDLE_HOLD = 60; // s to keep showing the last rate after the engine goes quiet
+
+// An idle window measures 0 tok/s, which reads like a broken engine: hold on to the
+// last measured rate for a while and mark it with * (dim) so it is not mistaken for live.
+function shownRate(cur, last, now) {
+  if (cur > 0 || !(last.v > 0) || now - last.t > IDLE_HOLD) return [cur, false];
+  return [last.v, true];
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // restore the running cost total from the previous run
@@ -327,6 +337,8 @@ async function pollOnce() {
       if (d.hasWindow) {
         state.histOut.push(d.outTps);
         state.histPrefill.push(d.prefillTps);
+        if (d.outTps > 0) state.lastOut = { v: d.outTps, t: t0 };
+        if (d.prefillTps > 0) state.lastPrefill = { v: d.prefillTps, t: t0 };
         if (state.histOut.length > HIST_MAX) state.histOut.shift();
         if (state.histPrefill.length > HIST_MAX) state.histPrefill.shift();
       }
@@ -465,12 +477,20 @@ function frame() {
   const noData = paint(' waiting for data...', t.dim);
   const v = (s) => (s != null ? s : noData);
 
+  const [outV, outHold] = shownRate(d?.outTps ?? 0, state.lastOut, now);
+  const [preV, preHold] = shownRate(d?.prefillTps ?? 0, state.lastPrefill, now);
+  // `*` marks a held (idle) rate; the short unit beats dropping that marker
+  const rateLine = (label, val, hold, f) => {
+    let s = ` ${label} ${f(val)} tok/s${hold ? '*' : ''}`;
+    if (vlen(s) > pw - 4) s = ` ${label} ${f(val)} t/s${hold ? '*' : ''}`;
+    return paint(s, hold ? t.dim : t.fg);
+  };
   const bTp = box(' Throughput', [
     v(state.histOut.length
       ? (showGraphs ? sparkline(state.histOut, Math.max(4, pw - 5), t.graph) : paint(' (graphs off - g)', t.dim))
       : noData),
-    v(d && paint(` decode ${d.outTps.toFixed(1)} tok/s`, t.fg)),
-    v(d && paint(` prefill ${fmt(d.prefillTps)} tok/s`, t.fg)),
+    v(d && rateLine('decode', outV, outHold, (x) => x.toFixed(1))),
+    v(d && rateLine('prefill', preV, preHold, fmt)),
     v(d && paint(` avg in ${fmt(d.avgCtx)} tok/req`, t.dim)),
   ], pw);
 
@@ -535,7 +555,7 @@ function frame() {
   // box(' Cost', .., W - 4) lines are W - 4 visible chars wide -> W with the frame's "│ .. │"
   const costBox = box(' Cost', [costBase + (W - 8 - vlen(costBase) >= vlen(rates) ? paint(rates, t.dim) : '')], W - 4);
   const keys = showHelp
-    ? paint(' q quit · h hide help · g toggle graphs · t theme (light = for a light-background terminal) — rates are per poll window; cost is a running total', t.dim)
+    ? paint(' q quit · h hide help · g graphs · t theme · * = last rate before idle · rates are per poll window, cost is a running total', t.dim)
     : themeIdx === 1
       ? paint(' light suits light terminals - t for dark · q quit · h help · g graphs', t.warn)
       : paint(' q quit · h help · g graphs · t theme', t.dim);
@@ -574,11 +594,13 @@ function cliLine() {
     st = `STALE ${state.error || 'no response'} (last ok ${Math.round(now - state.lastSuccessT)}s ago)`;
   else st = h.busy ? 'BUSY' : 'IDLE';
   const s = h?.streams;
+  const [outV, outHold] = shownRate(d?.outTps ?? 0, state.lastOut, now);
+  const [preV, preHold] = shownRate(d?.prefillTps ?? 0, state.lastPrefill, now);
   return [
     new Date().toTimeString().slice(0, 8),
     st,
-    `decode ${d ? d.outTps.toFixed(1) : '-'} t/s`,
-    `prefill ${d ? fmt(d.prefillTps) : '-'} t/s`,
+    `decode ${d ? outV.toFixed(1) + (outHold ? '*' : '') : '-'} t/s`,
+    `prefill ${d ? fmt(preV) + (preHold ? '*' : '') : '-'} t/s`,
     `cache ${d ? (d.cacheHit * 100).toFixed(1) + '%' : '-'}${d ? ` (all ${(d.allHit * 100).toFixed(1)}%)` : ''}`,
     `acc ${d ? (d.accRate * 100).toFixed(0) + '%' : '-'}`,
     `round ${d ? d.roundMs.toFixed(0) + ' ms' : '-'}`,

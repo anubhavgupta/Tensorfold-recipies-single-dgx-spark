@@ -35,6 +35,10 @@ Requires Node ≥ 18 (uses global `fetch`).
 ÷ prompt over the engine's whole lifetime — it barely moves and tells you
 what the prefix cache has actually been worth since the server booted.
 
+An idle window measures 0 tok/s, which looks like a stalled engine, so
+`decode` and `prefill` keep showing the last rate they actually measured for
+up to 60 s afterwards — dimmed and marked `*` — before falling back to 0.0.
+
 ## Usage
 
 ```sh
