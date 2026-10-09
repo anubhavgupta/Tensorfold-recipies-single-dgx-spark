@@ -100,3 +100,29 @@ Cold 32K-token prompt, one stream. Larger rows barely help and cost KV memory, s
 | 2048 (default) | 792 | 41.8 GiB | 9 |
 | 4096 | 818 (+3%) | 39.6 GiB | 8 (+ n-gram pages spill to disk warning) |
 | 8192 | 828 (+4%) | 39.2 GiB | 8 (same warning) |
+
+## Round 4: faster EXL3 prompt processing (flash-2 overlay)
+
+Model: `turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6`, TensorFold 0.6.5. Start/stop: `./flash-2/start.sh` / `./flash-2/stop.sh`.
+The overlay is on by default; `OVERLAY=0 ./flash-2/start.sh` runs stock. Details and the diff are in `flash-2/overlay/`.
+
+Profile (torch.profiler): about 48% of prefill is the grouped expert GEMM (`grouped_kernel`), about 10% is `group_kernel`.
+Two fixes, with greedy output identical to stock:
+- the expert kernel decodes each weight tile once for up to 5 row tiles (it was once per 16-row tile);
+- `group_kernel` was rewritten with a shared-memory histogram and ballot ordering (1.4 s -> 0.15 s per 8K prompt).
+
+| Cold prompt | Stock tok/s | Overlay tok/s | Gain |
+|---|---|---|---|
+| 4K | 859 | 1026 | +19% |
+| 32K | 846 | 1032 | +22% |
+| 131K | 790 | 934 | +18% |
+| 249K | 748 | 880 | +18% |
+
+`TENSORFOLD_MTL` sweep, 8K prompt: stock 842, MTL 4 1038, MTL 5 1064 (default), MTL 6 984, MTL 8 956.
+Decode is unchanged (code N=1 66.4, N=4 176 steady, N=9 249 steady tok/s; prose N=9 151 steady). Startup still reports
+9 full-window streams (42.4 GiB for KV, 4.47 GiB per full window). A full 9 x 250K run was not repeated with the overlay.
+Further gains need a different expert design (for example dequantising to fp16 tiles).
+
+## flash-4 (MiaAI-Lab Zig recipe, INT4-AutoRound checkpoint)
+
+Set up in `flash-4/` (`./flash-4/start.sh`, `./flash-4/stop.sh`, port 8888). The smoke test passed (8 streams, 262K, MTP). Not benchmarked yet.

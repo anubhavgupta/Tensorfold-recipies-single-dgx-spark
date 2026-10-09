@@ -10,6 +10,7 @@
 #   REPO (turboderp/Qwen3.8-Flash-Next-exl3)              TF_VERSION (default 0.6.5)
 #   PARALLEL (9) CONTEXT (262144) KV_DTYPE (int8) VISION (1; EXL3 needs PARALLEL >= 2) VISION_MAX_IMAGES (50)
 #   VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (32768) TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
+#   OVERLAY (1: mount overlay/exl3, the faster prompt kernels; 0: stock)  TENSORFOLD_MTL (5)
 #   MTP_DRAFTS (6) MTP_CONFIDENCE (0.60)  PATCHES (0: use ../qwen38-flash-next/patches, untested on EXL3)
 #   PORT (8888) HOST (0.0.0.0) NAME (tf-flash-2-exl3) SERVED_NAME (Qwen3.8-Flash-Next) FOREGROUND (0)
 # Not available for EXL3 packs: --ple-on-ssd, --tp 2. Logs: docker logs -f tf-flash-2-exl3   Stop: ./flash-2/end.sh
@@ -90,6 +91,14 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
 fi
 
 wrapper=(--tf-name "$NAME" --tf-version "$TF_VERSION" --tf-docker-arg=--ulimit=stack=67108864)
+# Faster EXL3 prompt processing (bit-identical output): overlay/exl3 replaces the 0.6.5 expert kernels, see
+# overlay/README.md. OVERLAY=0 runs stock 0.6.5. TENSORFOLD_MTL (4, 5, 6, 8) sets the row tiles that share one weight decode.
+if [[ "${OVERLAY:-1}" == 1 && "$TF_VERSION" == 0.6.5 ]]; then
+  _ex=/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3
+  for _f in experts_grouped.cuh experts.cu experts.py; do
+    wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/overlay/exl3/$_f:$_ex/$_f:ro")
+  done
+fi
 [[ "$PATCHES" != 1 ]] || wrapper+=(--tf-patches "$SCRIPT_DIR/../qwen38-flash-next/patches")
 [[ "$FOREGROUND" == 1 ]] || wrapper+=(--tf-detach)
 
