@@ -1,6 +1,10 @@
 """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
 
 import hashlib
+import os
+
+KEEP_MAX = int(os.environ.get("TENSORFOLD_KEEP_MAX", "64"))
+HEADROOM = int(float(os.environ.get("TENSORFOLD_KEEP_HEADROOM_GIB", "4")) * 2**30)
 
 
 def keyed(s) -> list[int]:
@@ -75,8 +79,29 @@ def remember(owner, ids, st, snap, tail) -> None:
     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
     while len(owner.kept) > owner.keep:
         gone.append(owner.kept.pop(0)[1])
+    while low(owner) and shed(owner):
+        pass
     busy = owner._busy()
     for old in gone:
         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \
                 all(f is not old for f in owner.free):
             owner.free.append(old)
+
+
+def low(owner) -> bool:
+    """Whether free memory is under the headroom that extra snapshots may not eat into."""
+
+    live = owner.memory_gate.live
+    return live is not None and live() < HEADROOM
+
+
+def shed(owner, keep=None, protect=None) -> bool:
+    """Drop the oldest snapshot beyond the guaranteed ``keep_min`` whose slot keeps another one; False if none."""
+
+    if len(owner.kept) <= owner.keep_min:
+        return False
+    for k in owner.kept:
+        if k[1] is not keep and k[1] is not protect and sum(x[1] is k[1] for x in owner.kept) > 1:
+            owner.kept = [x for x in owner.kept if x is not k]
+            return True
+    return False

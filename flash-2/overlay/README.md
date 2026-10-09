@@ -27,6 +27,10 @@ On a hit the images are still encoded (the full rotary positions are needed), bu
 Tested on `Qwen3.8-Flash-Next` with a 1.7K-token image prompt: first 0 cached, repeat 1767, next turn 1767, a different
 image after the same system text 1551 (the text before the image only); greedy output identical cached and uncached.
 
+### Elastic kept snapshots
+
+Stock keeps at most 8 prompt snapshots (`KEEP = 8`) and counts snapshots, not conversations: each conversation leaves one per message start plus one at its prompt end, so 8 covers about 4 conversations. With 9 parallel chats, 5 of 9 follow-ups re-prefilled cold. The overlay keeps 8 as a floor and lets up to `TENSORFOLD_KEEP_MAX` (64) be held while memory allows. Extra snapshots (about 110 MiB each) are shed oldest-first when a stream needs to grow (`_evict_kept`) or when free memory falls under `TENSORFOLD_KEEP_HEADROOM_GIB` (4). Only a snapshot whose slot holds another one is shed; slot-level eviction is unchanged. Measured: 9 parallel ~15K-token chats, follow-ups 9 of 9 warm (1 s each; stock 5 of 9 cold, 71 s); then 6 x 100K streams over the same server finished with no errors.
+
 ## Larger media limits (`limits/`, `VISION_LIMITS=1`)
 
 Ported from the Qwen3.8-27B TensorFold patch. Stock 0.6.5 limits -> overlay:

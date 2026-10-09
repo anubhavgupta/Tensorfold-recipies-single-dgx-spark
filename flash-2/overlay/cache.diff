@@ -1,6 +1,25 @@
---- a/multi.py	2026-10-09 18:13:02.150147560 +0530
-+++ b/multi.py	2026-10-09 18:13:02.160715418 +0530
-@@ -253,10 +253,11 @@
+--- a/multi.py
++++ b/multi.py
+@@ -89,7 +89,8 @@
+         self.next_id = 0
+         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
+         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
+-        self.keep = keep
++        self.keep_min = keep                         # snapshots always kept; up to prefixes.KEEP_MAX while memory allows
++        self.keep = max(keep, prefixes.KEEP_MAX)
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
+@@ -154,6 +155,8 @@
+     def _evict_kept(self, keep: State, *, protect: State | None = None) -> bool:
+         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
+ 
++        if prefixes.shed(self, keep, protect):
++            return True
+         busy = self._busy()
+         for ids, st, _, _ in self.kept:
+             if st is not keep and st is not protect and id(st) not in busy:
+@@ -253,10 +256,11 @@
          if self.w.comm is not None and any(x is not None for x in (s.constraint, s.vision, s.probabilities)):
              raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
          t0 = time.perf_counter()
@@ -13,7 +32,7 @@
          if self.w.comm is None:
              try:
                  if not self._grow(st, len(s.prompt) + self.depth + 2,
-@@ -266,7 +267,7 @@
+@@ -266,7 +270,7 @@
                  if resume is None:
                      self.free.append(st)
                  else:
@@ -22,7 +41,7 @@
                  raise
          e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
          mtp = s.draft and self.depth > 0 and self.mbuf is not None
-@@ -281,7 +282,7 @@
+@@ -281,7 +285,7 @@
              e.stops = list(s.stops)
          else:
              e.stops = sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)}) \
@@ -31,8 +50,8 @@
          s.sid, s.st = self.next_id, st
          self.next_id += 1
          s.prefill_s = time.perf_counter() - t0
---- a/multi_fill.py	2026-10-09 18:13:02.150954594 +0530
-+++ b/multi_fill.py	2026-10-09 18:13:02.160832254 +0530
+--- a/multi_fill.py
++++ b/multi_fill.py
 @@ -122,12 +122,12 @@
      def _keep_at(s: Stream) -> int | None:
          """Where a drafting stream's prompt state is kept: one token before its end, which a next turn extends."""
@@ -57,12 +76,16 @@
              self.fills[s.sid][3] = None
              if a + n < len(s.prompt):
                  continue
---- a/prefixes.py	2026-10-09 18:13:02.151882160 +0530
-+++ b/prefixes.py	2026-10-09 19:49:24.468620679 +0530
-@@ -1,5 +1,28 @@
+--- a/prefixes.py
++++ b/prefixes.py
+@@ -1,5 +1,32 @@
  """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
  
 +import hashlib
++import os
++
++KEEP_MAX = int(os.environ.get("TENSORFOLD_KEEP_MAX", "64"))
++HEADROOM = int(float(os.environ.get("TENSORFOLD_KEEP_HEADROOM_GIB", "4")) * 2**30)
 +
 +
 +def keyed(s) -> list[int]:
@@ -88,8 +111,38 @@
  
  def _best(kept, prompt, busy=()):
      return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
---- a/state.py	2026-10-09 19:27:24.351945391 +0530
-+++ b/state.py	2026-10-09 19:27:24.365497192 +0530
+@@ -52,8 +79,29 @@
+     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
+     while len(owner.kept) > owner.keep:
+         gone.append(owner.kept.pop(0)[1])
++    while low(owner) and shed(owner):
++        pass
+     busy = owner._busy()
+     for old in gone:
+         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \
+                 all(f is not old for f in owner.free):
+             owner.free.append(old)
++
++
++def low(owner) -> bool:
++    """Whether free memory is under the headroom that extra snapshots may not eat into."""
++
++    live = owner.memory_gate.live
++    return live is not None and live() < HEADROOM
++
++
++def shed(owner, keep=None, protect=None) -> bool:
++    """Drop the oldest snapshot beyond the guaranteed ``keep_min`` whose slot keeps another one; False if none."""
++
++    if len(owner.kept) <= owner.keep_min:
++        return False
++    for k in owner.kept:
++        if k[1] is not keep and k[1] is not protect and sum(x[1] is k[1] for x in owner.kept) > 1:
++            owner.kept = [x for x in owner.kept if x is not k]
++            return True
++    return False
+--- a/state.py
++++ b/state.py
 @@ -289,6 +289,8 @@
          if other.capacity > self.capacity:
              raise ValueError(f"copy_from: {other.capacity} cache rows do not fit {self.capacity}")

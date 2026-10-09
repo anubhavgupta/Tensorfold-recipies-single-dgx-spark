@@ -89,7 +89,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         self.next_id = 0
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
-        self.keep = keep
+        self.keep_min = keep                         # snapshots always kept; up to prefixes.KEEP_MAX while memory allows
+        self.keep = max(keep, prefixes.KEEP_MAX)
 
     def _busy(self) -> set[int]:
         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
@@ -154,6 +155,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
     def _evict_kept(self, keep: State, *, protect: State | None = None) -> bool:
         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
 
+        if prefixes.shed(self, keep, protect):
+            return True
         busy = self._busy()
         for ids, st, _, _ in self.kept:
             if st is not keep and st is not protect and id(st) not in busy:
