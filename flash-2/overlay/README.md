@@ -26,3 +26,16 @@ re-prefills the whole history. `multi.py`, `multi_fill.py`, `prefixes.py` and `s
 On a hit the images are still encoded (the full rotary positions are needed), but only the uncached rows are prefilled.
 Tested on `Qwen3.8-Flash-Next` with a 1.7K-token image prompt: first 0 cached, repeat 1767, next turn 1767, a different
 image after the same system text 1551 (the text before the image only); greedy output identical cached and uncached.
+
+## Larger media limits (`limits/`, `VISION_LIMITS=1`)
+
+Ported from the Qwen3.8-27B TensorFold patch. Stock 0.6.5 limits -> overlay:
+
+| Limit | Stock | Overlay |
+|---|---|---|
+| Request body (`server/request_body.py`) | 32 MiB | 96 MiB |
+| Video, each / total (`vision/videos.py`) | 16 / 20 MiB | 64 / 96 MiB |
+| Images, total bytes / pixels (`vision/images.py`) | 20 MiB / 32 MP | 64 MiB / 400 MP |
+| Images, total decode timeout | 30 s | 60 s |
+
+Still 2 videos and 50 images (`--vision-max-images`) per request. Tested: a 23 MB video (13K tokens, 23 s) and 50 images of 1080p (15.7K tokens, 24 s); the 51st is refused. `limits.diff` holds the diff.
