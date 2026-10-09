@@ -91,3 +91,12 @@ Full capacity, 9 streams x ~249K prompt + 256 generated, all engines: 9/9 succee
 - TensorFold: it does scale. The earlier flat result came from `concurrency.py` (identical repetitive prompts, prefill inside the timing window). Use `bench/suite.py`.
 - Tabby: the fused MoE decode kernel handles at most `MAX_BSZN=8` rows per forward. With MTP, rows = streams x (1+drafts), so 2+ streams fell onto the slow path. Patch `flash-3/patches/exllamav3-fused-decode-rows.patch` raises `MAX_BSZN` to 25 (the kernel limit is 256 slots / 10 experts per token) and shortens the draft window so rows stay <= 25 (`EXL3_FUSED_DECODE_ROWS`, 0 disables). Apply it in `flash-3/runtime/exllamav3` and rebuild (`pip install --no-build-isolation -e .`, ~45 min without ninja). It is already applied and built in the local runtime.
 - Remaining gap: TensorFold still wins at N>=4 because Tabby's verify path above 8 rows is less efficient.
+
+## Round 3: TENSORFOLD_PREFILL_ROWS sweep (flash-2, TensorFold 0.6.5, EXL3 4.05bpw_h6_ng6)
+Cold 32K-token prompt, one stream. Larger rows barely help and cost KV memory, so the default (2048) stays.
+
+| Rows | Prefill tok/s | Free for KV caches | Full-window (262K) streams |
+|---|---|---|---|
+| 2048 (default) | 792 | 41.8 GiB | 9 |
+| 4096 | 818 (+3%) | 39.6 GiB | 8 (+ n-gram pages spill to disk warning) |
+| 8192 | 828 (+4%) | 39.2 GiB | 8 (same warning) |
