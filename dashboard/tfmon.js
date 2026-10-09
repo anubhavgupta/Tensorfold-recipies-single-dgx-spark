@@ -144,7 +144,7 @@ function fmtCost(n) {
 function diff(prev, cur) {
   const out = {
     hasWindow: false, dt: 0,
-    outTps: 0, prefillTps: 0, cacheHit: 0,
+    outTps: 0, prefillTps: 0, cacheHit: 0, allHit: 0,
     accRate: 0, tokPerRound: 0, roundMs: 0,
     reqRate: 0, util: 0, avgCtx: 0, avgOut: 0, winCost: 0, spentPerSec: 0,
   };
@@ -156,6 +156,7 @@ function diff(prev, cur) {
   if (ch.streams.max > 0) {
     out.util = clamp01((ch.streams.decoding + ch.streams.prefilling) / ch.streams.max);
   }
+  if (ch.promptTotal > 0) out.allHit = clamp01(ch.cachedTotal / ch.promptTotal); // lifetime, not windowed
   if (!prev || !prev.t) return out;
   const dt = cur.t - prev.t;
   if (!(dt > 0)) return out;
@@ -483,8 +484,10 @@ function frame() {
 
   const lifeCost = h ? lifetimeCost(h) : 0;
   const hitPre = d ? ` hit ${(d.cacheHit * 100).toFixed(1)}% ` : '';
+  const allPre = d ? ` all ${(d.allHit * 100).toFixed(1)}% ` : '';
   const bCa = box(' Cache', [
     v(d && paint(hitPre, t.fg) + bar(d.cacheHit, Math.max(4, (pwLast - 4) - vlen(hitPre)))),
+    v(d && paint(allPre, t.fg) + bar(d.allHit, Math.max(4, (pwLast - 4) - vlen(allPre)))),
     v(d && paint(' spend/sec ', t.fg) + paint(fmtUsd(d.spentPerSec), t.warn)),
     v(h && paint(` ${fmt(h.cachedTotal)} / `, t.dim) + paint(fmt(h.promptTotal), t.accent) + paint(' tok', t.dim)),
   ], pwLast);
@@ -576,7 +579,7 @@ function cliLine() {
     st,
     `decode ${d ? d.outTps.toFixed(1) : '-'} t/s`,
     `prefill ${d ? fmt(d.prefillTps) : '-'} t/s`,
-    `cache ${d ? (d.cacheHit * 100).toFixed(1) + '%' : '-'}`,
+    `cache ${d ? (d.cacheHit * 100).toFixed(1) + '%' : '-'}${d ? ` (all ${(d.allHit * 100).toFixed(1)}%)` : ''}`,
     `acc ${d ? (d.accRate * 100).toFixed(0) + '%' : '-'}`,
     `round ${d ? d.roundMs.toFixed(0) + ' ms' : '-'}`,
     `streams ${s ? `${Math.min(s.max, s.decoding + s.prefilling)}/${s.max}` : '-'} (dec ${s?.decoding ?? 0} pre ${s?.prefilling ?? 0})`,

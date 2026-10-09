@@ -12,23 +12,28 @@ Requires Node ≥ 18 (uses global `fetch`).
 ```
 ┌ TensorFold: Qwen3.8-27B ───────────────────────────────────────────OK · idle┐
 │ ┌─  Throughput ────────┐ ┌─  Spec Decode ───────┐ ┌─  Cache ───────────────┐│
-│ │              ▁▁▁▁▁▁  │ │  acc 0% ░░░░░░░░░░░░ │ │  hit 0.0% ░░░░░░░░░░░░ ││
-│ │  decode 0.0 tok/s    │ │  0.0 tok/round       │ │  spend/sec ₹0.000000   ││
-│ │  prefill 0.0 tok/s   │ │  round 0 ms          │ │  2.92M / 3.12M tok     ││
-│ │  avg in 31.5K tok/.. │ │  stream util 0%      │ └────────────────────────┘│
-│ └──────────────────────┘ └──────────────────────┘                           │
+│ │             ▁▁▁▁▁▁▁  │ │  acc 0% ░░░░░░░░░░░░ │ │  hit 0.0% ░░░░░░░░░░░░ ││
+│ │  decode 0.0 tok/s    │ │  0.0 tok/round       │ │  all 95.6% ███████████ ││
+│ │  prefill 0.0 tok/s   │ │  round 0 ms          │ │  spend/sec ₹0.000000   ││
+│ │  avg in 41.2K tok/.. │ │  stream util 0%      │ │  4.92M / 5.15M tok     ││
+│ └──────────────────────┘ └──────────────────────┘ └────────────────────────┘│
 │ ┌─  Streams ──────────────────────────────────────────────────────────────┐ │
 │ │ ░░░░░░░░░ 0/9   Decoding 0   Prefilling 0   Req 0.0/s   Running 0       │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │ ┌─  Lifetime ─────────────────────────────────────────────────────────────┐ │
-│ │ Requests 99.0   Prompt 3.12M   Completion 40.0K   Ctx 262144            │ │
+│ │ Requests 125.0   Prompt 5.15M   Completion 59.9K   Ctx 262144           │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │ ┌─  Cost ─────────────────────────────────────────────────────────────────┐ │
-│ │ Total ₹5594.77   Session ₹133.43   Earlier ₹5461.34                     │ │
+│ │ Total ₹5657.29   Session ₹195.95   Earlier ₹5461.34                     │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 │  q quit · h help · g graphs · t theme                                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+`hit` and `all` are the same gauge over two horizons: `hit` = Δcached ÷
+Δprompt for the last poll window (jumpy, that is the point), `all` = cached
+÷ prompt over the engine's whole lifetime — it barely moves and tells you
+what the prefix cache has actually been worth since the server booted.
 
 ## Usage
 
