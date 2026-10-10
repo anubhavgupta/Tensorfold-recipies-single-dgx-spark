@@ -15,7 +15,7 @@
 #   REPO (turboderp/Qwen3.8-27B-exl3) REVISION (SC_4.00bpw_H5_V6)  MODEL_DIR explicit pack dir (skips the cache lookup)
 #   DRAFT_REPO (igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
 #   TF_VERSION (0.6.6)  PATCHES (1; 0: stock image, which needs KV_DTYPE=bf16, no drafter)
-#   PARALLEL (8) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
+#   PARALLEL (16) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
 #   MEMORY_RESERVE_GIB (2) CHECKPOINT_SLOTS (empty: TensorFold's default)
 #   VISION (1; needs ./27B-2/convert_vision.sh once) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (32768)
 #   TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
@@ -51,7 +51,7 @@ FOREGROUND="${FOREGROUND:-0}"
 PATCHES="${PATCHES:-1}"
 TF_VERSION="${TF_VERSION:-0.6.6}"
 
-PARALLEL="${PARALLEL:-8}"
+PARALLEL="${PARALLEL:-16}"
 CONTEXT="${CONTEXT:-262144}"
 KV_DTYPE="${KV_DTYPE:-fp8}"
 KV_POOL_GB="${KV_POOL_GB:-0}"

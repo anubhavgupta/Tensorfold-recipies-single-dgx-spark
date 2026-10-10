@@ -1,0 +1,171 @@
+EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (was one decode per 16 rows). Bit-identical rows; TENSORFOLD_EXL3_MP=1 restores the stock kernel.
+
+--- tensorfold/cuda/exl3/linear.cu	2026-10-10 16:13:57.154686608 +0530
++++ tensorfold/cuda/exl3/linear.cu	2026-10-10 16:13:48.021954843 +0530
+@@ -6,6 +6,7 @@
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ #include <algorithm>
++#include <cstdlib>
+ 
+ #include "decode.cuh"
+ 
+@@ -125,7 +126,7 @@
+     store4(xh, F16, (size_t)row * K + k, v);
+ }
+ 
+-template <int K2, int CB, int WK>
++template <int K2, int CB, int WK, int MP>
+ __global__ void __launch_bounds__(WK * 32) linear_kernel(
+     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
+     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+@@ -150,21 +151,29 @@
+         prev = word != lane / (8 / K2);
+     }
+ 
+-    for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
+-        const int R = min(16, M - m0);
+-
+-        float acc[8][2][4];
++    // MP passes of 16 rows share each decoded weight tile; a row's sums are the same for any MP (fixed k order, own mma rows)
++    for (int m00 = 0, pass0 = 0; m00 < M; m00 += 16 * MP, pass0 += MP) {
++        float acc[MP][8][2][4];
++#pragma unroll
++        for (int p = 0; p < MP; ++p)
+ #pragma unroll
+-        for (int i = 0; i < 8; ++i)
++            for (int i = 0; i < 8; ++i)
+ #pragma unroll
+-            for (int h = 0; h < 2; ++h)
++                for (int h = 0; h < 2; ++h)
+ #pragma unroll
+-                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
++                    for (int c = 0; c < 4; ++c) acc[p][i][h][c] = 0.f;
+ 
+         // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
+-        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
+-        const half* x0 = xh + (size_t)r0 * K;
+-        const half* x1 = xh + (size_t)r1 * K;
++        const half* x0[MP];
++        const half* x1[MP];
++#pragma unroll
++        for (int p = 0; p < MP; ++p) {
++            const int mp = m00 + 16 * p, Rp = M - mp;
++            const int r0 = Rp <= 0 ? M - 1 : mp + (g < Rp ? g : Rp - 1);
++            const int r1 = Rp <= 0 ? M - 1 : mp + (g + 8 < Rp ? g + 8 : Rp - 1);
++            x0[p] = xh + (size_t)r0 * K;
++            x1[p] = xh + (size_t)r1 * K;
++        }
+         const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
+         // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
+         constexpr bool PF = K2 <= 12;
+@@ -174,11 +183,14 @@
+ #pragma unroll 1
+         for (int i = 0; i < per_warp; ++i) {
+             const int kt = kt0 + i;
+-            uint32_t a[4];
+-            a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
+-            a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
+-            a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
+-            a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
++            uint32_t a[MP][4];
++#pragma unroll
++            for (int p = 0; p < MP; ++p) {
++                a[p][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[p] + kt * 16 + 2 * t));
++                a[p][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[p] + kt * 16 + 2 * t));
++                a[p][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[p] + kt * 16 + 2 * t + 8));
++                a[p][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[p] + kt * 16 + 2 * t + 8));
++            }
+             if constexpr (PF) {
+                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
+             }
+@@ -189,8 +201,11 @@
+                 else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
+                 uint32_t b0[2], b1[2];
+                 decode_lane<K2, CB>(w, lane, b0, b1);
+-                mma16816(acc[j][0], a, b0);
+-                mma16816(acc[j][1], a, b1);
++#pragma unroll
++                for (int p = 0; p < MP; ++p) {
++                    mma16816(acc[p][j][0], a[p], b0);
++                    mma16816(acc[p][j][1], a[p], b1);
++                }
+             }
+             if constexpr (PF) {
+ #pragma unroll
+@@ -198,6 +213,11 @@
+             }
+         }
+ 
++#pragma unroll
++        for (int p = 0; p < MP; ++p) {
++        const int m0 = m00 + 16 * p, pass = pass0 + p;
++        if (m0 >= M) break;
++        const int R = min(16, M - m0);
+         // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
+         for (int rlo = 0; rlo < R; rlo += 8) {
+             const int rn = min(R - rlo, 8);
+@@ -209,7 +229,7 @@
+                     for (int h = 0; h < 2; ++h) {
+                         const int col = i * 16 + h * 8 + 2 * t;
+                         *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
+-                            rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
++                            rlo ? make_float2(acc[p][i][h][2], acc[p][i][h][3]) : make_float2(acc[p][i][h][0], acc[p][i][h][1]);
+                     }
+             }
+             __syncthreads();
+@@ -262,6 +282,7 @@
+             }
+         }
+         __syncthreads();                             // red is reused in the next pass
++        }
+     }
+ }
+ 
+@@ -282,6 +303,25 @@
+     }
+ }
+ 
++// passes of 16 rows one weight decode serves (3 at most: 4 spill registers); TENSORFOLD_EXL3_MP=1 is the stock kernel
++inline int max_mp() {
++    static const int v = [] {
++        const char* e = std::getenv("TENSORFOLD_EXL3_MP");
++        const int x = e ? std::atoi(e) : 3;
++        return x >= 3 ? 3 : x >= 2 ? 2 : 1;
++    }();
++    return v;
++}
++
++template <int K2, int CB>
++auto pick_kernel(int64_t WK, int M) {
++    const int need = (M + 15) / 16, mp = std::min(max_mp(), need <= 3 ? need : need == 4 ? 2 : 3);
++#define TF_MP(W_) (mp == 1 ? linear_kernel<K2, CB, W_, 1> : mp == 2 ? linear_kernel<K2, CB, W_, 2> \
++                                                         : linear_kernel<K2, CB, W_, 3>)
++    return WK == 2 ? TF_MP(2) : WK == 4 ? TF_MP(4) : TF_MP(8);
++#undef TF_MP
++}
++
+ int dtype_of(const at::Tensor& t) {
+     return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
+ }
+@@ -314,8 +354,7 @@
+     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
+ #define TF_LAUNCH(K2_, CB_)                                                                                        \
+     if (K2 == K2_ && cb == CB_) {                                                                               \
+-        auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \
+-                              : WK == 4 ? linear_kernel<K2_, CB_, 4> : linear_kernel<K2_, CB_, 8>;              \
++        auto kernel = pick_kernel<K2_, CB_>(WK, M);                                                             \
+         const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                \
+         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                              \
+--- tensorfold/cuda/exl3/linear.py	2026-10-10 16:13:57.155821378 +0530
++++ tensorfold/cuda/exl3/linear.py	2026-10-10 16:13:48.026452865 +0530
+@@ -18,7 +18,7 @@
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
++    return load(name="tensorfold_exl3_linear_v6", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                 verbose=False)
+ 

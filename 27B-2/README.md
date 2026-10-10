@@ -11,7 +11,7 @@ PARALLEL=1 ./27B-2/start.sh # best single-stream decode ("wide" draft trees)
 ./27B-2/end.sh
 ```
 
-Knobs (env): `PARALLEL` (8), `CONTEXT` (262144), `KV_DTYPE` (fp8), `VISION` (1), `VISION_MAX_IMAGES` (50),
+Knobs (env): `PARALLEL` (16), `CONTEXT` (262144), `KV_DTYPE` (fp8), `VISION` (1), `VISION_MAX_IMAGES` (50),
 `THINKING` (1), `TENSORFOLD_KEEP_MAX` (32), `TENSORFOLD_KEEP_HEADROOM_GIB` (8), `MEMORY_RESERVE_GIB`, `CHECKPOINT_SLOTS`.
 Media limits as in flash-2 (body 192 MiB, images 64 MiB, video 64/192 MiB, 16384 image/video tokens).
 
@@ -24,6 +24,7 @@ Media limits as in flash-2 (body 192 MiB, images 64 MiB, video 64/192 MiB, 16384
 | 0006 | EXL3 prefill GEMM tile BK 32 to 64: bit-identical output, 3-20% faster matmuls, +8.6% on a 4096-row chunk. |
 | 0007 | Vision prefix cache: image/video prompts resume from and keep states, keyed by media hashes (as in flash-2). Single-GPU path and scheduler path. |
 | 0008 | Elastic kept states: up to `TENSORFOLD_KEEP_MAX`, shed oldest-first when `MemAvailable` falls under the headroom. |
+| 0009 | EXL3 verify linear: up to 3 passes of 16 rows share one weight decode (stock re-read and re-decoded the weights for every 16 rows). Every row bit-identical to stock; `TENSORFOLD_EXL3_MP=1` restores the stock kernel. |
 
 ## Results (fp8 KV, 262144 context)
 
@@ -40,20 +41,33 @@ draft acceptance can improve it. Prefill is compute-bound (Triton EXL3 GEMM 63-8
 Vision: an image repeated gives `cached_tokens` 277 of 284 and identical output; a different question after the image
 only reuses the text before the image (same as flash-2).
 
-## Throughput by number of streams (PARALLEL=8, short prompts, 800 new tokens each, T=1)
+## Throughput by number of streams (short prompts, 800 new tokens each, T=1)
 
 `bench/tput.py 1 2 4 8`: N requests sent at once; aggregate = all completion tokens / wall time.
 
-| Streams | Essays: aggregate | Essays: per stream | Code: aggregate | Code: per stream |
-|---|---|---|---|---|
-| 1 | 39 tok/s | 40 | 85 tok/s | 90 |
-| 2 | 69 | 41 | 129 | 70 |
-| 4 | 104 | 30 | 157 | 42 |
-| 6 | 114 | 22 | - | - |
-| 8 | 117 | 16 | 170 | 24 |
+Stock TensorFold's EXL3 verify kernel decoded the weights once per 16 rows, so a verify of 17-32 rows cost two full
+weight passes and 64 rows four (gate_proj: 16 rows 204 us, 32 rows 388 us, 64 rows 730 us). With several streams the
+drafted rows of all streams share one verify, so that cliff capped multi-stream throughput. Patch 0009 makes up to 48
+rows share one decode (32 rows 222-247 us, 48 rows 222 us, 64 rows 343 us), and the verify curve became:
 
-Aggregate throughput rises about 2-3x up to 4 streams and flattens after that: more streams leave room for fewer draft rows
-each (a verify of up to 16 rows costs about the same as 1, while 24+ rows cost much more).
+| Rows | 16 | 24 | 32 | 48 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| Stock (ms) | 69 | 110 | 114 | 161 | 209 | 408 |
+| 0009 (ms) | 70 | 75 | 78 | 93 | 132 | 244 |
+
+| Streams | Essays: stock | Essays: 0009 | Code: stock | Code: 0009 |
+|---|---|---|---|---|
+| 1 | 39 tok/s | 41 tok/s | 85 tok/s | 88 tok/s |
+| 2 | 69 | 71 | 129 | 149 |
+| 4 | 104 | 119 | 157 | 219 |
+| 6 | 114 | 141 | - | - |
+| 8 | 117 | 165 | 170 | 257 |
+| 12 | - | 200 | - | 277 |
+| 16 | - | 214 | - | 293 |
+
+(Aggregate; per-stream speed is aggregate / streams. 12 and 16 streams need `PARALLEL=16`, now the default; a lone stream
+is as fast at 16 as at 8.) Where a round's time goes at 8 code streams (~45 verify rows): forward 102 ms, batched draft
+14 ms, GDN state commit 11 ms (each stream's fp32 recurrent state, ~150 MB, is read and rewritten), other ~10 ms.
 
 ## Concurrency at the full window
 
