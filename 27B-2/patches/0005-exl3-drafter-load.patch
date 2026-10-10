@@ -1,0 +1,81 @@
+Qwen3.8-27B-2: load an EXL3 drafter (igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw). Stock DFlash2 reads a bf16 drafter
+only. This decodes each EXL3 group (trellis/suh/svh/mul1) on the GPU to bf16 W = diag(suh) H W_q H diag(svh) and then
+packs it to affine 4-bit as for a bf16 drafter; admission counts the same bytes. Only draft acceptance is affected,
+never target output. Applies after 0004.
+
+--- tensorfold/families/qwen3_5/cuda/affine_memory.py	2026-10-10 11:23:10.102663224 +0530
++++ tensorfold/families/qwen3_5/cuda/affine_memory.py	2026-10-10 11:23:55.469305791 +0530
+@@ -70,8 +70,9 @@
+     from tensorfold.cuda.capacity import Weights, estimate_weights, headers
+ 
+     held = estimate_weights(draft_dir, draft_bytes)
+-    largest = max((math.prod(info["shape"]) for name, info in headers(draft_dir).items()
+-                   if packed_draft(name, info["shape"])), default=0)
++    largest = max((math.prod(info["shape"]) if name.endswith(".weight") else info["shape"][0] * info["shape"][1] * 256
++                   for name, info in headers(draft_dir).items()
++                   if packed_draft(name, info["shape"]) or name.endswith(".trellis")), default=0)
+     return Weights(held.resident, max(held.staging, 14 * largest), held.mapped)
+ 
+ 
+@@ -82,6 +83,12 @@
+ 
+     shape = [int(n) for n in info["shape"]]
+     count = math.prod(shape)
++    if name.endswith(".trellis"):             # an EXL3 drafter's group: held as the 4-bit copy of its decoded weight
++        count = shape[0] * shape[1] * 256
++        packed = count // 2 + count // 64 * 4
++        return packed * (2 if name.endswith(("k_proj.trellis", "v_proj.trellis")) else 1), 0
++    if name.endswith((".suh", ".svh", ".mul1", ".mcg", ".su", ".sv")):
++        return 0, 0
+     if name.startswith("candidate_selector.") and name.endswith("_codebook"):
+         return 0, 0
+     if not packed_draft(name, shape):
+--- tensorfold/families/qwen3_5/cuda/dflash2.py	2026-10-10 11:23:10.102775514 +0530
++++ tensorfold/families/qwen3_5/cuda/dflash2.py	2026-10-10 11:23:55.469213485 +0530
+@@ -145,6 +145,37 @@
+     return QLinear(words, scale.contiguous(), bias.contiguous())
+ 
+ 
++def _hadamard(n: int, device) -> torch.Tensor:
++    """H / sqrt(n) (Sylvester, symmetric), the rotation EXL3 applies to every 128 inputs and outputs."""
++
++    h = torch.ones((1, 1), dtype=torch.float32)
++    while h.shape[0] < n:
++        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
++    return (h / n ** 0.5).to(device)
++
++
++def dequantize_exl3(weights: dict, device) -> None:
++    """Turn an EXL3 drafter's groups (trellis, suh, svh, mul1) into bf16 ``.weight`` [N, K] tensors in place.
++
++    W = diag(suh) H W_q H diag(svh) with W_q decoded on the GPU; the 4-bit affine packing then runs as for a bf16 drafter."""
++
++    from tensorfold.cuda.exl3.linear import Exl3Linear
++
++    h = _hadamard(128, device)
++    for prefix in sorted(n[:-len(".trellis")] for n in weights if n.endswith(".trellis")):
++        parts = {p: weights.pop(f"{prefix}.{p}", None) for p in ("trellis", "suh", "svh", "su", "sv", "mul1", "mcg")}
++        codebook = "mul1" if parts["mul1"] is not None else "mcg" if parts["mcg"] is not None else "3inst"
++        layer = Exl3Linear.from_tensors(parts["trellis"], parts["suh"] if parts["suh"] is not None else parts["su"],
++                                        parts["svh"] if parts["svh"] is not None else parts["sv"], codebook, None,
++                                        device, layout="stored")
++        wq = layer.unpack().float()                                   # [K, N] in the rotated domain
++        k, n = wq.shape
++        w = torch.matmul(h, wq.view(k // 128, 128, n)).view(k, n) * layer.suh.float()[:, None]
++        w = torch.matmul(w.view(k, n // 128, 128), h).view(k, n) * layer.svh.float()[None, :]
++        weights[f"{prefix}.weight"] = w.t().contiguous().to(torch.bfloat16).cpu()
++        del layer, wq, w
++
++
+ def _sub_parts(head, spans: tuple[tuple[int, int], ...]) -> list[tuple[object, int, int]]:
+     """An NVFP4 checkpoint's head rows for ``spans``: views of whole 64-row tiles (bf16 rows as they are), each span's columns."""
+ 
+@@ -215,6 +246,8 @@
+             else:
+                 self.weights[name] = tensor                  # on the host until packed: no bf16 copy on the device
+         del f
++        if any(n.endswith(".trellis") for n in self.weights):              # an EXL3 drafter: decode to bf16, then as below
++            dequantize_exl3(self.weights, self.device)
+         self.inv_freq = (1.0 / self.theta **
+                          (torch.arange(self.head_dim // 2, device=self.device,
+                                        dtype=torch.float32) * 2 / self.head_dim))

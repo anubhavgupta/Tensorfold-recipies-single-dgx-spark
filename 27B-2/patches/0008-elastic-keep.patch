@@ -1,0 +1,51 @@
+Elastic kept prompt states: up to TENSORFOLD_KEEP_MAX, shed when MemAvailable drops under TENSORFOLD_KEEP_HEADROOM_GIB.
+
+--- tensorfold/cuda/streams.py	2026-10-10 12:34:36.825159477 +0530
++++ tensorfold/cuda/streams.py	2026-10-10 12:35:33.130379023 +0530
+@@ -2,11 +2,27 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Sequence
+ 
+ 
++KEEP_MAX = int(os.environ.get("TENSORFOLD_KEEP_MAX", "0"))
++HEADROOM = int(float(os.environ.get("TENSORFOLD_KEEP_HEADROOM_GIB", "8")) * 2**30)
++
++
++def mem_available() -> int:
++    try:
++        with open("/proc/meminfo") as f:
++            for line in f:
++                if line.startswith("MemAvailable:"):
++                    return int(line.split()[1]) * 1024
++    except OSError:
++        pass
++    return 1 << 62
++
++
+ @dataclass
+ class Stream:
+     """One request. ``emit`` receives each round's new tokens and returns True to stop the stream."""
+@@ -112,7 +128,8 @@
+     """Private prompt-end states by ids (never decoded rows: prefill and decode bits differ), newest last."""
+ 
+     def __init__(self, keep: int = 8) -> None:
+-        self.keep = keep
++        self.min_keep = keep                                # always kept; up to TENSORFOLD_KEEP_MAX while memory allows
++        self.keep = max(keep, KEEP_MAX)
+         self.entries: list[tuple[list[int], Any, Any]] = []
+         self.hit: set[tuple[int, ...]] = set()             # entries a later prompt resumed from
+ 
+@@ -146,6 +163,8 @@
+         self.entries = [e for e in self.entries if e[0] != ids] + [(ids, state, snap)]
+         while len(self.entries) > self.keep:
+             self._drop(self.entries[:-1])
++        while len(self.entries) > max(self.min_keep, 1) and mem_available() < HEADROOM:
++            self._drop(self.entries[:-1])
+ 
+     def evict(self, among: list | None = None) -> bool:
+         """Memory is short: drop the entry ``add`` would drop next (of ``among``); False when none is left."""
