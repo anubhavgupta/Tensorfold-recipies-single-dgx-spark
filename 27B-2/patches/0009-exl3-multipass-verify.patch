@@ -1,7 +1,9 @@
-EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (was one decode per 16 rows). Bit-identical rows; TENSORFOLD_EXL3_MP=1 restores the stock kernel.
+EXL3 decode/verify linear: up to 4 passes of 16 rows share one weight decode (stock re-read and re-decoded the
+weights every 16 rows); at 49-64 and 97-128 rows a 128-column block's tiles split over 2 blocks, which meet in Z.
+Every row bit-identical to stock (same K slices, k order, fragments and warp-order sums); TENSORFOLD_EXL3_MP=1 is stock.
 
 --- tensorfold/cuda/exl3/linear.cu	2026-10-10 16:13:57.154686608 +0530
-+++ tensorfold/cuda/exl3/linear.cu	2026-10-10 16:13:48.021954843 +0530
++++ tensorfold/cuda/exl3/linear.cu	2026-10-10 18:52:01.221701357 +0530
 @@ -6,6 +6,7 @@
  #include <ATen/cuda/CUDAContext.h>
  #include <c10/cuda/CUDAGuard.h>
@@ -10,16 +12,50 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
  
  #include "decode.cuh"
  
-@@ -125,7 +126,7 @@
+@@ -109,6 +110,18 @@
+     }
+ }
+ 
++// tiles [j0, j0 + J) of one k step (unshuffled widths): a column part's words only
++template <int K2, int J>
++__device__ __forceinline__ void load_part(const uint32_t* step, int lane, uint32_t (&raw)[J * lane_words<K2>()]) {
++    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
++    int word, offset;
++    lane_start<K2>(lane, word, offset);
++#pragma unroll
++    for (int j = 0; j < J; ++j)
++#pragma unroll
++        for (int q = 0; q < LW; ++q) raw[j * LW + q] = __ldg(step + j * TW + (word + q) % TW);
++}
++
+ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype,
+                                                      const half* __restrict__ suh, half* __restrict__ xh, int K) {
+     const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
+@@ -125,7 +138,9 @@
      store4(xh, F16, (size_t)row * K + k, v);
  }
  
 -template <int K2, int CB, int WK>
-+template <int K2, int CB, int WK, int MP>
++// MP passes of 16 rows share each decoded weight tile; CS blocks split a 128-column block's tiles (CS > 1: their
++// warp sums meet in Z and the last block finishes). A column's sums keep one order for any MP and CS: rows are bit-identical.
++template <int K2, int CB, int WK, int MP, int CS>
  __global__ void __launch_bounds__(WK * 32) linear_kernel(
      const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
      const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
-@@ -150,21 +151,29 @@
+@@ -136,7 +151,11 @@
+     __shared__ int last;
+     const int RH = min(M, 8);                                 // rows of red a warp
+ 
+-    const int nb = blockIdx.x, split = blockIdx.y, NB = gridDim.x;
++    static_assert(CS == 1 || !step_shuffled<K2>(), "column parts need unshuffled step words");
++    constexpr int J = 8 / CS;                                 // 16-column tiles a block takes
++    const int nb = blockIdx.x / CS, part = blockIdx.x % CS, split = blockIdx.y, NB = gridDim.x / CS;
++    const int j0 = part * J;
++    const bool direct = SK == 1 && CS == 1;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int g = lane >> 2, t = lane & 3;
+     const int per_warp = (K >> 4) / SK / WK;
+@@ -150,47 +169,70 @@
          prev = word != lane / (8 / K2);
      }
  
@@ -29,17 +65,17 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
 -        float acc[8][2][4];
 +    // MP passes of 16 rows share each decoded weight tile; a row's sums are the same for any MP (fixed k order, own mma rows)
 +    for (int m00 = 0, pass0 = 0; m00 < M; m00 += 16 * MP, pass0 += MP) {
-+        float acc[MP][8][2][4];
-+#pragma unroll
-+        for (int p = 0; p < MP; ++p)
++        float acc[MP][J][2][4];
  #pragma unroll
 -        for (int i = 0; i < 8; ++i)
-+            for (int i = 0; i < 8; ++i)
++        for (int p = 0; p < MP; ++p)
  #pragma unroll
 -            for (int h = 0; h < 2; ++h)
-+                for (int h = 0; h < 2; ++h)
++            for (int i = 0; i < J; ++i)
  #pragma unroll
 -                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
++                for (int h = 0; h < 2; ++h)
++#pragma unroll
 +                    for (int c = 0; c < 4; ++c) acc[p][i][h][c] = 0.f;
  
          // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
@@ -59,7 +95,14 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
          const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
          // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
          constexpr bool PF = K2 <= 12;
-@@ -174,11 +183,14 @@
+-        constexpr int SR = step_regs<K2>();
++        constexpr int SR = CS == 1 ? step_regs<K2>() : J * LW;
+         uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
+-        if constexpr (PF) load_step<K2>(tile, lane, cur);
++        if constexpr (PF) {
++            if constexpr (CS == 1) load_step<K2>(tile, lane, cur);
++            else load_part<K2, J>(tile + j0 * TW, lane, cur);
++        }
  #pragma unroll 1
          for (int i = 0; i < per_warp; ++i) {
              const int kt = kt0 + i;
@@ -77,10 +120,23 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
 +                a[p][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[p] + kt * 16 + 2 * t + 8));
 +            }
              if constexpr (PF) {
-                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
+-                if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
++                if (i + 1 < per_warp) {
++                    if constexpr (CS == 1) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
++                    else load_part<K2, J>(tile + (size_t)(i + 1) * stride_k + j0 * TW, lane, nxt);
++                }
              }
-@@ -189,8 +201,11 @@
-                 else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
+ #pragma unroll
+-            for (int j = 0; j < 8; ++j) {
++            for (int j = 0; j < J; ++j) {
+                 uint32_t w[LW];
+-                if constexpr (PF) step_lane_words<K2>(cur, j, lane, prev, w);
+-                else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
++                if constexpr (PF && CS == 1) step_lane_words<K2>(cur, j, lane, prev, w);
++                else if constexpr (PF) {
++#pragma unroll
++                    for (int q = 0; q < LW; ++q) w[q] = cur[j * LW + q];
++                } else ldg_lane_words<K2>(tile + (size_t)i * stride_k + (j0 + j) * TW, lane, w);
                  uint32_t b0[2], b1[2];
                  decode_lane<K2, CB>(w, lane, b0, b1);
 -                mma16816(acc[j][0], a, b0);
@@ -93,7 +149,7 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
              }
              if constexpr (PF) {
  #pragma unroll
-@@ -198,6 +213,11 @@
+@@ -198,23 +240,28 @@
              }
          }
  
@@ -105,16 +161,53 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
          // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
          for (int rlo = 0; rlo < R; rlo += 8) {
              const int rn = min(R - rlo, 8);
-@@ -209,7 +229,7 @@
+             __syncthreads();                         // red is reused by every half and pass
+             if (g < RH) {
+ #pragma unroll
+-                for (int i = 0; i < 8; ++i)
++                for (int i = 0; i < J; ++i)
+ #pragma unroll
                      for (int h = 0; h < 2; ++h) {
-                         const int col = i * 16 + h * 8 + 2 * t;
+-                        const int col = i * 16 + h * 8 + 2 * t;
++                        const int col = (j0 + i) * 16 + h * 8 + 2 * t;
                          *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
 -                            rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
 +                            rlo ? make_float2(acc[p][i][h][2], acc[p][i][h][3]) : make_float2(acc[p][i][h][0], acc[p][i][h][1]);
                      }
              }
              __syncthreads();
-@@ -262,6 +282,7 @@
+ 
+-            if (SK == 1) {
++            if (direct) {
+                 for (int r = warp; r < rn; r += WK) {
+                     float v[4];
+                     const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
+@@ -228,8 +275,9 @@
+                     store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                 }
+             } else {
+-                for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
+-                    const int r = idx >> 5, c = 4 * (idx & 31);
++                constexpr int QR = 32 / CS;              // float4s of a row this block holds
++                for (int idx = threadIdx.x; idx < rn * QR; idx += WK * 32) {
++                    const int r = idx / QR, c = j0 * 16 + 4 * (idx % QR);
+                     float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+ #pragma unroll
+                     for (int w = 1; w < WK; ++w) {
+@@ -240,10 +288,10 @@
+                 }
+             }
+         }
+-        if (SK > 1) {
++        if (!direct) {
+             __threadfence();
+             __syncthreads();
+-            if (threadIdx.x == 0) last = atomicAdd(counters + pass * NB + nb, 1) == SK - 1;
++            if (threadIdx.x == 0) last = atomicAdd(counters + pass * NB + nb, 1) == SK * CS - 1;
+             __syncthreads();
+             if (last) {
+                 __threadfence();
+@@ -262,6 +310,7 @@
              }
          }
          __syncthreads();                             // red is reused in the next pass
@@ -122,50 +215,92 @@ EXL3 decode/verify linear: up to 3 passes of 16 rows share one weight decode (wa
      }
  }
  
-@@ -282,6 +303,25 @@
+@@ -282,6 +331,40 @@
      }
  }
  
-+// passes of 16 rows one weight decode serves (3 at most: 4 spill registers); TENSORFOLD_EXL3_MP=1 is the stock kernel
++// (passes of 16 rows one weight decode serves, column parts): MP x 64 / CS accumulators a thread.
++// TENSORFOLD_EXL3_MP=1 is the stock kernel (a decode every 16 rows).
 +inline int max_mp() {
 +    static const int v = [] {
 +        const char* e = std::getenv("TENSORFOLD_EXL3_MP");
-+        const int x = e ? std::atoi(e) : 3;
-+        return x >= 3 ? 3 : x >= 2 ? 2 : 1;
++        return e ? std::max(1, std::atoi(e)) : 4;
 +    }();
 +    return v;
 +}
 +
++inline void mp_cs(int M, bool shuffled, int& mp, int& cs) {
++    // measured on GB10: 4 passes in 2 column parts beat 2 x 2 passes for 49-64 rows (and 2 sweeps of them 3 x 3 passes
++    // for 97-128); 6 or 8 passes a decode, or 4 column parts, lose (register pressure, per-block activation reads)
++    const int need = (M + 15) / 16, cap = max_mp();
++    if ((need == 4 || need >= 7) && !shuffled && cap >= 4) { mp = 4; cs = 2; }
++    else { mp = std::min({need, 3, cap}); cs = 1; }
++}
++
++template <int K2, int CB, int W_>
++auto pick_wk(int mp, int cs) {
++    if constexpr (K2 == 2 || K2 == 4) {
++        return mp == 1 ? linear_kernel<K2, CB, W_, 1, 1> : mp == 2 ? linear_kernel<K2, CB, W_, 2, 1>
++                                                                   : linear_kernel<K2, CB, W_, 3, 1>;
++    } else {
++        return mp == 1 ? linear_kernel<K2, CB, W_, 1, 1> : mp == 2 ? linear_kernel<K2, CB, W_, 2, 1>
++             : mp == 3 ? linear_kernel<K2, CB, W_, 3, 1> : linear_kernel<K2, CB, W_, 4, 2>;
++    }
++}
++
 +template <int K2, int CB>
-+auto pick_kernel(int64_t WK, int M) {
-+    const int need = (M + 15) / 16, mp = std::min(max_mp(), need <= 3 ? need : need == 4 ? 2 : 3);
-+#define TF_MP(W_) (mp == 1 ? linear_kernel<K2, CB, W_, 1> : mp == 2 ? linear_kernel<K2, CB, W_, 2> \
-+                                                         : linear_kernel<K2, CB, W_, 3>)
-+    return WK == 2 ? TF_MP(2) : WK == 4 ? TF_MP(4) : TF_MP(8);
-+#undef TF_MP
++auto pick_kernel(int64_t WK, int mp, int cs) {
++    return WK == 2 ? pick_wk<K2, CB, 2>(mp, cs) : WK == 4 ? pick_wk<K2, CB, 4>(mp, cs) : pick_wk<K2, CB, 8>(mp, cs);
 +}
 +
  int dtype_of(const at::Tensor& t) {
      return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
  }
-@@ -314,8 +354,7 @@
-     TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
+@@ -307,15 +390,16 @@
+     const int M = (int)xh.size(0), K = (int)xh.size(1), N = (int)y.size(1);
+     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
+     TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
+-    dim3 grid((unsigned)(N / 128), (unsigned)SK);
++    int mp, cs;
++    mp_cs(M, K2 == 2 || K2 == 4, mp, cs);
++    dim3 grid((unsigned)(N / 128 * cs), (unsigned)SK);
+     auto stream = at::cuda::getCurrentCUDAStream();
+     const half* bptr = bias ? reinterpret_cast<const half*>(bias->data_ptr()) : nullptr;
+     float* zptr = Z ? Z->data_ptr<float>() : nullptr;
+-    TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
++    TORCH_CHECK((SK == 1 && cs == 1) || zptr, "Z is needed with more than one split or column part");
  #define TF_LAUNCH(K2_, CB_)                                                                                        \
      if (K2 == K2_ && cb == CB_) {                                                                               \
 -        auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \
 -                              : WK == 4 ? linear_kernel<K2_, CB_, 4> : linear_kernel<K2_, CB_, 8>;              \
-+        auto kernel = pick_kernel<K2_, CB_>(WK, M);                                                             \
++        auto kernel = pick_kernel<K2_, CB_>(WK, mp, cs);                                                        \
          const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                \
          if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
          kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                              \
 --- tensorfold/cuda/exl3/linear.py	2026-10-10 16:13:57.155821378 +0530
-+++ tensorfold/cuda/exl3/linear.py	2026-10-10 16:13:48.026452865 +0530
++++ tensorfold/cuda/exl3/linear.py	2026-10-10 18:52:01.222670908 +0530
 @@ -18,7 +18,7 @@
      from tensorfold.cuda.build import load
  
      here = Path(__file__).parent
 -    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
-+    return load(name="tensorfold_exl3_linear_v6", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
++    return load(name="tensorfold_exl3_linear_v9", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                  extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                  verbose=False)
+ 
+@@ -175,12 +175,13 @@
+         sk, wk = self.split
+         if xh is None:
+             xh = torch.empty((m, self.k), dtype=torch.float16, device=x.device)
+-        if sk > 1 and z is None:
++        parts = 48 < m <= 64 or m > 96    # linear.cu splits a 128-column block's tiles over 2 blocks there
++        if (sk > 1 or parts) and z is None:
+             z = torch.empty((sk * m * self.n,), dtype=torch.float32, device=x.device)
+         sk_stride, nb_stride = self.strides
+         ext = _ext()
+         ext.rot_in(x, self.suh, xh)
+-        ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
++        ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if (sk > 1 or parts) else None,
+                    self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
+         return out
  

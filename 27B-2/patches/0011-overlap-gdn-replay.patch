@@ -1,0 +1,126 @@
+Scheduler: a round's GDN state replay runs on a side CUDA stream beside the next round's draft; the forward,
+prefill and drop wait on it. Same outputs (greedy multi-stream hashes compared). TENSORFOLD_OVERLAP_REPLAY=0: inline.
+
+--- tensorfold/families/qwen3_5/cuda/forward.py	2026-10-10 16:13:57.146325925 +0530
++++ tensorfold/families/qwen3_5/cuda/forward.py	2026-10-10 17:31:28.698890377 +0530
+@@ -430,30 +430,44 @@
+ 
+ 
+ def commit_streams(states: Sequence[State], record: Sequence[Record], paths: Sequence[Sequence[int]],
+-                   indices: list | None = None, *, in_place: bool = False) -> None:
++                   indices: list | None = None, *, in_place: bool = False, side=None):
+     """Commit each stream's accepted path into its own state with one GDN replay launch for every stream (``in_place``: states nothing else holds)."""
+ 
+     indices = indices if indices is not None else path_indices(record, paths)
+     width = record[0].k.shape[0]
+     packed = indices[0][0].as_strided((len(paths), width + 1), (width + 1, 1))    # path_indices' one copy
+-    _commit(states, record, paths, packed[:, :width], packed[:, width], [t for _, _, t in indices], in_place)
++    return _commit(states, record, paths, packed[:, :width], packed[:, width], [t for _, _, t in indices], in_place,
++                   side)
+ 
+ 
+ def _commit(states: Sequence[State], record: Sequence[Record], paths: Sequence[Sequence[int]], rows: torch.Tensor,
+-            counts: torch.Tensor, takes: Sequence[torch.Tensor], in_place: bool = False) -> None:
++            counts: torch.Tensor, takes: Sequence[torch.Tensor], in_place: bool = False, side=None):
++    """``side`` (a CUDA stream, ``in_place`` only): the GDN replay runs there; returns (its done event, the tensors it
++    uses, held until the caller's stream waits on the event), else None."""
+     if any(not p for p in paths) or any(len(record) != len(st.rec) for st in states):
+         raise ValueError("record and nonempty paths required")
+     # one GDN replay launch covers every layer and stream
+     linear = [(i, item) for i, item in enumerate(record) if isinstance(item, GDNRecord)]
+     att = [(i, item) for i, item in enumerate(record) if not isinstance(item, GDNRecord)]
+-    replayed = None
++    replayed, pending = None, None
+     if linear:
+         items = [item for _, item in linear]
++        recs = [[st.rec[i] for i, _ in linear] for st in states]
+         ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
+-                                     [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
+-        table = deltanet.to_device(ptrs, torch.int64, rows.device)
+-        replayed = deltanet.replay(table, len(items), len(states), rows, counts, items[0].k, items[0].v,
+-                                   in_place=in_place)
++                                     [t.beta for t in items], recs)
++        if side is not None and in_place:
++            # the replay only rewrites each stream's recurrent states: nothing reads them before the next forward
++            side.wait_stream(torch.cuda.current_stream(rows.device))
++            with torch.cuda.stream(side):
++                table = deltanet.to_device(ptrs, torch.int64, rows.device)
++                deltanet.replay(table, len(items), len(states), rows, counts, items[0].k, items[0].v, in_place=True)
++                done = torch.cuda.Event()
++                done.record(side)
++            pending = (done, (table, rows, counts, items, recs))
++        else:
++            table = deltanet.to_device(ptrs, torch.int64, rows.device)
++            replayed = deltanet.replay(table, len(items), len(states), rows, counts, items[0].k, items[0].v,
++                                       in_place=in_place)
+     device = rows.device
+     if linear:
+         # a stream's new conv rows are the last ``keep`` of [its committed rows | its accepted rows]
+@@ -501,3 +515,4 @@
+         torch._foreach_copy_(dst, src)
+     for st, path in zip(states, paths):
+         st.pos += len(path)
++    return pending
+--- tensorfold/families/qwen3_5/cuda/multi.py	2026-10-10 16:13:57.146472566 +0530
++++ tensorfold/families/qwen3_5/cuda/multi.py	2026-10-10 18:15:23.882784984 +0530
+@@ -118,6 +118,11 @@
+         self.broken: Exception | None = None
+         self.costs: list[tuple[int, float]] | None = None     # (rows, ms) of the forward: tree widths by the curve
+         self.overhead = (8.0, 1.5)                            # a round's other ms until measured: fixed, per stream
++        # one GPU: a round's GDN state replay runs on a side stream beside the next round's draft (it only rewrites the
++        # streams' recurrent states, which nothing reads before the next forward); TENSORFOLD_OVERLAP_REPLAY=0: inline
++        self.side = (torch.cuda.Stream(self.device) if world == 1 and cuda
++                     and os.environ.get("TENSORFOLD_OVERLAP_REPLAY", "1") != "0" else None)
++        self.pending = None                                   # (the replay's done event, the tensors it uses)
+         self.block = max_rows
+         # one GPU: a stream's caches hold its prompt, then grow a step at a time while the gate has room
+         c, att = w.config, sum(1 for layer in getattr(w, "layers", ()) if not layer.linear)
+@@ -426,6 +431,8 @@
+ 
+         self._check()
+         self._timed(time.perf_counter())
++        if self.filling:
++            self._sync()                    # a prefill step may keep or copy states
+         done = self._fill() if self.filling else []
+         start = time.perf_counter()
+         live = [s for s in self.streams.values() if not s.done]
+@@ -569,6 +576,7 @@
+             grammars = self._masks(plan, wins) if self.split else {}
+         self.block = self._deepest(plan, wins, block)
+         states = [self.streams[item[0]].st for item in plan]
++        self._sync()                                  # the last round's replayed states, before the forward reads them
+         taps_wanted = self.drafts and any(self.streams[item[0]].draft for item in plan)
+         logits, record, taps, starts = multi_tree_forward(
+             self.w, [(t, p, st) for (t, p), st in zip(wins, states)],
+@@ -628,7 +636,8 @@
+         rows = [[starts[k] + r for r in path] for k, path in enumerate(paths)]
+         indices = path_indices(record, rows)
+         streams = [self.streams[item[0]] for item in plan]
+-        commit_streams([s.st for s in streams], record, rows, indices, in_place=True)
++        self._sync()
++        self.pending = commit_streams([s.st for s in streams], record, rows, indices, in_place=True, side=self.side)
+         drafting = []
+         for s, (tokens, _), path, (_, _, take) in zip(streams, wins, paths, indices):
+             s.committed.extend(tokens[r] for r in path)
+@@ -640,6 +649,13 @@
+             for (s, _), snap in zip(drafting, snaps):
+                 s.snap = snap
+ 
++    def _sync(self) -> None:
++        """The current stream waits for a side-stream replay; its tensors may go once that is ordered."""
++
++        if self.pending is not None:
++            torch.cuda.current_stream(self.device).wait_event(self.pending[0])
++            self.pending = None
++
+     def finish(self, done: list[Stream]) -> None:
+         """Drop finished streams on every rank (their prompt-end states joined the prefix cache at admission)."""
+ 
+@@ -654,6 +670,7 @@
+     def drop(self) -> list[Stream]:
+         """After an error in a round: forget the live streams (two ranks can no longer be trusted to agree)."""
+ 
++        self._sync()
+         live = [s for s in self.streams.values() if not s.done]
+         for s in live:
+             del self.streams[s.sid]

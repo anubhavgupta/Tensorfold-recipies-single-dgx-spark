@@ -1,0 +1,26 @@
+4-bit lane matmul (the DFlash2 drafter's): GB10 takes block 11 past 16 rows, 10-40% faster than 3/4/5 at 24-192 rows.
+Blocks never change bits.
+
+--- tensorfold/cuda/kernels/qmm_group.cu	2026-10-10 16:13:57.139236172 +0530
++++ tensorfold/cuda/kernels/qmm_group.cu	2026-10-10 17:16:54.595386535 +0530
+@@ -394,7 +394,8 @@
+ // 10-12 (``qmm.group_tile`` on SM 12.0 from 96 SMs) spread the slice sums and skip m16 tiles wholly past M.
+ template <bool F32>
+ void dispatch(int tile, int M, bool gb10, const at::Tensor& x, const at::Tensor& xs, Parts& parts, int C, bool pdl) {
+-    if (tile == 0 && gb10) tile = M <= 16 ? 2 : M <= 32 ? 3 : M <= 64 ? 4 : 5;
++    // GB10 past 16 rows: the spread, m16-skipping 64x128 block (11) measured 10-40% faster than 3/4/5 at 24-192 rows
++    if (tile == 0 && gb10) tile = M <= 16 ? 2 : 11;
+     if (tile == 0) tile = M <= 8 ? 7 : M <= 16 ? 8 : M <= 32 ? 9 : M <= 64 ? 4 : 5;
+     auto go = [&](auto full, auto skip, int bm) { M % bm ? skip() : full(); };
+     switch (tile) {
+--- tensorfold/cuda/kernels/qmm.py	2026-10-10 16:13:57.139209932 +0530
++++ tensorfold/cuda/kernels/qmm.py	2026-10-10 17:16:54.598207612 +0530
+@@ -18,7 +18,7 @@
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_qmm_v5", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
++    return load(name="tensorfold_qmm_v6", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+                                                    str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
+                                                    str(here / "qmm_prefill8.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)

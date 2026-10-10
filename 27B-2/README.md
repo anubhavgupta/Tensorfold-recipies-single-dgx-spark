@@ -24,7 +24,9 @@ Media limits as in flash-2 (body 192 MiB, images 64 MiB, video 64/192 MiB, 16384
 | 0006 | EXL3 prefill GEMM tile BK 32 to 64: bit-identical output, 3-20% faster matmuls, +8.6% on a 4096-row chunk. |
 | 0007 | Vision prefix cache: image/video prompts resume from and keep states, keyed by media hashes (as in flash-2). Single-GPU path and scheduler path. |
 | 0008 | Elastic kept states: up to `TENSORFOLD_KEEP_MAX`, shed oldest-first when `MemAvailable` falls under the headroom. |
-| 0009 | EXL3 verify linear: up to 3 passes of 16 rows share one weight decode (stock re-read and re-decoded the weights for every 16 rows). Every row bit-identical to stock; `TENSORFOLD_EXL3_MP=1` restores the stock kernel. |
+| 0009 | EXL3 verify linear: up to 4 passes of 16 rows share one weight decode (stock re-read and re-decoded the weights for every 16 rows); at 49-64 and 97-128 rows a 128-column block is split over 2 thread blocks to keep registers in bounds. Every row bit-identical to stock (layer test at every row count, and greedy 8-stream outputs identical); `TENSORFOLD_EXL3_MP=1` restores the stock kernel. |
+| 0010 | Drafter 4-bit matmul: GB10 uses block 11 past 16 rows (10-40% faster drafter GEMMs at 24-192 rows; blocks never change bits). |
+| 0011 | Scheduler: a round's GDN state replay runs on a side CUDA stream beside the next round's draft (same outputs; `TENSORFOLD_OVERLAP_REPLAY=0` turns it off). |
 
 ## Results (fp8 KV, 262144 context)
 
@@ -66,8 +68,20 @@ rows share one decode (32 rows 222-247 us, 48 rows 222 us, 64 rows 343 us), and 
 | 16 | - | 214 | - | 293 |
 
 (Aggregate; per-stream speed is aggregate / streams. 12 and 16 streams need `PARALLEL=16`, now the default; a lone stream
-is as fast at 16 as at 8.) Where a round's time goes at 8 code streams (~45 verify rows): forward 102 ms, batched draft
-14 ms, GDN state commit 11 ms (each stream's fp32 recurrent state, ~150 MB, is read and rewritten), other ~10 ms.
+is as fast at 16 as at 8.)
+
+### What limits it now (16 streams, ~60 verify rows a round, ~190 ms a round)
+
+| Part | ms / round | Why it is not lower |
+|---|---|---|
+| Verify forward | ~140 | EXL3 linears are ~110 ms: 64 rows cost ~1.5x one row. Weight decode and mma are not the limit (removing either changes nothing); a block of 8 warps at 228-255 registers is one per SM, so memory latency is poorly hidden. A rewrite with a warp per pass sharing decoded tiles through shared memory was bit-exact but slower, so it was dropped. |
+| Draft (DFlash2, 5 layers x ~160 rows) | ~22 | Compute-bound 4-bit GEMMs (0010 helped ~10%). Capping the draft block at 8 or 6 changed nothing; a bf16 drafter accepts the same (6.06 vs 6.00 tok/round) at 3x the draft time. |
+| GDN state replay | ~20 | Each stream's fp32 recurrent state (~150 MB) is read and rewritten; 0011 overlaps it with the draft (~4%). |
+| Sampling, tree planning, Python | ~10 | |
+
+Second round of tuning (0009 column split, 0010, 0011), same benchmark: 16 code streams 285-296 tok/s (was 293),
+16 essay streams 205-208 (was 214), 8 code streams 260-272 (was 257) - within run-to-run noise (~7%, GPU temperature
+moves the one-row verify between 64 and 72 ms). The kernel-level gains are real but small next to the fixed costs.
 
 ## Concurrency at the full window
 
