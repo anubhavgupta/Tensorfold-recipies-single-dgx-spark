@@ -40,6 +40,21 @@ draft acceptance can improve it. Prefill is compute-bound (Triton EXL3 GEMM 63-8
 Vision: an image repeated gives `cached_tokens` 277 of 284 and identical output; a different question after the image
 only reuses the text before the image (same as flash-2).
 
+## Throughput by number of streams (PARALLEL=8, short prompts, 800 new tokens each, T=1)
+
+`bench/tput.py 1 2 4 8`: N requests sent at once; aggregate = all completion tokens / wall time.
+
+| Streams | Essays: aggregate | Essays: per stream | Code: aggregate | Code: per stream |
+|---|---|---|---|---|
+| 1 | 39 tok/s | 40 | 85 tok/s | 90 |
+| 2 | 69 | 41 | 129 | 70 |
+| 4 | 104 | 30 | 157 | 42 |
+| 6 | 114 | 22 | - | - |
+| 8 | 117 | 16 | 170 | 24 |
+
+Aggregate throughput rises about 2-3x up to 4 streams and flattens after that: more streams leave room for fewer draft rows
+each (a verify of up to 16 rows costs about the same as 1, while 24+ rows cost much more).
+
 ## Concurrency at the full window
 
 Startup: "up to 8 streams, each growing to 262144 tokens". Tested with 8 simultaneous requests of ~249K tokens each
