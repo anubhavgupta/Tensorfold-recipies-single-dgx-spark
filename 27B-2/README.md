@@ -12,7 +12,7 @@ PARALLEL=1 ./27B-2/start.sh # best single-stream decode ("wide" draft trees)
 ```
 
 Knobs (env): `PARALLEL` (16), `CONTEXT` (262144), `KV_DTYPE` (fp8), `VISION` (1), `VISION_MAX_IMAGES` (50),
-`THINKING` (1), `TENSORFOLD_KEEP_MAX` (32), `TENSORFOLD_KEEP_HEADROOM_GIB` (8), `MEMORY_RESERVE_GIB`, `CHECKPOINT_SLOTS`.
+`THINKING` (1), `TENSORFOLD_KEEP_MAX` (128), `TENSORFOLD_KEEP_HEADROOM_GIB` (8), `MEMORY_RESERVE_GIB`, `CHECKPOINT_SLOTS`.
 Media limits as in flash-2 (body 192 MiB, images 64 MiB, video 64/192 MiB, 16384 image/video tokens).
 
 ## Patches
