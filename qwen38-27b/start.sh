@@ -40,6 +40,9 @@
 #     recommends a presence_penalty (1.5 in instruct mode) and a repetition_penalty, but TensorFold has neither
 #     setting (it always decodes as if both were off), so they cannot be set here.
 #   TENSORFOLD_VIDEO_TOKENS (default 16384) and any other TENSORFOLD_* variable are passed to the server.
+#   Our 0005 caches image/video prompts (keyed by the media's hashes), so a chat with images resumes instead of
+#   re-prefilling every turn; our 0006 keeps up to TENSORFOLD_KEEP_MAX (128) prompt states while MemAvailable stays
+#   above TENSORFOLD_KEEP_HEADROOM_GIB (8), the stock 3 always.
 #
 # Config file: .env beside this script, KEY=value lines (# comments, quotes both optional).
 #   Read before the defaults above, so it only changes what it sets; a variable already in the environment
@@ -129,6 +132,8 @@ fi
 
 wrapper=(--tf-name "$NAME" --tf-docker-arg=--ulimit=stack=67108864)
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
+export TENSORFOLD_KEEP_MAX="${TENSORFOLD_KEEP_MAX:-128}"
+export TENSORFOLD_KEEP_HEADROOM_GIB="${TENSORFOLD_KEEP_HEADROOM_GIB:-8}"
 if [[ "$PATCHES" == 1 ]]; then
   wrapper+=(--tf-patches "$SCRIPT_DIR/patches")
   if [[ "$KV_POOL_GB" =~ ^0*([.]0*)?$ ]]; then unset TENSORFOLD_KV_POOL_GIB; else export TENSORFOLD_KV_POOL_GIB="$KV_POOL_GB"; fi
