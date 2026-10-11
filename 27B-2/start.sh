@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Serve the EXL3 pack turboderp/Qwen3.8-27B-exl3 (revision SC_4.00bpw_H5_V6) with the EXL3 DFlash2 drafter
+# Serve anubhav200/Qwen3.8-27B-exl3-4.00bpw-bf16vision (turboderp's EXL3 4.00 bpw pack of Qwen3.8-27B, SC_4.00bpw_H5_V6,
+# plus the official bf16 vision tower and froggeric's v22.5 chat template) with the EXL3 DFlash2 drafter
 # igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw on TensorFold only (./tensorfold.sh, a derived image built from ./patches).
 # Download first:
-#   hf download turboderp/Qwen3.8-27B-exl3 --revision SC_4.00bpw_H5_V6
+#   hf download anubhav200/Qwen3.8-27B-exl3-4.00bpw-bf16vision --local-dir ~/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision
 #   hf download igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw
-# TensorFold has no HF-revision option, so the script resolves the snapshots in the HF cache (mounted into the container).
+# The model folder (MODEL_PATH) is mounted read-only into the container; the drafter is found in the HF cache.
 #
 # Patches (27B-2/patches, applied with tensorfold.sh --tf-patches; 0001-0004 come from ../qwen38-27b):
 #   0001 fp8 KV cache (KV_DTYPE=fp8)  0002 video / bigger media limits  0003 memory reserve below 2 GiB
 #   0004 pinned KV pool               0005 EXL3 drafter loader (decodes the drafter's EXL3 groups to bf16, packs to 4-bit)
+#   0006 faster EXL3 prefill GEMM tiles   0007 image/video prefix cache   0008 elastic kept prompt states (KEEP_MAX)
+#   0009 EXL3 verify kernel shares weight decodes across rows   0010 GB10 drafter GEMM tile   0011 overlapped GDN replay
 #
 # Usage: ./27B-2/start.sh [extra tensorfold serve args]    (appended, so they override the defaults)
 # Env (a .env beside this script is read first; real environment variables win):
-#   MODEL_PATH (/home/gb10/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision: host folder from build_model_dir.sh,
+#   MODEL_PATH (/home/gb10/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision: the downloaded model folder, or one
+#     rebuilt from the upstream repos with build_model_dir.sh;
 #     the EXL3 pack plus vision_bf16.safetensors; mounted read-only at /models/<name>)
 #   MODEL_DIR explicit pack dir inside the container (skips MODEL_PATH)
 #   DRAFT_REPO (igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
@@ -70,7 +74,7 @@ TOP_K="${TOP_K:-20}"
 die() { echo "start-27b-2: $*" >&2; exit 1; }
 
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
-# Resolve a cached revision to its snapshot path inside the container; refuse unfinished downloads.
+# Resolve the drafter's cached snapshot to its path inside the container; refuse unfinished downloads.
 resolve() {
   local repo=$1 rev=$2 dir snap
   dir="$HF_CACHE/hub/models--${repo//\//--}"
@@ -93,11 +97,11 @@ fi
 DRAFT_ARG=""
 if [[ -n "${DRAFT_DIR:-}" ]]; then DRAFT_ARG="$DRAFT_DIR"; elif [[ -n "$DRAFT_REPO" ]]; then DRAFT_ARG="$(resolve "$DRAFT_REPO" refs/main)"; fi
 
-# The pack's own vision tower is EXL3-quantized (6 bits) in the shards, which TensorFold cannot load: serve the same
-# model's full-precision tower from the model folder instead (build_model_dir.sh).
+# The pack's own vision tower is EXL3-quantized (6 bits) in the shards, which TensorFold cannot load: serve the
+# official bf16 tower the model folder carries as vision_bf16.safetensors instead.
 if [[ "$VISION" == 1 && -z "${TENSORFOLD_VISION_WEIGHTS:-}" ]]; then
   [[ -n "$MODEL_MOUNT" ]] || die "VISION=1 with MODEL_DIR: set TENSORFOLD_VISION_WEIGHTS to a container path, or VISION=0"
-  [[ -f "$MODEL_PATH/vision_bf16.safetensors" ]] || die "no $MODEL_PATH/vision_bf16.safetensors: run ./27B-2/build_model_dir.sh"
+  [[ -f "$MODEL_PATH/vision_bf16.safetensors" ]] || die "no $MODEL_PATH/vision_bf16.safetensors: download the model folder again (see the header) or VISION=0"
   export TENSORFOLD_VISION_WEIGHTS="$MODEL_MOUNT/vision_bf16.safetensors"
 fi
 
