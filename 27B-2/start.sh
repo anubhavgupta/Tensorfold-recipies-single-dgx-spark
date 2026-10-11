@@ -17,7 +17,7 @@
 #   TF_VERSION (0.6.6)  PATCHES (1; 0: stock image, which needs KV_DTYPE=bf16, no drafter)
 #   PARALLEL (16) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
 #   MEMORY_RESERVE_GIB (2) CHECKPOINT_SLOTS (empty: TensorFold's default)
-#   VISION (1; needs ./27B-2/convert_vision.sh once) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (32768)
+#   VISION (1; needs ./27B-2/convert_vision.sh once) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (131072: a lower cap can end a thinking reply before it answers)
 #   TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
 #   TENSORFOLD_MAX_BODY_MIB / TENSORFOLD_*  any TENSORFOLD_* variable is passed on
 #   PORT (8888) HOST (0.0.0.0) NAME (tf-27b-2) SERVED_NAME (Qwen3.8-27B) FOREGROUND (0)
@@ -61,7 +61,7 @@ VISION="${VISION:-1}"
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"
 VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-16384}"
 THINKING="${THINKING:-1}"
-MAX_TOKENS="${MAX_TOKENS:-32768}"
+MAX_TOKENS="${MAX_TOKENS:-131072}"
 if [[ "$THINKING" == 1 ]]; then _t=1.0; _p=0.95; else _t=0.7; _p=0.80; fi
 TEMPERATURE="${TEMPERATURE:-$_t}"
 TOP_P="${TOP_P:-$_p}"
