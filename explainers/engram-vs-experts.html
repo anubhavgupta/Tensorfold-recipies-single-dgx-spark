@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram vs experts: what can live on NVMe (DeepSeek-V4.1-Flash)</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --panel2: #1e2230; --ink: #e7e9ee; --dim: #9aa3b5; --line: #2c3243;
+    --eng: #f5b942; --exp: #6aa8ff; --gpu: #5fd38d; --ssd: #ff7a6b; --ram: #b388ff; --n2: #4dd0e1; --n3: #f48fb1; --n4: #aed581;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 28px 32px 8px; max-width: 1180px; margin: auto; }
+  h1 { margin: 0 0 6px; font-size: 26px; }
+  h1 .e { color: var(--eng); } h1 .x { color: var(--exp); }
+  .sub { color: var(--dim); max-width: 900px; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 18px 0 6px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card b { display: block; font-size: 22px; }
+  .card span { color: var(--dim); font-size: 13px; }
+  main { max-width: 1180px; margin: auto; padding: 0 32px 40px; }
+  nav { display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0 12px; }
+  nav button { background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px; cursor: pointer; font: inherit; }
+  nav button.on { background: var(--panel2); border-color: var(--eng); }
+  .scene { display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px 20px; }
+  .scene.on { display: block; }
+  .scene h2 { margin: 0 0 4px; font-size: 20px; }
+  .why { color: var(--dim); margin: 0 0 14px; }
+  .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .controls button { background: var(--eng); color: #111; border: 0; border-radius: 8px; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+  .controls button.alt { background: var(--panel2); color: var(--ink); border: 1px solid var(--line); }
+  .controls label { color: var(--dim); font-size: 13px; }
+  .stage { position: relative; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .caption { min-height: 44px; margin-top: 10px; padding: 10px 12px; background: var(--panel2); border-radius: 8px; border-left: 3px solid var(--eng); }
+  .caption.x { border-left-color: var(--exp); }
+  .tok { display: inline-block; padding: 4px 9px; margin: 3px; border-radius: 6px; background: var(--panel2); border: 1px solid var(--line); transition: all .35s; font-family: ui-monospace, monospace; font-size: 14px; }
+  .tok.cur { border-color: var(--eng); box-shadow: 0 0 0 2px #f5b94255; }
+  .tok.n2 { background: #4dd0e122; border-color: var(--n2); } .tok.n3 { background: #f48fb122; border-color: var(--n3); } .tok.n4 { background: #aed58122; border-color: var(--n4); }
+  .mono { font-family: ui-monospace, monospace; }
+  .meter { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px; font-size: 14px; color: var(--dim); }
+  .meter b { color: var(--ink); }
+  .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; }
+  .fly { position: absolute; border-radius: 4px; transition: left .9s cubic-bezier(.4,0,.2,1), top .9s cubic-bezier(.4,0,.2,1), width .9s, height .9s, opacity .4s; pointer-events: none; z-index: 5; }
+  .box { position: absolute; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 8px 10px; font-size: 13px; }
+  .box h4 { margin: 0 0 4px; font-size: 13px; }
+  .hashgrid { display: grid; grid-template-columns: 70px repeat(8, 1fr); gap: 4px; font-size: 11px; }
+  .hashgrid div { padding: 3px 2px; border-radius: 4px; background: var(--panel2); text-align: center; opacity: .25; transition: opacity .3s, background .3s; font-family: ui-monospace, monospace; }
+  .hashgrid div.lbl { opacity: 1; background: none; text-align: left; color: var(--dim); }
+  .hashgrid div.on { opacity: 1; }
+  .grid384 { display: grid; grid-template-columns: repeat(32, 1fr); gap: 2px; }
+  .grid384 div { aspect-ratio: 1; border-radius: 2px; background: #252a38; transition: background .25s; }
+  .lane { position: relative; height: 34px; margin: 6px 0; background: var(--panel2); border-radius: 6px; overflow: hidden; }
+  .lane .seg { position: absolute; top: 4px; bottom: 4px; border-radius: 4px; font-size: 11px; color: #111; padding: 2px 4px; white-space: nowrap; overflow: hidden; }
+  .lanelbl { font-size: 12px; color: var(--dim); }
+  .cursor { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; opacity: .7; z-index: 3; }
+  table.cmp { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+  table.cmp td, table.cmp th { border-bottom: 1px solid var(--line); padding: 7px 8px; text-align: left; vertical-align: top; }
+  table.cmp th { color: var(--dim); font-weight: 600; }
+  .bar { height: 14px; border-radius: 4px; display: inline-block; vertical-align: middle; }
+  footer { max-width: 1180px; margin: auto; padding: 0 32px 40px; color: var(--dim); font-size: 13px; }
+  a { color: var(--exp); }
+  @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Why the <span class="e">Engram table</span> can live on NVMe but the <span class="x">routed experts</span> can't</h1>
+  <p class="sub">DeepSeek-V4.1-Flash on one DGX Spark (128 GB). Its two Engram layers (1 and 14) hold a 183 GiB phrase-memory
+    table; its routed experts are ~195 GiB at 3 bits. Neither fits in memory with the rest. Five animated scenes show why
+    one of them can sit on a ~4 GB/s SSD at almost no cost and the other cannot.</p>
+  <div class="cards">
+    <div class="card"><b style="color:var(--eng)">12.7 KB</b><span>Engram read per token (48 rows × 264 B)</span></div>
+    <div class="card"><b style="color:var(--exp)">~3.2 GB</b><span>expert weights touched per token (6 × 40 layers × ~13 MB)</span></div>
+    <div class="card"><b style="color:var(--gpu)">~245 GB/s</b><span>memory bandwidth the GPU reads weights at</span></div>
+    <div class="card"><b style="color:var(--ssd)">3.5–5.4 GB/s</b><span>this Spark's NVMe (measured: random 2 MiB / sequential)</span></div>
+  </div>
+</header>
+
+<main>
+  <nav id="nav">
+    <button data-s="s1" class="on">1 · A fact lookup ("…in Paris")</button>
+    <button data-s="s2">2 · The router decides late</button>
+    <button data-s="s3">3 · Prefetch timeline</button>
+    <button data-s="s4">4 · Reading a long prompt</button>
+    <button data-s="s5">5 · Hot phrases stay cached</button>
+    <button data-s="s6">Summary</button>
+  </nav>
+
+  <section class="scene on" id="s1">
+    <h2>Use case 1 · Chat: "The Eiffel Tower is in Paris"</h2>
+    <p class="why">What happens in one Engram layer when the model reaches the token <span class="mono">Paris</span>.
+      The rows it needs are decided by the <b>token ids alone</b>: a hash of the last few tokens.</p>
+    <div class="controls"><button id="s1play">▶ Play</button><label>speed <input id="s1speed" type="range" min="0.5" max="3" step="0.5" value="1"></label></div>
+    <div class="stage" id="s1stage" style="height:470px">
+      <div class="box" style="left:12px;top:12px;width:520px">
+        <h4>1 · tokens → normalised ids (case, accents, spaces folded)</h4>
+        <div id="s1toks"></div>
+        <div id="s1norm" class="mono" style="color:var(--dim);font-size:12.5px;margin-top:4px;opacity:0;transition:opacity .4s"></div>
+      </div>
+      <div class="box" style="left:12px;top:142px;width:520px">
+        <h4>2 · the n-grams ending at "Paris", each hashed by 8 heads → 24 row numbers</h4>
+        <div class="hashgrid" id="s1hash"></div>
+      </div>
+      <div class="box" style="left:546px;top:12px;width:236px;height:446px">
+        <h4 style="color:var(--ssd)">NVMe · Engram table (L1)</h4>
+        <div style="font-size:12px;color:var(--dim)">384 M rows × 264 B = 94.4 GiB<br>24 bucket ranges (3 sizes × 8 heads), ~16 M rows each</div>
+        <div id="s1table" style="position:relative;margin-top:8px;height:362px;border-radius:6px;background:#211b1b;border:1px solid #3a2a2a"></div>
+      </div>
+      <div class="box" style="left:794px;top:12px;width:262px;height:446px">
+        <h4 style="color:var(--gpu)">GPU · layer 1</h4>
+        <div id="s1gpu" style="position:relative;height:250px;border-radius:6px;background:#162119;border:1px solid #234a30"></div>
+        <div id="s1gate" style="margin-top:8px;font-size:12.5px;opacity:.25;transition:opacity .4s">
+          24 rows (24 × 256 values) → <span class="mono">wkv</span> projection → gated by the hidden state
+          (<span class="mono">q_weight</span>/<span class="mono">k_weight</span>) → added to the residual stream.
+        </div>
+      </div>
+      <div class="box" style="left:12px;top:356px;width:520px">
+        <h4>3 · bytes read from NVMe</h4>
+        <div class="meter"><span>rows: <b id="s1rows">0</b> / 24</span><span>layer 1: <b id="s1bytes">0 B</b></span><span>both Engram layers: <b id="s1both">0 B</b></span></div>
+        <div style="font-size:12.5px;color:var(--dim);margin-top:6px">At 3.5 GB/s that is a few microseconds of transfer; issued in parallel it is dominated by one ~0.1 ms SSD latency.</div>
+      </div>
+    </div>
+    <div class="caption" id="s1cap">Press Play.</div>
+  </section>
+
+  <section class="scene" id="s2">
+    <h2>Use case 2 · The same token, now through the experts</h2>
+    <p class="why">Each MoE layer's <b>router</b> scores 384 experts from the hidden state and picks 6. That hidden state only
+      exists once the token has gone through every layer before it, so the read can't start early. Each picked expert is
+      a whole matrix (~13 MB at 3 bpw) and all of it is multiplied.</p>
+    <div class="controls"><button id="s2play">▶ Play</button>
+      <button class="alt" id="s2mode">experts in: NVMe</button>
+      <label>speed <input id="s2speed" type="range" min="0.5" max="4" step="0.5" value="1.5"></label></div>
+    <div class="stage" style="height:430px;padding:14px">
+      <div style="display:grid;grid-template-columns:1.1fr .9fr;gap:18px">
+        <div>
+          <div class="lanelbl">40 layers (the token flows left → right)</div>
+          <div id="s2layers" style="display:grid;grid-template-columns:repeat(20,1fr);gap:4px;margin:6px 0 14px"></div>
+          <div class="lanelbl">this layer's router: 384 experts, 6 picked</div>
+          <div class="grid384" id="s2grid" style="margin-top:6px"></div>
+        </div>
+        <div>
+          <div class="lanelbl">fetching the 6 picked experts (~80 MB) for this layer</div>
+          <div class="lane" style="height:40px"><div class="seg" id="s2bar" style="left:0;width:0;background:var(--exp)"></div></div>
+          <div class="meter"><span>this layer: <b id="s2lay">–</b></span></div>
+          <div class="meter"><span>layers done: <b id="s2done">0</b>/40</span><span>expert bytes: <b id="s2bytes">0</b></span></div>
+          <div class="meter"><span>I/O time for this token: <b id="s2time">0 ms</b></span><span>→ <b id="s2tps">–</b></span></div>
+          <div style="font-size:12.5px;color:var(--dim);margin-top:14px">The animation shows the first layers at a readable
+            pace, then fast-forwards; the timers use the real sizes and bandwidths (RAM 245 GB/s, NVMe 4 GB/s), and ignore
+            compute.</div>
+        </div>
+      </div>
+    </div>
+    <div class="caption x" id="s2cap">Press Play. Toggle where the experts live to compare.</div>
+  </section>
+
+  <section class="scene" id="s3">
+    <h2>Use case 3 · Decoding one token: who waits for whom</h2>
+    <p class="why">Engram rows are known the moment a token is sampled, so their reads start immediately and overlap with
+      compute. Layer 14's lookup even has 13 layers of work to hide behind. Expert reads can only start when the token
+      reaches that layer's router, so the GPU sits idle while they arrive.</p>
+    <div class="controls"><button id="s3play">▶ Play</button>
+      <button class="alt" id="s3mode">experts in: RAM</button></div>
+    <div class="stage" style="padding:14px 16px;height:300px">
+      <div id="s3lanes" style="position:relative">
+        <div class="lanelbl">GPU compute (40 layers; thin bars when the timeline is long)</div><div class="lane" id="s3gpu"></div>
+        <div class="lanelbl" style="color:var(--eng)">Engram reads (NVMe) · layers 1 and 14</div><div class="lane" id="s3eng"></div>
+        <div class="lanelbl" style="color:var(--exp)">Expert reads</div><div class="lane" id="s3exp"></div>
+        <div class="cursor" id="s3cur" style="left:0"></div>
+      </div>
+      <div class="meter"><span>token time: <b id="s3t">–</b></span><span>GPU idle: <b id="s3idle">–</b></span><span><b id="s3tps"></b></span></div>
+    </div>
+    <div class="caption" id="s3cap">Illustrative scale: ~0.4 ms compute per layer; NVMe ~0.1 ms latency and 4 GB/s; RAM 245 GB/s.</div>
+  </section>
+
+  <section class="scene" id="s4">
+    <h2>Use case 4 · Reading a long document (prefill, 4,096-token chunk)</h2>
+    <p class="why">A prompt is processed thousands of tokens at a time. Every token adds its own 48 small Engram rows, but
+      together the tokens pick nearly <b>every</b> expert in every layer, so the whole expert set would have to be read for
+      each chunk.</p>
+    <div class="controls"><button id="s4play">▶ Play</button></div>
+    <div class="stage" style="padding:14px;height:390px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px">
+        <div>
+          <div class="lanelbl" style="color:var(--eng)">Engram rows read for the chunk</div>
+          <div class="lane" style="height:40px"><div class="seg" id="s4eb" style="left:0;width:0;background:var(--eng)"></div></div>
+          <div class="meter"><span>tokens: <b id="s4tok">0</b></span><span>rows: <b id="s4rows">0</b></span><span>bytes: <b id="s4eB">0</b></span></div>
+          <div style="font-size:12.5px;color:var(--dim);margin-top:10px">4,096 × 48 rows × 264 B ≈ 52 MB, about 13 ms at
+            4 GB/s, and it can stream in while the chunk computes.</div>
+        </div>
+        <div>
+          <div class="lanelbl" style="color:var(--exp)">Experts touched in one layer (of 384)</div>
+          <div class="grid384" id="s4grid" style="margin-top:6px"></div>
+          <div class="meter"><span>touched: <b id="s4touch">0</b>/384</span><span>whole model: <b id="s4xB">0</b></span></div>
+          <div style="font-size:12.5px;color:var(--dim);margin-top:6px">With 4,096 tokens × 6 picks, the chance a given expert is
+            never picked is (1−6/384)<sup>4096</sup> ≈ 10<sup>−28</sup>. Reading ~195 GiB of experts from NVMe takes
+            ~50 s per chunk, against a few seconds of compute.</div>
+        </div>
+      </div>
+    </div>
+    <div class="caption x" id="s4cap">Press Play.</div>
+  </section>
+
+  <section class="scene" id="s5">
+    <h2>Use case 5 · Coding and everyday text: hot phrases stay in RAM</h2>
+    <p class="why">N-grams follow a long-tail distribution: <span class="mono">in the</span>, <span class="mono">of the</span>,
+      <span class="mono">import numpy as</span>, <span class="mono">def __init__(self</span> come up constantly. The OS page
+      cache keeps their rows in spare RAM, so most lookups never reach the SSD. Rare phrases cost one small read.</p>
+    <div class="controls"><button id="s5play">▶ Play</button></div>
+    <div class="stage" style="padding:14px;height:330px">
+      <div id="s5text" class="mono" style="font-size:14px;line-height:2.1;min-height:200px"></div>
+      <div class="meter"><span><span class="sw" style="background:var(--ram)"></span>page-cache hits: <b id="s5hit">0</b></span>
+        <span><span class="sw" style="background:var(--ssd)"></span>SSD reads: <b id="s5miss">0</b></span><span>hit rate: <b id="s5rate">–</b></span></div>
+      <div style="font-size:12.5px;color:var(--dim);margin-top:8px">Illustrative: a phrase counts as "hot" once it has been
+        seen before in this stream, plus a small built-in list of very common phrases. Real hit rates depend on the text
+        and on how much RAM is free.</div>
+    </div>
+    <div class="caption" id="s5cap">Press Play.</div>
+  </section>
+
+  <section class="scene" id="s6">
+    <h2>Summary</h2>
+    <table class="cmp">
+      <tr><th></th><th style="color:var(--eng)">Engram table</th><th style="color:var(--exp)">Routed experts</th></tr>
+      <tr><td>What decides what is read</td><td>A hash of the last 2–4 token ids</td><td>The router, from the hidden state at that layer</td></tr>
+      <tr><td>Known when</td><td>As soon as the token exists, so it can be prefetched</td><td>Only when the token reaches that layer</td></tr>
+      <tr><td>Read per token</td><td>48 rows × 264 B = <b>12.7 KB</b> <span class="bar" style="width:2px;background:var(--eng)"></span></td>
+        <td>6 × 40 × ~13 MB ≈ <b>3.2 GB</b> <span class="bar" style="width:260px;background:var(--exp)"></span></td></tr>
+      <tr><td>Work on the data</td><td>Copy a row (a lookup)</td><td>Full matrix multiply</td></tr>
+      <tr><td>Prompt chunk (4,096 tokens)</td><td>~52 MB</td><td>~all 195 GiB</td></tr>
+      <tr><td>Caching</td><td>Long-tailed, so the page cache keeps hot phrases</td><td>Spread out; caching helps less</td></tr>
+      <tr><td>From NVMe</td><td><b style="color:var(--gpu)">Effectively free</b></td><td><b style="color:var(--ssd)">~1 tok/s</b> without caching</td></tr>
+    </table>
+    <p class="why" style="margin-top:14px">Rule of thumb: anything you can <b>look up</b> and <b>predict ahead of time</b>
+      (Engram tables, Qwen3.8-Flash-Next's n-gram embedding, Gemma's per-layer embeddings) can live on SSD. Anything you
+      must <b>multiply in full</b> and only <b>learn about at the last moment</b> (MoE experts) needs to be in memory to be fast.</p>
+  </section>
+</main>
+
+<footer>
+  Numbers: <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a>
+  config.json, safetensors headers and <span class="mono">inference/engram.py</span> (Engram at layers 1 and 14, 2–4-gram
+  hashing over a 99,092-entry normalised vocabulary, 8 heads, 256-dim fp8 rows + 8 scales, 384 M rows per layer; 384
+  routed experts, 6 per token, 40 layers); expert size from 3.0 bpw EXL3 packs (13.3 MB per expert);
+  NVMe speeds measured on this DGX Spark. Row numbers in scene 1 come from a simplified hash for illustration; the real one
+  uses per-layer multipliers and prime-sized buckets. Timings in scenes 2–4 are estimates from sizes and bandwidths, not
+  benchmarks.
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmtB = b => b < 1e3 ? b.toFixed(0) + ' B' : b < 1e6 ? (b / 1e3).toFixed(1) + ' KB' : b < 1e9 ? (b / 1e6).toFixed(1) + ' MB' : (b / 1e9).toFixed(1) + ' GB';   // decimal units
+const run = {};   // per-scene run tokens: a replay cancels the previous run
+
+document.querySelectorAll('#nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.scene').forEach(s => s.classList.toggle('on', s.id === b.dataset.s));
+});
+
+// ---------- Scene 1: one Engram lookup ----------
+const WORDS = ['The', ' Eiffel', ' Tower', ' is', ' in', ' Paris'];
+const COLORS = { 2: 'var(--n2)', 3: 'var(--n3)', 4: 'var(--n4)' };
+function hashRow(ngram, n, head) {      // illustrative FNV-style hash into a ~16M-row bucket range
+  let h = 2166136261 ^ (n * 131 + head * 7919);
+  for (const ch of ngram.toLowerCase()) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
+  return h % 15999989;
+}
+function s1reset() {
+  $('s1toks').innerHTML = WORDS.map((w, i) => `<span class="tok" id="t${i}">${w.replace(' ', '␣')}</span>`).join('');
+  $('s1norm').style.opacity = 0;
+  let g = '<div class="lbl"></div>' + [...Array(8)].map((_, h) => `<div class="lbl" style="text-align:center">head ${h}</div>`).join('');
+  for (const n of [2, 3, 4]) {
+    g += `<div class="lbl" style="color:${COLORS[n]}">${n}-gram</div>`;
+    for (let h = 0; h < 8; h++) g += `<div id="h${n}${h}">–</div>`;
+  }
+  $('s1hash').innerHTML = g;
+  const t = $('s1table'); t.innerHTML = '';
+  for (let s = 0; s < 24; s++) {
+    const d = document.createElement('div');
+    d.style.cssText = `position:absolute;left:0;right:0;top:${s * 15}px;height:15px;border-bottom:1px solid #3a2a2a;font-size:9px;color:#7a5a55;padding-left:4px`;
+    d.textContent = `${[2, 3, 4][Math.floor(s / 8)]}-gram h${s % 8}`;
+    t.appendChild(d);
+  }
+  $('s1gpu').innerHTML = ''; $('s1gate').style.opacity = .25;
+  $('s1rows').textContent = 0; $('s1bytes').textContent = '0 B'; $('s1both').textContent = '0 B';
+  document.querySelectorAll('#s1stage .fly').forEach(e => e.remove());
+}
+async function s1play() {
+  const me = run.s1 = {}; const sp = () => 1 / +$('s1speed').value;
+  const W = async ms => { await sleep(ms * sp()); if (run.s1 !== me) throw 0; };
+  s1reset();
+  const cap = t => $('s1cap').innerHTML = t;
+  try {
+    cap('The model has just produced the token <b>Paris</b>. Before any layer runs, the Engram lookup can already be worked out from the token ids.');
+    $('t5').classList.add('cur'); await W(1200);
+    $('s1norm').textContent = '→ the · eiffel · tower · is · in · paris (99,092-id vocabulary)';
+    $('s1norm').style.opacity = 1;
+    cap('Tokens are folded to a smaller vocabulary first, so <span class="mono">Paris</span>, <span class="mono">paris</span> and <span class="mono">PARIS</span> look the same.'); await W(1500);
+    const stage = $('s1stage'), sr = stage.getBoundingClientRect(), tr = $('s1table').getBoundingClientRect(), gr = $('s1gpu').getBoundingClientRect();
+    let rows = 0;
+    for (const n of [2, 3, 4]) {
+      document.querySelectorAll('#s1toks .tok').forEach(e => e.classList.remove('n2', 'n3', 'n4'));
+      for (let i = 6 - n; i < 6; i++) $('t' + i).classList.add('n' + n);
+      const gram = WORDS.slice(6 - n).join('').trim();
+      cap(`<b style="color:${COLORS[n]}">${n}-gram</b> "${gram}": hashed 8 times (one per head, each with its own multiplier and its own prime-sized range of ~16 M rows).`);
+      await W(700);
+      for (let h = 0; h < 8; h++) {
+        const row = hashRow(gram, n, h), cell = $('h' + n + h);
+        cell.textContent = (row / 1e6).toFixed(2) + 'M'; cell.classList.add('on');
+        cell.style.boxShadow = `inset 0 0 0 1px ${COLORS[n]}`;
+        const seg = (n - 2) * 8 + h, y = tr.top - sr.top + seg * 15 + 3, x = tr.left - sr.left + 60 + (row / 16e6) * (tr.width - 90);
+        const dot = document.createElement('div'); dot.className = 'fly';
+        dot.style.cssText += `left:${x}px;top:${y}px;width:22px;height:9px;background:${COLORS[n]};box-shadow:0 0 8px ${COLORS[n]}`;
+        stage.appendChild(dot); await W(130);
+        const gx = gr.left - sr.left + 8 + (rows % 6) * 39, gy = gr.top - sr.top + 8 + Math.floor(rows / 6) * 60;
+        dot.style.left = gx + 'px'; dot.style.top = gy + 'px'; dot.style.width = '33px'; dot.style.height = '52px';
+        rows++; $('s1rows').textContent = rows; $('s1bytes').textContent = fmtB(rows * 264); $('s1both').textContent = fmtB(rows * 264 * 2);
+        await W(170);
+      }
+      await W(500);
+    }
+    cap('24 rows × 264 B = <b>6.3 KB</b> for this layer; layer 14 does the same with its own table, so <b>12.7 KB per token</b> in total, out of a 183 GiB table. That is why the table can sit on the SSD.');
+    $('s1gate').style.opacity = 1; await W(2600);
+    cap('Then the GPU projects the 24 rows, gates them against the hidden state and adds them in. The read itself needed nothing from the model, just the token ids, so it can start before the forward pass does.');
+  } catch (e) { }
+}
+$('s1play').onclick = s1play; s1reset();
+
+// ---------- Scene 2: experts, decided by the router ----------
+let s2nvme = true;
+$('s2mode').onclick = () => { s2nvme = !s2nvme; $('s2mode').textContent = 'experts in: ' + (s2nvme ? 'NVMe' : 'RAM'); };
+function s2reset() {
+  $('s2layers').innerHTML = [...Array(40)].map((_, i) => `<div id="L${i}" style="height:22px;border-radius:4px;background:#252a38;font-size:9px;text-align:center;color:#556;line-height:22px">${i}</div>`).join('');
+  $('s2grid').innerHTML = [...Array(384)].map((_, i) => `<div id="e${i}"></div>`).join('');
+  $('s2bar').style.width = 0; ['s2lay', 's2tps'].forEach(i => $(i).textContent = '–');
+  $('s2done').textContent = 0; $('s2bytes').textContent = '0'; $('s2time').textContent = '0 ms';
+}
+async function s2play() {
+  const me = run.s2 = {}; const sp = () => 1 / +$('s2speed').value;
+  const W = async ms => { await sleep(ms * sp()); if (run.s2 !== me) throw 0; };
+  s2reset(); const nv = s2nvme, bw = nv ? 4e9 : 245e9, per = 6 * 13.3e6, cap = t => $('s2cap').innerHTML = t;
+  let total = 0, bytes = 0;
+  try {
+    cap(`Experts in <b>${nv ? 'NVMe' : 'RAM'}</b>. The token enters layer 0; only when a layer's router runs do we learn which 6 experts it needs.`);
+    for (let L = 0; L < 40; L++) {
+      const fast = L >= 6;
+      $('L' + L).style.background = 'var(--gpu)'; $('L' + L).style.color = '#111';
+      document.querySelectorAll('#s2grid div').forEach(d => d.style.background = '#252a38');
+      if (!fast) { cap(`Layer ${L}: the router scores 384 experts from this token's hidden state…`); await W(500); }
+      const pick = new Set(); while (pick.size < 6) pick.add(Math.floor(Math.random() * 384));
+      pick.forEach(i => $('e' + i).style.background = 'var(--exp)');
+      const t = per / bw * 1000; total += t; bytes += per;
+      $('s2lay').textContent = `${fmtB(per)} in ${t.toFixed(t < 1 ? 2 : 1)} ms`;
+      const steps = fast ? 4 : 18;
+      for (let s = 1; s <= steps; s++) { $('s2bar').style.width = (s / steps * 100) + '%'; await W(fast ? 10 : (nv ? 70 : 12)); }
+      if (!fast) { cap(`Layer ${L}: 6 experts picked → read ${fmtB(per)} of weights ${nv ? 'from the SSD while the GPU waits' : 'from memory'} (${t.toFixed(t < 1 ? 2 : 1)} ms).`); await W(700); }
+      $('L' + L).style.background = nv ? 'var(--ssd)' : 'var(--exp)';
+      $('s2done').textContent = L + 1; $('s2bytes').textContent = fmtB(bytes); $('s2time').textContent = total.toFixed(1) + ' ms';
+      $('s2tps').textContent = (1000 / total).toFixed(1) + ' tok/s ceiling';
+    }
+    cap(nv ? `<b>${fmtB(bytes)}</b> read for one token: <b>${total.toFixed(0)} ms</b> of I/O alone, about <b>${(1000 / total).toFixed(1)} tok/s</b>, and none of it could start early. Toggle to RAM to compare.`
+           : `<b>${fmtB(bytes)}</b> per token from memory: <b>${total.toFixed(1)} ms</b>, so the I/O ceiling is about ${(1000 / total).toFixed(0)} tok/s (compute then dominates). Toggle to NVMe to compare.`);
+  } catch (e) { }
+}
+$('s2play').onclick = s2play; s2reset();
+
+// ---------- Scene 3: decode timeline ----------
+let s3nvme = false;
+$('s3mode').onclick = () => { s3nvme = !s3nvme; $('s3mode').textContent = 'experts in: ' + (s3nvme ? 'NVMe' : 'RAM'); };
+async function s3play() {
+  const me = run.s3 = {}; const nv = s3nvme;
+  const comp = 0.4, engLat = 0.12, expT = 6 * 13.3e6 / (nv ? 4e9 : 245e9) * 1000;
+  const gpu = [], exp = [], eng = [{ s: 0, e: engLat }, { s: 0, e: engLat }];
+  let t = 0, idle = 0;
+  for (let L = 0; L < 40; L++) {
+    if (L === 1 && t < engLat) { idle += engLat - t; t = engLat; }   // never happens: layer 0 already takes longer
+    exp.push({ s: t, e: t + expT });
+    if (nv) { idle += expT; t += expT; } else t += expT;            // experts are needed right after the router
+    gpu.push({ s: t, e: t + comp, L }); t += comp;
+  }
+  const T = t, Wd = $('s3gpu').clientWidth, x = v => v / T * Wd;
+  ['s3gpu', 's3eng', 's3exp'].forEach(id => $(id).innerHTML = '');
+  const draw = (id, seg, col, lbl) => { const d = document.createElement('div'); d.className = 'seg';
+    d.style.cssText += `left:${x(seg.s)}px;width:${Math.max(3, x(seg.e) - x(seg.s))}px;background:${col};opacity:0`; d.textContent = lbl || ''; $(id).appendChild(d); return d; };
+  const items = [];
+  eng.forEach((s, i) => { const d = draw('s3eng', s, 'var(--eng)'); d.style.top = (4 + i * 13) + 'px'; d.style.bottom = 'auto'; d.style.height = '11px'; items.push([s.s, d]); });
+  exp.forEach(s => items.push([s.s, draw('s3exp', s, nv ? 'var(--ssd)' : 'var(--exp)')]));
+  gpu.forEach(s => items.push([s.s, draw('s3gpu', s, 'var(--gpu)', s.L % 5 === 0 ? 'L' + s.L : '')]));
+  items.sort((a, b) => a[0] - b[0]);
+  $('s3t').textContent = '–'; $('s3idle').textContent = '–'; $('s3tps').textContent = '';
+  $('s3cap').innerHTML = nv ? 'Experts on <b>NVMe</b>: each layer must wait for its experts after the router runs, so the red bars push the green ones apart.'
+                            : 'Experts in <b>RAM</b>, Engram on <b>NVMe</b>: both Engram reads start at t = 0 and finish long before they are needed, so the GPU never waits for them.';
+  const dur = 3200, t0 = performance.now(); let k = 0;
+  while (true) {
+    if (run.s3 !== me) return;
+    const f = Math.min(1, (performance.now() - t0) / dur), now = f * T;
+    $('s3cur').style.left = x(now) + 'px';
+    while (k < items.length && items[k][0] <= now) { items[k][1].style.opacity = 1; k++; }
+    if (f >= 1) break; await sleep(16);
+  }
+  $('s3t').textContent = T.toFixed(1) + ' ms'; $('s3idle').textContent = idle.toFixed(1) + ' ms (' + (idle / T * 100).toFixed(0) + '%)';
+  $('s3tps').textContent = '≈ ' + (1000 / T).toFixed(1) + ' tok/s';
+  $('s3cap').innerHTML += nv ? ' The Engram reads still cost nothing; the expert waits are the whole problem.' : ' Toggle to NVMe to see what happens if the experts are offloaded instead.';
+}
+$('s3play').onclick = s3play;
+
+// ---------- Scene 4: prefill chunk ----------
+async function s4play() {
+  const me = run.s4 = {};
+  $('s4grid').innerHTML = [...Array(384)].map((_, i) => `<div id="p${i}"></div>`).join('');
+  const hit = new Uint8Array(384); let touched = 0, said = false;
+  $('s4cap').innerHTML = 'Tokens of the chunk arrive; each adds 48 Engram rows and picks 6 experts per layer.';
+  for (let tok = 0; tok <= 4096; tok += 32) {
+    if (run.s4 !== me) return;
+    for (let j = 0; j < 32 * 6; j++) { const e = Math.floor(Math.random() * 384); if (!hit[e]) { hit[e] = 1; touched++; $('p' + e).style.background = 'var(--exp)'; } }
+    $('s4tok').textContent = tok.toLocaleString(); $('s4rows').textContent = (tok * 48).toLocaleString();
+    $('s4eB').textContent = fmtB(tok * 48 * 264); $('s4eb').style.width = (tok / 4096 * 100) + '%';
+    $('s4touch').textContent = touched; $('s4xB').textContent = (touched / 384 * 195).toFixed(0) + ' GiB';
+    if (touched > 376 && !said) { said = true; $('s4cap').innerHTML = `After only <b>${tok}</b> tokens, almost every expert in the layer has already been picked.`; }
+    await sleep(40);
+  }
+  $('s4cap').innerHTML = 'Whole chunk: <b style="color:var(--eng)">~52 MB of Engram rows</b> (tiny, readable in parallel) against <b style="color:var(--exp)">~195 GiB of expert weights</b>, all of them needed. From NVMe that is ~50 s of reading per 4,096 tokens.';
+}
+$('s4play').onclick = s4play;
+
+// ---------- Scene 5: page cache ----------
+const S5 = ['import numpy as np', 'import torch', 'from torch import nn', 'class Model(nn.Module):', 'def __init__(self, dim):',
+  'super().__init__()', 'self.proj = nn.Linear(dim, dim)', 'def forward(self, x):', 'return self.proj(x)',
+  'in the middle of the night', 'one of the most important', 'at the end of the day', 'import numpy as np',
+  'def __init__(self, dim):', 'the quokka of Rottnest Island', 'return self.proj(x)', 'in the middle of the',
+  'one of the best', 'for i in range(10):', 'for i in range(n):', 'Zygomorphic flowers of Lamiaceae'];
+const COMMON = ['import numpy', 'numpy as', 'as np', 'in the', 'of the', 'one of', 'the most', 'at the', 'the end', 'end of',
+  'def __init__', '__init__(self', 'for i', 'i in', 'in range', 'self.proj', 'return self', 'from torch', 'import torch', 'the middle', 'middle of'];
+async function s5play() {
+  const me = run.s5 = {}; const seen = new Set(); let hit = 0, miss = 0; $('s5text').innerHTML = '';
+  $('s5cap').innerHTML = 'Each word is underlined by where its 2-gram row came from: RAM page cache (purple) or a read from the SSD (red).';
+  for (const line of S5) {
+    const words = line.split(/(?<=[ .(])/).filter(Boolean); const div = document.createElement('div'); $('s5text').appendChild(div);
+    if ($('s5text').children.length > 7) $('s5text').firstChild.remove();
+    for (let i = 0; i < words.length; i++) {
+      if (run.s5 !== me) return;
+      const key = (i ? words[i - 1] + words[i] : words[i]).replace(/\s+/g, ' ').trim().toLowerCase();
+      const hot = seen.has(key) || COMMON.some(c => key.startsWith(c));
+      seen.add(key); hot ? hit++ : miss++;
+      const s = document.createElement('span'); s.textContent = words[i];
+      s.style.cssText = `border-bottom:3px solid ${hot ? 'var(--ram)' : 'var(--ssd)'};padding:0 1px;margin-right:1px`;
+      div.appendChild(s); $('s5hit').textContent = hit; $('s5miss').textContent = miss;
+      $('s5rate').textContent = (hit / (hit + miss) * 100).toFixed(0) + '%';
+      await sleep(110);
+    }
+  }
+  $('s5cap').innerHTML = 'Repeated code and common phrases hit the page cache; rare phrases ("quokka", "Zygomorphic") go to the SSD, each for one small read. Experts don\'t get this benefit: each token\'s 6 picks per layer are spread across 384 large matrices.';
+}
+$('s5play').onclick = s5play;
+</script>
+</body>
+</html>
