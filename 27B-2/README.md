@@ -13,7 +13,7 @@ PARALLEL=1 ./27B-2/start.sh # best single-stream decode ("wide" draft trees)
 ./27B-2/end.sh
 ```
 
-Knobs (env): `PARALLEL` (16), `CONTEXT` (262144), `KV_DTYPE` (fp8), `VISION` (1), `VISION_MAX_IMAGES` (50),
+Knobs (env): `PARALLEL` (9: about as many full 262K-token streams as fit; 16 for many short requests), `CONTEXT` (262144), `KV_DTYPE` (fp8), `VISION` (1), `VISION_MAX_IMAGES` (50),
 `THINKING` (1), `TENSORFOLD_KEEP_MAX` (128), `TENSORFOLD_KEEP_HEADROOM_GIB` (8), `MEMORY_RESERVE_GIB`, `CHECKPOINT_SLOTS`.
 Media limits as in flash-2 (body 192 MiB, images 64 MiB, video 64/192 MiB, 16384 image/video tokens).
 
@@ -69,7 +69,7 @@ rows share one decode (32 rows 222-247 us, 48 rows 222 us, 64 rows 343 us), and 
 | 12 | - | 200 | - | 277 |
 | 16 | - | 214 | - | 293 |
 
-(Aggregate; per-stream speed is aggregate / streams. 12 and 16 streams need `PARALLEL=16`, now the default; a lone stream
+(Aggregate; per-stream speed is aggregate / streams. 12 and 16 streams need `PARALLEL=16` (the default is 9: only 8-9 full 262K-token streams fit in memory, ~7.8 GiB each); a lone stream
 is as fast at 16 as at 8.)
 
 ### What limits it now (16 streams, ~60 verify rows a round, ~190 ms a round)
