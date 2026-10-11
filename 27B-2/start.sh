@@ -17,7 +17,7 @@
 #   TF_VERSION (0.6.6)  PATCHES (1; 0: stock image, which needs KV_DTYPE=bf16, no drafter)
 #   PARALLEL (16) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
 #   MEMORY_RESERVE_GIB (2) CHECKPOINT_SLOTS (empty: TensorFold's default)
-#   VISION (1; needs ./27B-2/convert_vision.sh once) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (131072: a lower cap can end a thinking reply before it answers)
+#   VISION (1; needs ./27B-2/convert_vision.sh once) VISION_TOWER (bf16: full-precision tower; exl3: the pack's 6-bit one) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (131072: a lower cap can end a thinking reply before it answers)
 #   TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
 #   TENSORFOLD_MAX_BODY_MIB / TENSORFOLD_*  any TENSORFOLD_* variable is passed on
 #   PORT (8888) HOST (0.0.0.0) NAME (tf-27b-2) SERVED_NAME (Qwen3.8-27B) FOREGROUND (0)
@@ -85,10 +85,16 @@ if [[ -n "${MODEL_DIR:-}" ]]; then MODEL_ARG="$MODEL_DIR"; else MODEL_ARG="$(res
 DRAFT_ARG=""
 if [[ -n "${DRAFT_DIR:-}" ]]; then DRAFT_ARG="$DRAFT_DIR"; elif [[ -n "$DRAFT_REPO" ]]; then DRAFT_ARG="$(resolve "$DRAFT_REPO" refs/main)"; fi
 
-# The pack's vision tower is EXL3-quantized in the shards; convert_vision.sh makes the floating tower TensorFold loads.
+# The pack's vision tower is EXL3-quantized (6 bits) in the shards. VISION_TOWER=bf16 (default) uses the same model's
+# full-precision tower instead (copied from Vontra/Qwen3.8-27B-MLX-4bit); exl3 the pack's own, converted to fp16.
 if [[ "$VISION" == 1 && -z "${TENSORFOLD_VISION_WEIGHTS:-}" ]]; then
-  [[ -f "$HF_CACHE/vision-f16-27b.safetensors" ]] || die "run ./27B-2/convert_vision.sh once first (or VISION=0)"
-  export TENSORFOLD_VISION_WEIGHTS=/root/.cache/huggingface/vision-f16-27b.safetensors
+  case "${VISION_TOWER:-bf16}" in
+    bf16) vfile=vision-bf16-27b.safetensors ;;
+    exl3) vfile=vision-f16-27b.safetensors ;;
+    *) die "VISION_TOWER must be bf16 or exl3" ;;
+  esac
+  [[ -f "$HF_CACHE/$vfile" ]] || die "run ./27B-2/convert_vision.sh ${VISION_TOWER:-bf16} once first (or VISION=0)"
+  export TENSORFOLD_VISION_WEIGHTS=/root/.cache/huggingface/$vfile
 fi
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then

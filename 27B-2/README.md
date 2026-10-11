@@ -5,7 +5,8 @@
 - TensorFold only (no TabbyAPI). A derived image is built from `patches/*.patch` (`--tf-patches`), rebuilt when they change.
 
 ```bash
-./27B-2/convert_vision.sh   # once: the pack's vision tower is EXL3-quantized; writes ~/.cache/huggingface/vision-f16-27b.safetensors
+./27B-2/convert_vision.sh   # once: the full-precision bf16 vision tower (copied from Vontra/Qwen3.8-27B-MLX-4bit) -> ~/.cache/huggingface/vision-bf16-27b.safetensors
+./27B-2/convert_vision.sh exl3   # optional: the pack's own 6-bit EXL3 tower as fp16 (VISION_TOWER=exl3)
 ./27B-2/start.sh            # port 8888, container tf-27b-2
 PARALLEL=1 ./27B-2/start.sh # best single-stream decode ("wide" draft trees)
 ./27B-2/end.sh
