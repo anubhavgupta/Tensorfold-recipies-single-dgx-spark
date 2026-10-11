@@ -5,8 +5,9 @@
 - TensorFold only (no TabbyAPI). A derived image is built from `patches/*.patch` (`--tf-patches`), rebuilt when they change.
 
 ```bash
-./27B-2/build_model_dir.sh  # once: ~/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision = the EXL3 pack + vision_bf16.safetensors
-                            # (the same model's full-precision vision tower, copied unchanged from Vontra/Qwen3.8-27B-MLX-4bit)
+hf download anubhav200/Qwen3.8-27B-exl3-4.00bpw-bf16vision --local-dir ~/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision
+                            # once: the published model folder (the EXL3 pack + the official bf16 vision tower);
+                            # or rebuild it from the upstream repos with ./27B-2/build_model_dir.sh
 ./27B-2/start.sh            # port 8888, container tf-27b-2
 PARALLEL=1 ./27B-2/start.sh # best single-stream decode ("wide" draft trees)
 ./27B-2/end.sh

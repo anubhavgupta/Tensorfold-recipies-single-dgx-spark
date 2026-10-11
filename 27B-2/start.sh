@@ -86,7 +86,7 @@ MODEL_MOUNT=""
 if [[ -n "${MODEL_DIR:-}" ]]; then
   MODEL_ARG="$MODEL_DIR"
 else
-  [[ -f "$MODEL_PATH/model.safetensors.index.json" ]] || die "no model in $MODEL_PATH: run ./27B-2/build_model_dir.sh once"
+  [[ -f "$MODEL_PATH/model.safetensors.index.json" ]] || die "no model in $MODEL_PATH: hf download anubhav200/Qwen3.8-27B-exl3-4.00bpw-bf16vision --local-dir $MODEL_PATH (or ./27B-2/build_model_dir.sh)"
   MODEL_MOUNT="/models/$(basename "$MODEL_PATH")"
   MODEL_ARG="$MODEL_MOUNT"
 fi
