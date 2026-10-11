@@ -12,12 +12,14 @@
 #
 # Usage: ./27B-2/start.sh [extra tensorfold serve args]    (appended, so they override the defaults)
 # Env (a .env beside this script is read first; real environment variables win):
-#   REPO (turboderp/Qwen3.8-27B-exl3) REVISION (SC_4.00bpw_H5_V6)  MODEL_DIR explicit pack dir (skips the cache lookup)
+#   MODEL_PATH (/home/gb10/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision: host folder from build_model_dir.sh,
+#     the EXL3 pack plus vision_bf16.safetensors; mounted read-only at /models/<name>)
+#   MODEL_DIR explicit pack dir inside the container (skips MODEL_PATH)
 #   DRAFT_REPO (igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
 #   TF_VERSION (0.6.6)  PATCHES (1; 0: stock image, which needs KV_DTYPE=bf16, no drafter)
 #   PARALLEL (16) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
 #   MEMORY_RESERVE_GIB (2) CHECKPOINT_SLOTS (empty: TensorFold's default)
-#   VISION (1; needs ./27B-2/convert_vision.sh once) VISION_TOWER (bf16: full-precision tower; exl3: the pack's 6-bit one) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (131072: a lower cap can end a thinking reply before it answers)
+#   VISION (1; needs MODEL_PATH/vision_bf16.safetensors) VISION_MAX_IMAGES (50) VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (131072: a lower cap can end a thinking reply before it answers)
 #   TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
 #   TENSORFOLD_MAX_BODY_MIB / TENSORFOLD_*  any TENSORFOLD_* variable is passed on
 #   PORT (8888) HOST (0.0.0.0) NAME (tf-27b-2) SERVED_NAME (Qwen3.8-27B) FOREGROUND (0)
@@ -40,8 +42,6 @@ if [[ -f "$ENV_FILE" ]]; then
   done < "$ENV_FILE"
 fi
 
-REPO="${REPO:-turboderp/Qwen3.8-27B-exl3}"
-REVISION="${REVISION:-SC_4.00bpw_H5_V6}"
 DRAFT_REPO="${DRAFT_REPO-igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw}"
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-27B}"
 HOST="${HOST:-0.0.0.0}"
@@ -81,20 +81,24 @@ resolve() {
   [[ -z "$(find "$dir/blobs" -name '*.incomplete' -print -quit)" ]] || die "$repo: download still in progress (*.incomplete blobs)"
   echo "/root/.cache/huggingface/hub/models--${repo//\//--}/snapshots/$snap"
 }
-if [[ -n "${MODEL_DIR:-}" ]]; then MODEL_ARG="$MODEL_DIR"; else MODEL_ARG="$(resolve "$REPO" "$REVISION")"; fi
+MODEL_PATH="${MODEL_PATH:-/home/gb10/projects/models/Qwen3.8-27B-exl3-4.00bpw-bf16vision}"
+MODEL_MOUNT=""
+if [[ -n "${MODEL_DIR:-}" ]]; then
+  MODEL_ARG="$MODEL_DIR"
+else
+  [[ -f "$MODEL_PATH/model.safetensors.index.json" ]] || die "no model in $MODEL_PATH: run ./27B-2/build_model_dir.sh once"
+  MODEL_MOUNT="/models/$(basename "$MODEL_PATH")"
+  MODEL_ARG="$MODEL_MOUNT"
+fi
 DRAFT_ARG=""
 if [[ -n "${DRAFT_DIR:-}" ]]; then DRAFT_ARG="$DRAFT_DIR"; elif [[ -n "$DRAFT_REPO" ]]; then DRAFT_ARG="$(resolve "$DRAFT_REPO" refs/main)"; fi
 
-# The pack's vision tower is EXL3-quantized (6 bits) in the shards. VISION_TOWER=bf16 (default) uses the same model's
-# full-precision tower instead (copied from Vontra/Qwen3.8-27B-MLX-4bit); exl3 the pack's own, converted to fp16.
+# The pack's own vision tower is EXL3-quantized (6 bits) in the shards, which TensorFold cannot load: serve the same
+# model's full-precision tower from the model folder instead (build_model_dir.sh).
 if [[ "$VISION" == 1 && -z "${TENSORFOLD_VISION_WEIGHTS:-}" ]]; then
-  case "${VISION_TOWER:-bf16}" in
-    bf16) vfile=vision-bf16-27b.safetensors ;;
-    exl3) vfile=vision-f16-27b.safetensors ;;
-    *) die "VISION_TOWER must be bf16 or exl3" ;;
-  esac
-  [[ -f "$HF_CACHE/$vfile" ]] || die "run ./27B-2/convert_vision.sh ${VISION_TOWER:-bf16} once first (or VISION=0)"
-  export TENSORFOLD_VISION_WEIGHTS=/root/.cache/huggingface/$vfile
+  [[ -n "$MODEL_MOUNT" ]] || die "VISION=1 with MODEL_DIR: set TENSORFOLD_VISION_WEIGHTS to a container path, or VISION=0"
+  [[ -f "$MODEL_PATH/vision_bf16.safetensors" ]] || die "no $MODEL_PATH/vision_bf16.safetensors: run ./27B-2/build_model_dir.sh"
+  export TENSORFOLD_VISION_WEIGHTS="$MODEL_MOUNT/vision_bf16.safetensors"
 fi
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
@@ -123,6 +127,7 @@ if [[ "$KV_POOL_GB" == auto ]]; then
 fi
 
 wrapper=(--tf-name "$NAME" --tf-version "$TF_VERSION" --tf-docker-arg=--ulimit=stack=67108864)
+[[ -z "$MODEL_MOUNT" ]] || wrapper+=(--tf-docker-arg="--volume=$MODEL_PATH:$MODEL_MOUNT:ro")
 if [[ "$PATCHES" == 1 ]]; then
   wrapper+=(--tf-patches "$SCRIPT_DIR/patches")
   if [[ "$KV_POOL_GB" =~ ^0*([.]0*)?$ ]]; then unset TENSORFOLD_KV_POOL_GIB; else export TENSORFOLD_KV_POOL_GIB="$KV_POOL_GB"; fi

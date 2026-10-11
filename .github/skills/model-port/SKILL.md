@@ -45,8 +45,11 @@ Helper scripts (in `scripts/` beside this file):
   W_q from the GPU unpack), then the normal affine 4-bit packing; count trellis tensors at packed size in admission.
   Verify against the reference dequantizer (correlation > 0.99999). Drafter precision only changes acceptance, never
   output: double quantization (EXL3 -> bf16 -> affine 4-bit) measured the same acceptance as bf16 (6.06 vs 6.00 tok/round).
-- **EXL3 vision tower inside the shards**: extract `model.visual.*` and run `python -m tensorfold.vision.exl3_convert`
-  once (`convert_vision.sh`), point `TENSORFOLD_VISION_WEIGHTS` at the result.
+- **EXL3 vision tower inside the shards** (quantized, TensorFold cannot load it): prefer the same model's bf16 tower from
+  an MLX/bf16 checkpoint (same `vision_tower.*` names; TensorFold accepts bf16 and permutes MLX's channels-last patch
+  embed), saved as `vision_bf16.safetensors` in a self-contained model folder (`27B-2/build_model_dir.sh`), mounted with
+  `--tf-docker-arg=--volume=HOST:/models/NAME:ro`; else extract `model.visual.*` and run
+  `python -m tensorfold.vision.exl3_convert`. Point `TENSORFOLD_VISION_WEIGHTS` at the container path.
 - **Vision/video prefix cache**: stock never caches image prompts (placeholder ids are identical across images). Key the
   cache by the prompt with each image/video placeholder run replaced by ids hashed from the media's hash; drop the
   "vision" guards on stops/ends/resume; drop the "fresh state" rope check.
