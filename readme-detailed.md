@@ -68,6 +68,43 @@ MTP accept rate on code: 73.9%. With stock TensorFold defaults (MTP confidence 0
 workspace), prose was 45.9 / 65.4 / 112.5 / 114.4 / 165.8 tok/s at 1-5 clients; the preset's three settings close that
 gap. Concurrent full-context streams were not measured for Flash Next.
 
+### Qwen3.8-Flash-Next EXL3 (`flash-2/start.sh`)
+
+`turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6` on TensorFold v0.6.5 with the `flash-2/overlay` patches (faster EXL3
+prompt kernels, image prefix cache, elastic kept states, bigger media limits, n-gram table left unpinned), MTP drafts,
+`--parallel 9`, 262,144-token context. A different method from the tables above: chat prompts per content class,
+greedy, 256-token replies, thinking off, aggregate decode tok/s (`flash-3/bench/suite.py`).
+
+| Content | 1 client | 4 clients | 9 clients |
+|---|---:|---:|---:|
+| Code | 93 | 177 | 254 |
+| Prose | 54 | 106 | 158 |
+| DevOps | 98 | 172 | 254 |
+| JSON | 97 | 188 | 274 |
+
+These were measured before the prompt-kernel overlay; with it decode was unchanged (code 66 / 176 / 249 steady and prose
+151 at 9 clients in a rerun). A single short request alone decodes at about 47 tok/s. For comparison, TabbyAPI + the
+patched exllamav3 fork on the same pack: code 76 / 131 / 133, prose 50 / 91 / 117 at 1 / 4 / 9 clients.
+
+Prefill, one cold stream (tok/s):
+
+| Prompt | Stock v0.6.5 | flash-2 overlay |
+|---|---:|---:|
+| 4K | 859 | 1026 (+19%) |
+| 32K | 846 | 1032 (+22%) |
+| 131K | 790 | 934 (+18%) |
+| 249K | 748 | 880 (+18%) |
+
+| Test | Result |
+|---|---|
+| **Concurrent full-262K streams** | 9 x ~249K-token prompts + 256 new tokens: **9/9 completed** (3034 s wall). Prefills run one at a time (~740 tok/s); per-stream decode 8-49 tok/s depending on start time. Measured on stock v0.6.5; startup reports 9 full windows (4.47 GiB of KV each) with the overlay too. |
+| n-gram table unpinned (`TENSORFOLD_NGRAM_LOCK_GIB=0`, default) | 45 GiB `MemAvailable` after start (stock pins it: 7.5 GiB); decode 46.9 tok/s and cold 35K prefill 33.5 s, the same as stock; 6 x 80K and 6 x 100K concurrent runs had no errors |
+| Elastic kept states (`TENSORFOLD_KEEP_MAX`) | 9 parallel ~15K-token chats: all 9 follow-ups warm (~1 s each); stock re-prefilled 5 of 9 (71 s) |
+| Image prefix cache | a repeated image prompt resumed 1,767 cached tokens; greedy output identical cached or not |
+| `TENSORFOLD_PREFILL_ROWS` 4096 / 8192 | +3% / +4% prefill at 32K, but one fewer full-window stream; the default 2048 stays |
+
+Details and diffs: `flash-2/overlay/README.md`; raw results: `instructions.md` (rounds 2-4).
+
 ### Ternary-Bonsai-2-27B (`bonsai-27b/start.sh`)
 
 Throughput, 200-token replies (`ignore_eos`), `--parallel 8`, fp8 KV, default pool; 0007 and the 0006 path
