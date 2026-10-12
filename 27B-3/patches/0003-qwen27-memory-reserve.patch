@@ -1,0 +1,48 @@
+Qwen3.8-27B on TensorFold v0.6.5: TENSORFOLD_MEMORY_RESERVE_GIB may be 0 (the stock floor is 2 GiB), and the stream
+memory gate of the dense 27B decoder reads the same variable instead of a fixed 2 GiB. With 0 the budget is all of
+MemAvailable. Ported from patch 0004-qwen27-memory-reserve.patch of the Qwen3.8-27B-DGX-Spark-TensorFold recipe
+(against v0.6.0, Apache-2.0, a modification of TensorFold by the TensorFold contributors). Applies after 0002.
+
+--- tensorfold/cuda/capacity.py	2026-10-05 21:01:18.827218419 +0530
++++ tensorfold/cuda/capacity.py	2026-10-05 21:01:37.821997641 +0530
+@@ -158,7 +158,7 @@
+ 
+ 
+ def reserve_bytes(total: int) -> int:
+-    """Memory the startup keeps free in a pool: max(4 GiB, a tenth of it), or TENSORFOLD_MEMORY_RESERVE_GIB (>= 2)."""
++    """Memory the startup keeps free in a pool: max(4 GiB, a tenth of it), or TENSORFOLD_MEMORY_RESERVE_GIB (>= 0; the stock floor is 2)."""
+ 
+     value = os.environ.get("TENSORFOLD_MEMORY_RESERVE_GIB", "").strip()
+     if not value:
+@@ -167,8 +167,8 @@
+         gib = float(value)
+     except ValueError:
+         gib = math.nan
+-    if not 2 <= gib <= total / GIB:
+-        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 2 to the memory's size")
++    if not 0 <= gib <= total / GIB:
++        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 0 to the memory's size")
+     return int(gib * GIB)
+ 
+ 
+Binary files stage2/cuda/__pycache__/capacity.cpython-312.pyc and stage3/cuda/__pycache__/capacity.cpython-312.pyc differ
+--- tensorfold/families/qwen3_5/cuda/multi.py	2026-10-05 21:01:18.829920431 +0530
++++ tensorfold/families/qwen3_5/cuda/multi.py	2026-10-05 21:01:37.827383249 +0530
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import torch
+@@ -123,7 +124,7 @@
+ 
+         self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * getattr(c, "head_dim", 0) * kv_fp8.itemsize()   # a row of one layer
+         self.row_bytes = att * self.layer_bytes
+-        self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
++        self.memory_gate = (MemoryGate(1 << 62, reserve=int(float(os.environ.get("TENSORFOLD_MEMORY_RESERVE_GIB") or 2) * GIB), live=torch_live(torch, available_bytes))
+                      if world == 1 and cuda else None)
+ 
+     def live(self) -> int:
+Binary files stage2/families/qwen3_5/cuda/__pycache__/multi.cpython-312.pyc and stage3/families/qwen3_5/cuda/__pycache__/multi.cpython-312.pyc differ

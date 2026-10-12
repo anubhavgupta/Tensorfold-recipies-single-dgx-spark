@@ -1,0 +1,113 @@
+Qwen3.8-27B on TensorFold v0.6.5: video input and larger media limits. Ported from patch
+0001-qwen27-many-images-video.patch of the Qwen3.8-27B-DGX-Spark-TensorFold recipe (against v0.6.0, Apache-2.0, a
+modification of TensorFold by the TensorFold contributors; its video code was MiaAI-Lab's Flash Next patch). v0.6.5
+ships that video code and the many-images flags (--vision-max-images, --vision-image-tokens, TENSORFOLD_VIDEO_TOKENS)
+itself but turns video on only for Flash Next (qwen4_exp); this turns it on for the 27B (qwen3_5) too. The size limits
+become environment variables whose defaults are v0.6.5's: TENSORFOLD_REQUEST_BODY_MIB (32), TENSORFOLD_IMAGE_TOTAL_MIB
+(20, all of a request's images), TENSORFOLD_VIDEO_MIB (16, one video), TENSORFOLD_VIDEO_TOTAL_MIB (20).
+Applies after 0001.
+
+Binary files base/server/__pycache__/request_body.cpython-312.pyc and stage2/server/__pycache__/request_body.cpython-312.pyc differ
+--- tensorfold/server/request_body.py	2026-10-05 20:59:39.505803411 +0530
++++ tensorfold/server/request_body.py	2026-10-05 21:01:18.832483818 +0530
+@@ -2,12 +2,24 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ from typing import Any
+ 
+ from tensorfold.server.errors import RequestError
+ 
+-LIMIT = 32 * 1024**2
++def _env_mib(name: str, default: int) -> int:
++    """``name`` in MiB from the environment (a positive whole number), else ``default`` MiB; as bytes."""
++
++    value = os.environ.get(name, "").strip()
++    if not value:
++        return default * 1024 * 1024
++    if not value.isdigit() or int(value) < 1:
++        raise ValueError(f"{name}={value}: a positive whole number of MiB")
++    return int(value) * 1024 * 1024
++
++
++LIMIT = _env_mib("TENSORFOLD_REQUEST_BODY_MIB", 32)    # base64 media makes bodies a third larger than the files
+ _METADATA_LIMIT = 65536
+ 
+ 
+--- tensorfold/vision/images.py	2026-10-05 20:59:39.506452341 +0530
++++ tensorfold/vision/images.py	2026-10-05 21:01:18.832829676 +0530
+@@ -7,6 +7,7 @@
+ import hashlib
+ import io
+ import math
++import os
+ import struct
+ import time
+ import warnings
+@@ -16,6 +17,17 @@
+ 
+ from .images_http import MEDIA_TYPES, ImageInputError, fetch_image
+ 
++
++def _env_mib(name: str, default: int) -> int:
++    """``name`` in MiB from the environment (a positive whole number), else ``default`` MiB; as bytes."""
++
++    value = os.environ.get(name, "").strip()
++    if not value:
++        return default * 1024 * 1024
++    if not value.isdigit() or int(value) < 1:
++        raise ValueError(f"{name}={value}: a positive whole number of MiB")
++    return int(value) * 1024 * 1024
++
+ _DETAILS = {"auto", "low", "high"}
+ _FORMATS = tuple(MEDIA_TYPES.values())
+ _MEDIA = {"image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url"}
+@@ -25,7 +37,7 @@
+ class ImageLimits:
+     max_images: int = 4
+     max_encoded_bytes: int = 10 * 1024 * 1024
+-    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_total_encoded_bytes: int = _env_mib("TENSORFOLD_IMAGE_TOTAL_MIB", 20)
+     max_dimension: int = 8192
+     max_pixels: int = 16 * 1024 * 1024
+     max_total_pixels: int = 32 * 1024 * 1024
+Binary files base/vision/__pycache__/images.cpython-312.pyc and stage2/vision/__pycache__/images.cpython-312.pyc differ
+Binary files base/vision/__pycache__/qwen_cuda.cpython-312.pyc and stage2/vision/__pycache__/qwen_cuda.cpython-312.pyc differ
+Binary files base/vision/__pycache__/videos.cpython-312.pyc and stage2/vision/__pycache__/videos.cpython-312.pyc differ
+--- tensorfold/vision/qwen_cuda.py	2026-10-05 20:59:39.506510101 +0530
++++ tensorfold/vision/qwen_cuda.py	2026-10-05 21:01:18.832863292 +0530
+@@ -166,8 +166,8 @@
+         self.frontend = QwenImageProcessor.from_directory(model_dir)
+         raw = json.loads((Path(model_dir) / "config.json").read_text())
+         self.image_token = int(raw["image_token_id"])
+-        # videos: Flash Next's frontend (the frame groups ride the image path; tested on that checkpoint)
+-        self.videos = raw.get("model_type") == "qwen4_exp" and "video_token_id" in raw
++        # videos: Flash Next's and Qwen3.8-27B's frontends (the frame groups ride the image path)
++        self.videos = raw.get("model_type") in ("qwen4_exp", "qwen3_5") and "video_token_id" in raw
+         self.media_tokens = frozenset({self.image_token} | ({int(raw["video_token_id"])} if self.videos else set()))
+         self.device = device
+         config = Qwen3_5VisionConfig(**{k: v for k, v in self.config.items()
+--- tensorfold/vision/videos.py	2026-10-05 20:59:39.506592518 +0530
++++ tensorfold/vision/videos.py	2026-10-05 21:01:18.832904924 +0530
+@@ -11,7 +11,7 @@
+ 
+ import numpy as np
+ 
+-from .images import _data_bytes
++from .images import _data_bytes, _env_mib
+ from .images_http import ImageInputError, fetch_image
+ 
+ VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-matroska": "mkv"}
+@@ -20,8 +20,8 @@
+ @dataclass(frozen=True, slots=True)
+ class VideoLimits:
+     max_videos: int = 2
+-    max_encoded_bytes: int = 16 * 1024 * 1024         # base64 makes it a third larger in the 32 MiB request body
+-    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_encoded_bytes: int = _env_mib("TENSORFOLD_VIDEO_MIB", 16)   # base64: a third larger in the request body
++    max_total_encoded_bytes: int = _env_mib("TENSORFOLD_VIDEO_TOTAL_MIB", 20)
+     max_dimension: int = 8192
+     max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
+     fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)

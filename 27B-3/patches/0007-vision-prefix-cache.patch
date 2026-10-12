@@ -1,0 +1,190 @@
+Vision prefix cache: prompts with images or videos resume from, and keep, states keyed by the media's hashes.
+
+--- tensorfold/families/qwen3_5/cuda/decode.py	2026-10-10 12:34:36.829126965 +0530
++++ tensorfold/families/qwen3_5/cuda/decode.py	2026-10-10 12:34:36.844285737 +0530
+@@ -15,6 +15,29 @@
+ from .weights import Weights
+ 
+ 
++def media_key(prompt, vision) -> list[int]:
++    """The prompt as a prefix-cache key: each image or video placeholder run becomes ids only that media's bytes make."""
++
++    import hashlib
++
++    ids = list(prompt)
++    if vision is None:
++        return ids
++
++    def tag(kind, h):
++        return -1 - int.from_bytes(hashlib.sha256(f"{kind}:{h}".encode()).digest()[:16], "big")
++
++    for (a, b), h in zip(vision.image_spans, vision.image_hashes):
++        ids[a:b] = [tag("i", h)] * (b - a)
++    spans, grids = list(getattr(vision, "video_spans", ())), getattr(vision, "video_grid_thw", None)
++    first = 0
++    for h, grid in zip(getattr(vision, "video_hashes", ()), () if grids is None else grids):
++        for a, b in spans[first:first + int(grid[0])]:
++            ids[a:b] = [tag("v", h)] * (b - a)
++        first += int(grid[0])
++    return ids
++
++
+ def clone_state(st: State) -> State:
+     """Commits replace list entries; the attention list is shared, so a grow reaches every clone and frees the old."""
+ 
+@@ -37,11 +60,9 @@
+ 
+     from .prefill import prefill_state
+ 
+-    if vision is not None and stops:
+-        raise ValueError("an image prompt keeps no prompt states")
+     for p in stops:
+         if st.pos < p < len(prompt) and keep is not None:
+-            prefill_state(w, prompt[:p], st, tp=tp, draft=draft)
++            prefill_state(w, prompt[:p], st, tp=tp, draft=draft, vision=vision)
+             keep(p, clone_state(st), draft.snapshot() if draft is not None else None)
+     return prefill_state(w, prompt, st, tp=tp, draft=draft, keep_at=keep_at, vision=vision)
+ 
+--- tensorfold/families/qwen3_5/cuda/engine.py	2026-10-10 12:34:36.828739863 +0530
++++ tensorfold/families/qwen3_5/cuda/engine.py	2026-10-10 12:34:49.336680165 +0530
+@@ -186,7 +186,7 @@
+     def _remember(self, ids: list[int], st, snap) -> None:
+         self.cache.add(ids, st, snap)
+ 
+-    def _stops(self, prompt: list[int], hit, draft: bool) -> tuple[list[int], Callable | None]:
++    def _stops(self, prompt: list[int], hit, draft: bool, key=None) -> tuple[list[int], Callable | None]:
+         """Message starts past the resumed prefix, and the callback that keeps their states."""
+ 
+         from tensorfold.cuda.markers import MIN_GAP
+@@ -195,7 +195,8 @@
+             return [], None
+         base = len(hit[0]) if hit else 0
+         stops = [p for p in self.points(prompt) if p >= base + MIN_GAP]
+-        return stops, lambda p, st, snap: self._remember(list(prompt[:p]), st, snap)
++        key = prompt if key is None else key
++        return stops, lambda p, st, snap: self._remember(list(key[:p]), st, snap)
+ 
+     def _ends(self, prompt: list[int], stops: list[int]) -> bool:
+         """Whether to keep the prompt end too: not when a kept message start sits just before it."""
+@@ -232,7 +233,10 @@
+             return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
+                                          vision=vision, **grammar)
+         t0 = time.perf_counter()
+-        hit = self._resume(prompt) if draft and vision is None else None
++        from .decode import media_key
++
++        key = media_key(prompt, vision)
++        hit = self._resume(key) if draft and (vision is None or self.tp != 2) else None
+         encoded = self.vision.encode(vision, prompt) if vision is not None else None
+         if self.tp == 2:
+             return self._generate_tp(prompt, max_tokens, sampling, on_tokens, hit, t0, draft, stop_eos, vision=encoded,
+@@ -242,13 +246,13 @@
+             drafter.restore(hit[2])
+         elif drafter is not None:
+             drafter.restore(([None] * drafter.layers, [None] * drafter.layers, 0, 0))
+-        stops, keep = self._stops(prompt, hit, draft) if vision is None else ((), None)
+-        end = entry_end(prompt) if draft and vision is None and self._ends(prompt, stops) else None
++        stops, keep = self._stops(prompt, hit, draft, key)
++        end = entry_end(prompt) if draft and self._ends(prompt, stops) else None
+         st, pending, *kept = prefill(self.w, prompt, sampling, drafter, state=hit[1] if hit else None, room=self.room,
+                                      limit=self.context_window, stops=stops, keep=keep, keep_at=end, vision=encoded,
+                                      **grammar)
+         if end is not None:
+-            self._remember(list(prompt[:end]), *kept[0])
++            self._remember(list(key[:end]), *kept[0])
+         prefill_s = time.perf_counter() - t0
+         if on_tokens([pending]):
+             return {"prefill_s": prefill_s, "cached": hit[1].pos if hit else 0}
+--- tensorfold/families/qwen3_5/cuda/multi.py	2026-10-10 12:34:36.829346836 +0530
++++ tensorfold/families/qwen3_5/cuda/multi.py	2026-10-10 12:35:07.016145667 +0530
+@@ -175,7 +175,10 @@
+         if prepared is not None and self.vision is None:
+             raise ValueError("image inputs require starting this engine with --vision")
+         encoded = self.vision.encode(prepared, s.prompt) if prepared is not None else None
+-        hit = self.cache.longest(s.prompt) if s.draft and encoded is None else None
++        from .decode import media_key
++
++        s.key = media_key(s.prompt, prepared)
++        hit = self.cache.longest(s.key) if s.draft else None
+         s.sid, s.cached = self.next_id, len(hit[0]) if hit else 0
+         self.next_id += 1
+         # the request's grammar rides after the fields (rank 1 compiles the same): a plain ADMIT is unchanged
+@@ -190,6 +193,10 @@
+         s.vision = encoded
+         self._queue(s, hit)
+ 
++    @staticmethod
++    def _key(s: Stream) -> list[int]:
++        return getattr(s, "key", None) or s.prompt
++
+     def _queue(self, s: Stream, hit) -> None:
+         drafter = self.draft if s.draft and self.drafts else None
+         rows = self._most(s) if self.memory_gate is None else self._first(s)
+@@ -198,7 +205,7 @@
+         s.snap = None if drafter is None else own(hit[2]) if hit and hit[2] is not None else \
+             ([None] * drafter.layers, [None] * drafter.layers, 0, 0)
+         s.stops = ([p for p in self.points(s.prompt) if p >= state.pos + MIN_GAP]
+-                   if self.points is not None and s.draft and s.vision is None else [])    # image prompts keep none
++                   if self.points is not None and s.draft else [])
+         self.filling.append(s)
+ 
+     def _most(self, s: Stream) -> int:
+@@ -340,7 +347,7 @@
+         ends, pieces = [], []
+         for s, stop in batch:
+             n = len(s.prompt)
+-            end = entry_end(s.prompt) if (stop == n and s.draft and s.vision is None
++            end = entry_end(s.prompt) if (stop == n and s.draft
+                                           and not (s.stops and n - s.stops[-1] < MIN_GAP)) else None
+             ends.append(end)
+             pieces.append(Piece(s.prompt[:stop], s.st, end, s.snap if s.draft and drafter is not None else None))
+@@ -351,12 +358,12 @@
+                 if snap is not None:
+                     s.snap = snap
+                 if stop in s.stops:
+-                    self.cache.add(list(s.prompt[:stop]), kept(s.st), own(s.snap))
++                    self.cache.add(list(self._key(s)[:stop]), kept(s.st), own(s.snap))
+                 n = len(s.prompt)
+                 firsts.append(None if stop < n else first_token(self.w, normed, n, s.sampling, self.rank, self.world,
+                                                                 s.constraint))
+                 if end is not None:
+-                    self.cache.add(list(s.prompt[:end]), viewed(at[0]) if end < n else kept(at[0]), own(at[1]))
++                    self.cache.add(list(self._key(s)[:end]), viewed(at[0]) if end < n else kept(at[0]), own(at[1]))
+         except Exception as exc:
+             if self.world == 2:
+                 self.broken = exc
+@@ -383,7 +390,7 @@
+             if drafter is not None:
+                 drafter.restore(s.snap)
+             n = len(s.prompt)             # the prompt end is kept one token early, unless a message start covers it
+-            end = entry_end(s.prompt) if (stop == n and s.draft and s.vision is None
++            end = entry_end(s.prompt) if (stop == n and s.draft
+                                           and not (s.stops and n - s.stops[-1] < MIN_GAP)) else None
+             out = prefill_state(self.w, s.prompt[:stop], s.st, tp=self.world == 2, draft=drafter, keep_at=end,
+                                 vision=s.vision)
+@@ -392,12 +399,12 @@
+                 s.snap = drafter.snapshot()
+                 drafter.skip(0)                  # no reference of its own: rounds read and replace s.snap's context
+             if stop in s.stops:
+-                self.cache.add(list(s.prompt[:stop]), kept(s.st), own(s.snap))
++                self.cache.add(list(self._key(s)[:stop]), kept(s.st), own(s.snap))
+             first = None if stop < n else first_token(self.w, normed, n, s.sampling, self.rank, self.world,
+                                                      s.constraint)
+             if end is not None:
+                 at, snap = out[1]
+-                self.cache.add(list(s.prompt[:end]), viewed(at) if end < n else kept(at), own(snap))
++                self.cache.add(list(self._key(s)[:end]), viewed(at) if end < n else kept(at), own(snap))
+         except Exception as exc:
+             if self.world == 2:
+                 self.broken = exc
+--- tensorfold/families/qwen3_5/cuda/prefill.py	2026-10-10 12:34:36.829244917 +0530
++++ tensorfold/families/qwen3_5/cuda/prefill.py	2026-10-10 12:34:36.844332681 +0530
+@@ -187,8 +187,6 @@
+     if keep_at is not None and not base <= keep_at <= n:
+         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{base}, {n}]")
+     if vision is not None:                         # a later prefill step goes on with the rope its first step set
+-        if base and getattr(st, "rope_delta", None) is not vision.rope_delta:
+-            raise ValueError("image prompts require a fresh prefill state")
+         st.rope_delta = vision.rope_delta
+     ids = torch.tensor(list(prompt[base:]), dtype=torch.int32, device=dev)
+     normed, kept = None, None
