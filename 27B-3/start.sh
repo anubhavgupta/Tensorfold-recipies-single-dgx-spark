@@ -2,11 +2,11 @@
 # Serve turboderp/Qwen3.8-27B-exl3 @ 4.00bpw (the standard 4.00 bpw EXL3 quant of Qwen3.8-27B; 27B-2 serves the
 # SC_4.00bpw_H5_V6 variant; this one keeps the official bf16 vision tower in its shards) with froggeric's v22.5 chat
 # template, and the EXL3
-# DFlash2 drafter igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw on TensorFold only (./tensorfold.sh, a derived image built
+# DFlash2 drafter z-lab/Qwen3.8-27B-DFlash2 (bf16) on TensorFold only (./tensorfold.sh, a derived image built
 # from ./patches, the same 11 patches as 27B-2).
 # Set up first:
 #   ./27B-3/build_model_dir.sh     (builds ~/projects/models/Qwen3.8-27B-exl3-4.00bpw)
-#   hf download igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw
+#   hf download z-lab/Qwen3.8-27B-DFlash2
 # The model folder (MODEL_PATH) is mounted read-only into the container; the drafter is found in the HF cache.
 #
 # Patches (27B-3/patches, applied with tensorfold.sh --tf-patches; 0001-0004 come from ../qwen38-27b):
@@ -20,7 +20,7 @@
 #   MODEL_PATH (/home/gb10/projects/models/Qwen3.8-27B-exl3-4.00bpw: the folder build_model_dir.sh makes;
 #     mounted read-only at /models/<name>)
 #   MODEL_DIR explicit pack dir inside the container (skips MODEL_PATH)
-#   DRAFT_REPO (igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
+#   DRAFT_REPO (z-lab/Qwen3.8-27B-DFlash2; igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw also works, via patch 0005)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
 #   TF_VERSION (0.6.6)  PATCHES (1; 0: stock image, which needs KV_DTYPE=bf16, no drafter)
 #   PARALLEL (9: about as many full 262K-token streams as fit in memory) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
 #   MEMORY_RESERVE_GIB (2) CHECKPOINT_SLOTS (empty: TensorFold's default)
@@ -47,7 +47,7 @@ if [[ -f "$ENV_FILE" ]]; then
   done < "$ENV_FILE"
 fi
 
-DRAFT_REPO="${DRAFT_REPO-igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw}"
+DRAFT_REPO="${DRAFT_REPO-z-lab/Qwen3.8-27B-DFlash2}"
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-27B}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"

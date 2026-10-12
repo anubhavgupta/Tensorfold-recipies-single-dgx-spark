@@ -11,12 +11,12 @@ A copy of [27B-2](../27B-2/README.md) (same 11 patches, scripts and defaults) fo
 | Chat template | froggeric v22.5 (upstream kept as `chat_template.upstream.jinja`) | froggeric v22.5 |
 | Container / port | `tf-27b-3` / 8888 | `tf-27b-2` / 8888 |
 
-- Drafter: `igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` (patch 0005 loads it).
+- Drafter: `z-lab/Qwen3.8-27B-DFlash2` (bf16; 27B-2 uses igor255's EXL3 quant of it). `DRAFT_REPO=igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` switches back (patch 0005 loads it).
 - Only one of 27B-2 / 27B-3 can run at a time (same port, and each takes most of the memory).
 
 ```bash
 ./27B-3/build_model_dir.sh  # once: copies the 4.00bpw pack from the HF cache (downloads it if missing) + the chat template
-hf download igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw
+hf download z-lab/Qwen3.8-27B-DFlash2
 ./27B-3/start.sh            # port 8888, container tf-27b-3, PARALLEL=9
 PARALLEL=1 ./27B-3/start.sh # best single-stream decode ("wide" draft trees)
 ./27B-3/end.sh
@@ -47,10 +47,10 @@ throughput and full-context concurrency; see below.
 
 ## Drafter: igor255 EXL3 vs z-lab bf16 (27B-3, back to back, `PARALLEL=9`)
 
-`igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` (default) against `z-lab/Qwen3.8-27B-DFlash2` (`DRAFT_REPO=z-lab/Qwen3.8-27B-DFlash2`).
+`igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` against `z-lab/Qwen3.8-27B-DFlash2` (now the default).
 Both end up as the same affine 4-bit drafter on the GPU. Aggregate tok/s at 1 / 2 / 4 / 8 clients.
 
-| Test | igor255 (EXL3) | z-lab (bf16) |
+| Test | igor255 (EXL3) | z-lab (bf16, default) |
 |---|---|---|
 | `same.py` prose (same prompt, greedy, 200 tok) | 50.9 / 89.3 / 144.9 / 205.1 | 52.6 / 91.0 / 143.5 / 209.2 |
 | `same.py` code | 74.7 / 124.8 / 209.3 / 280.3 | 73.6 / 119.8 / 206.0 / 293.9 |
