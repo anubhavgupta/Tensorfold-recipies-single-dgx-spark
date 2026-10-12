@@ -1,4 +1,4 @@
-# Qwen3.8-27B EXL3 4.00bpw (standard) + EXL3 DFlash2 drafter on TensorFold 0.6.6 (one DGX Spark)
+# Qwen3.8-27B EXL3 4.00bpw (standard) + z-lab DFlash2 drafter on TensorFold 0.6.6 (one DGX Spark)
 
 A copy of [27B-2](../27B-2/README.md) (same 11 patches, scripts and defaults) for the other 4.00 bpw quant:
 
