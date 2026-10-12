@@ -45,6 +45,21 @@ tokens from cache, and text answers are correct.
 Not re-measured for 27B-3 (expected to match 27B-2, which has the same engine, patches and memory use): multi-stream
 throughput and full-context concurrency; see below.
 
+## Drafter: igor255 EXL3 vs z-lab bf16 (27B-3, back to back, `PARALLEL=9`)
+
+`igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` (default) against `z-lab/Qwen3.8-27B-DFlash2` (`DRAFT_REPO=z-lab/Qwen3.8-27B-DFlash2`).
+Both end up as the same affine 4-bit drafter on the GPU. Aggregate tok/s at 1 / 2 / 4 / 8 clients.
+
+| Test | igor255 (EXL3) | z-lab (bf16) |
+|---|---|---|
+| `same.py` prose (same prompt, greedy, 200 tok) | 50.9 / 89.3 / 144.9 / 205.1 | 52.6 / 91.0 / 143.5 / 209.2 |
+| `same.py` code | 74.7 / 124.8 / 209.3 / 280.3 | 73.6 / 119.8 / 206.0 / 293.9 |
+| `tput.py` essays (distinct prompts, T=1, 800 tok) | 41.5 / 74.2 / 122.3 / 173.7 | 43.7 / 77.0 / 130.9 / 181.6 |
+| `tput.py --code` | 81.7 / 145.2 / 208.9 / 269.9 | 88.8 / 157.2 / 210.5 / 279.6 |
+| All requests: tokens per round, drafts accepted | 4.39, 47% (23,749 / 50,394) | 4.37, 47% (23,399 / 49,484) |
+
+Acceptance is the same; z-lab came out 0-8% ahead in most cells (z-lab ran second), close to run-to-run noise (~5-10%).
+
 ## Results measured on 27B-2 (same engine and patches)
 
 ### Patches
