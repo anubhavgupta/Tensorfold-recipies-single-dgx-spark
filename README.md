@@ -1,7 +1,7 @@
 # TensorFold v0.6.5 on DGX Spark
 
-This repo contains a recipe for running [TensorFold](https://github.com/ashhart/TensorFold) on a single DGX Spark
-(GB10, 128 GB) for three models. Key measured decode speeds (200-token replies, thinking off): "per stream" is one
+This repo contains recipes for running [TensorFold](https://github.com/ashhart/TensorFold) on a single DGX Spark
+(GB10, 128 GB) for several models (v0.6.5 Python engine, and TensorFold 1.0.12 native for `dory-4b` and `3.5-glm-2`). Key measured decode speeds (200-token replies, thinking off): "per stream" is one
 client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 and 5 clients):
 
 | Model | Per stream (prose / code) | Peak aggregate (prose / code) |
@@ -10,8 +10,11 @@ client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 a
 | Ternary-Bonsai-2-27B | 44.2 / 87.6 tok/s | 195.8 / 308.9 tok/s |
 | Qwen3.8-Flash-Next | 46.8 / 63.7 tok/s | 186.4 / 260.3 tok/s |
 | Qwen3.8-Flash-Next EXL3 (`flash-2`)* | 54 / 93 tok/s | 158 / 254 tok/s |
+| Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b`)** | 52 / 52 tok/s | 511 / 515 tok/s |
+| GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2`)** | 31 / 32 tok/s | 40 / 45 tok/s |
 
 \* Different method: 256-token chat replies, 9 clients (see its section).
+\** TensorFold 1.0.12 native (Zig) engine with this repo's patches; peak at 16 (Dory) and 4 (GLM) clients.
 
 Full results in [Benchmarks](#benchmarks).
 
@@ -128,6 +131,39 @@ Earlier comparison against Qwen3.8-27B + DFlash2 with 0006 (a different script, 
 the 27B on prose at 1-4 clients and tied at 8; the 27B led on code at higher concurrency (DFlash2 is trained on the
 27B, and large verification batches are compute-bound).
 
+### Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b/start.sh`)
+
+`nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4` (a looped nGPT, 2 recurrent loops by default) on TensorFold 1.0.12's
+native engine. TensorFold has no Dory family, so `dory-4b` adds one: `libdory.so` (NVFP4 tensor-core GEMMs, head-dim-256
+flash attention with sliding windows, slerp residuals, the recurrent loops, CUDA graphs) behind a lane backend registered
+by `dory-4b/patches/0001-register-dory.patch`. Logits match an fp32 PyTorch reference (top-1 99-100 %).
+
+Same-prompt greedy, 200-token replies, thinking off, 16 streams x 262,144-token window:
+
+| Clients | Prose | Code |
+|---:|---:|---:|
+| 1 | 52 | 52 |
+| 4 | 179 | 182 |
+| 16 | 511 | 515 |
+
+Prefill 3,000-3,450 tok/s up to 26K tokens, 1,150 tok/s at 249K; an edit-style request (copy drafts) 242 tok/s.
+`LOOPS=1` / `LOOPS=4`: 72 / 32 tok/s single stream. Details: `dory-4b/README.md`.
+
+### GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2/start.sh`)
+
+`turboderp/GLM-5.3-Flash-exl3 @ 2.05bpw` (80 GiB) on one Spark with TensorFold 1.0.12's native engine. Upstream serves
+this model on CUDA only from NVIDIA's 190 GiB NVFP4 checkpoint over several hosts; `3.5-glm-2/patches` add EXL3 to the
+CUDA engine (upstream PR #837, rebased) and load the pack in the GLM family at one rank, with a faster EXL3 prompt-experts
+kernel. MTP drafts on, 4 streams x 131,072-token window, port 8890.
+
+| Clients | Prose (same prompt, greedy) | Code (same prompt, greedy) | Distinct prompts, T=1 |
+|---:|---:|---:|---:|
+| 1 | 30.9 | 32.4 | 28.7 |
+| 4 | 39.6 | 44.7 | 30.3 |
+
+Prefill 433-456 tok/s up to 78K tokens. Drafted replies equal undrafted ones, concurrent equal solo. Details:
+`3.5-glm-2/README.md`.
+
 ## How to run
 
 There is nothing to install on the host: everything runs in a Docker container. It needs:
@@ -166,6 +202,16 @@ Then start and stop the model you want with its preset's `start.sh` and `end.sh`
 # Qwen3.8-Flash-Next preset
 ./qwen38-flash-next/start.sh     # background container tf-qwen38-flash-next; server on port 8888
 ./qwen38-flash-next/end.sh
+```
+
+The Dory and GLM recipes build their own TensorFold 1.0.12 image on the first `start.sh` (no `tensorfold.sh pull`
+needed; they download their checkpoint if it is missing):
+
+```bash
+./dory-4b/start.sh               # container tf-dory-4b; server on port 8888
+./dory-4b/stop.sh
+./3.5-glm-2/start.sh             # container tf-glm53-flash; server on port 8890 (~4 min load, needs ~100 GiB free)
+./3.5-glm-2/stop.sh
 ```
 
 `start.sh` runs in the background by default; `FOREGROUND=1` attaches to it instead (Ctrl+C stops it).
