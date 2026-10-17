@@ -17,6 +17,46 @@ Settings come from the environment or `./.env` (defaults and comments in `script
 (1), `TEMPERATURE`/`TOP_P` (1.0/0.95, NVIDIA's recommendation), `MAX_TOKENS`, `PORT`, `SERVED_NAME` (`Dory1.0-4B`).
 Extra arguments to `start.sh` go to `tensorfold-native serve`. Logs: `~/.cache/tf-dory-4b/logs/latest.log`.
 
+## Quick start
+
+Requirements: a DGX Spark (GB10, 128 GB unified memory), Docker with the NVIDIA Container Toolkit, an NGC login for the
+base image (`docker login nvcr.io`, once), internet on the first run, and the `hf` CLI on the host (else the download
+runs in the container). About 10 GB free memory is enough to start; more for long contexts and many streams.
+
+```bash
+git clone https://github.com/anubhavgupta/Tensorfold-recipies-single-dgx-spark
+cd Tensorfold-recipies-single-dgx-spark/dory-4b
+./start.sh                       # first run: builds the image, downloads the checkpoint (3.2 GB), serves in ~10 s once built
+docker logs -f tf-dory-4b       # follow the server (or the log under ~/.cache/tf-dory-4b/logs)
+```
+
+Send a request (OpenAI API at `http://localhost:8888/v1`, model `Dory1.0-4B`):
+
+```bash
+# thinking on (the default): the reasoning comes back in message.reasoning_content
+curl -s localhost:8888/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"Dory1.0-4B","messages":[{"role":"user","content":"What is 17*23?"}],"max_tokens":1000}'
+
+# thinking off for this request
+curl -s localhost:8888/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"Dory1.0-4B","messages":[{"role":"user","content":"Write a haiku about GPUs."}],"max_tokens":200,"chat_template_kwargs":{"enable_thinking":false}}'
+
+# tool calls: pass "tools" as with any OpenAI-compatible server; calls come back in message.tool_calls
+```
+
+Change settings with environment variables or a `.env` file in this folder (see below), then `./start.sh restart`.
+Stop with `./stop.sh`. Only one large server fits in memory: stop other recipes first.
+
+Re-run the benchmarks against a running server (`bench/`, copied from `27B-2/bench`):
+
+```bash
+cd bench
+python3 same.py 1 2 4          # same prompt for every client, greedy, 200-token replies
+python3 tput.py 1 2 4          # distinct prompts, T=1, 800 tokens each
+python3 bench.py prefill 4000 16000 64000
+```
+
+
 ## The model
 
 Dory is a *looped* normalized GPT (nGPT): 72 physical sublayers, each attention **or** SwiGLU MLP, with a slerp residual

@@ -20,6 +20,48 @@ checkpoint's MTP head), `PROMPT_CACHE_GIB` (0: sized by the server from what is 
 `tensorfold-native serve`; `TENSORFOLD_*` and `TF_GLM_*` variables are passed into the container. Logs:
 `~/.cache/tf-glm53-flash/logs/latest.log`. Only one big server fits: stop others first (the start warns below 100 GiB free).
 
+## Quick start
+
+Requirements: a DGX Spark (GB10, 128 GB unified memory), Docker with the NVIDIA Container Toolkit, an NGC login for the
+base image (`docker login nvcr.io`, once), internet on the first run, and the `hf` CLI on the host (else the download
+runs in the container). About 100 GiB of free memory when it starts (the start script warns below that).
+
+```bash
+git clone https://github.com/anubhavgupta/Tensorfold-recipies-single-dgx-spark
+cd Tensorfold-recipies-single-dgx-spark/3.5-glm-2
+./start.sh                       # first run: builds the image, downloads the 2.05bpw pack (80 GiB), loads it in ~4 min
+docker logs -f tf-glm53-flash       # follow the server (or the log under ~/.cache/tf-glm53-flash/logs)
+```
+
+Send a request (OpenAI API at `http://localhost:8890/v1`, model `GLM-5.3-Flash`):
+
+```bash
+# thinking on (the default): the reasoning comes back in message.reasoning_content
+curl -s localhost:8890/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"GLM-5.3-Flash","messages":[{"role":"user","content":"What is 17*23?"}],"max_tokens":1000}'
+
+# thinking off for this request
+curl -s localhost:8890/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"GLM-5.3-Flash","messages":[{"role":"user","content":"Write a haiku about GPUs."}],"max_tokens":200,"chat_template_kwargs":{"enable_thinking":false}}'
+
+# tool calls: pass "tools" as with any OpenAI-compatible server; calls come back in message.tool_calls
+```
+
+Change settings with environment variables or a `.env` file in this folder (see below), then `./start.sh restart`.
+Stop with `./stop.sh`. Only one large server fits in memory: stop other recipes first.
+
+Re-run the benchmarks against a running server (`bench/`, copied from `27B-2/bench`):
+
+```bash
+cd bench
+python3 same.py 1 2 4          # same prompt for every client, greedy, 200-token replies
+python3 tput.py 1 2 4          # distinct prompts, T=1, 800 tokens each
+python3 bench.py prefill 4000 16000 64000
+```
+
+The benchmark scripts here point at port 8890.
+
+
 ## Why patches were needed
 
 TensorFold 1.0.12 serves GLM-5.3-Flash on CUDA only from NVIDIA's NVFP4 checkpoint, at tensor parallel over several
