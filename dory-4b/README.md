@@ -47,6 +47,29 @@ curl -s localhost:8888/v1/chat/completions -H 'content-type: application/json' \
 Change settings with environment variables or a `.env` file in this folder (see below), then `./start.sh restart`.
 Stop with `./stop.sh`. Only one large server fits in memory: stop other recipes first.
 
+### Choosing `LOOPS` and `KV_MODE`
+
+`LOOPS` is how many times the recurrent block runs per token (the model card's "loop count"): more loops think more per
+token, so accuracy goes up and speed goes down. `KV_MODE` decides whether each loop keeps its own attention cache.
+
+| Setting | Use it when | 1 client | 16 clients | Full-attention KV a token |
+|---|---|---:|---:|---:|
+| `LOOPS=1` | speed matters most, simple chat | 72 tok/s | 731 tok/s | 36 KiB |
+| `LOOPS=2` (default) | NVIDIA's recommended balance | 52 | 511 | 56 KiB (`per_loop`) |
+| `LOOPS=4` | hardest tasks (agentic, SWE-bench-like); fewer reply tokens | 32 | 316 | 96 KiB (`per_loop`) |
+| `KV_MODE=last_loop` | long contexts or many long streams: KV at the one-loop size whatever `LOOPS` is | same speed | same | 36 KiB |
+
+- `per_loop` (default) is the reference mode: each loop of each recurrent attention layer has its own cache.
+- `last_loop` keeps one cache per layer, which each loop overwrites; NVIDIA reports accuracy close to `per_loop`. At
+  262,144 tokens it fits ~10 streams instead of ~6, and long-context decode reads 36 % less.
+- Short-context speed depends on `LOOPS` only; `KV_MODE` changes memory and long-context speed.
+
+```bash
+LOOPS=4 ./start.sh restart                     # most accurate
+LOOPS=2 KV_MODE=last_loop ./start.sh restart   # default quality, less KV memory
+echo "LOOPS=1" >> .env && ./start.sh restart   # keep a setting across restarts
+```
+
 Re-run the benchmarks against a running server (`bench/`, copied from `27B-2/bench`):
 
 ```bash
