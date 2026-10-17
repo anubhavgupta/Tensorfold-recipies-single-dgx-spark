@@ -1,0 +1,1381 @@
+GLM-5.3-Flash from an EXL3 pack on one GPU (TF_GLM_RANK=0, TF_GLM_WORLD=1), and faster EXL3 prompt experts.
+
+What:
+- cuda_weights.zig: an EXL3 checkpoint (config quant_method exl3) loads through core/exl3_load: KDA [q|k|v] and o, DSA
+  q_a, kv_a, q_b, o and the indexer's wq_b, the dense MLPs, the routed experts with the shared expert stacked last (the
+  router's shared slot, weight 1), eh_proj and the head as EXL3 groups; the small fp16 matrices (f_a, g_a, b, f_b, g_b,
+  kv_b, router, indexer wk/weights_proj/gate/k_norm) as bf16; the fused conv1d. Pages are released layer by layer.
+- cuda_mat.zig: a projection is bf16 or EXL3 (`Mat`), one matmul for both; blocks keep EXL3 projections apart and copy
+  their rows into place (KDA's [q|k|v|f_a|g_a|b] rows) or read them at their own stride (DSA's q_a and kv_a).
+- cuda_moe.zig: EXL3 experts run every slot through exl3_experts.run into fp32 rows (2048 rows a call).
+- cuda_forward.zig: the head and MTP's eh_proj through `Mat`; MTP drafts through the EXL3 head (no BF16 head to make the
+  4-bit draft head from); one rank skips the pieced exchanges. cuda_engine.zig: EXL3 configs skip the ModelOpt check and
+  load the EXL3 kernels; more than one rank is refused for EXL3. qlinear: decodeF32/promptF32 for EXL3.
+- exl3_experts: prompt rows (256+) take a 64-column x 64-member program that decodes each weight tile once for four
+  16-row member tiles, over a device work list of the member groups that exist (the old grid launched ~2.4M programs a
+  projection at 2048 rows, ~94% of them empty). A row's arithmetic and order are unchanged; decode rows keep the old shape.
+Why: one DGX Spark holds GLM-5.3-Flash only as EXL3 (turboderp/GLM-5.3-Flash-exl3 2.05bpw: 2-bit experts, 3-5 bit
+elsewhere, 80 GiB); 1.0.12 serves the family only from NVIDIA's 190 GiB NVFP4 checkpoint over several hosts.
+Verified: `tf-cuda-test exl3` (all pass after the kernel change); served greedy replies identical drafted vs
+`"draft": false`, concurrent vs solo, and before vs after the experts change (sha 570d68a56234); prefill 424 -> 493 tok/s.
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 8147a686..49324749 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -8,6 +8,11 @@
+ 
+ namespace tf_exl3 {
+ 
++// A prompt program's n tiles (16 columns each) and member tiles (16 rows each, one weight decode for all of them). Prompt
++// launches walk the column blocks fastest (grid x) over a work list of the member groups that exist.
++constexpr int GROUPED_NT = 4;
++constexpr int GROUPED_MB = 4;
++
+ // One projection's grouped arguments; the fields must stay in launch.zig add order.
+ struct GroupedArgs {
+     const half* x0; // fp16 [P, K], the rotated gate (or down) inputs
+@@ -21,12 +26,16 @@ struct GroupedArgs {
+     const int* members; // int32 [nexp_max, maxm], row * 32 + slot, -1 after the last member
+     float* z; // fp32 partials, [(mat * sk + split) * P + p] * N + col
+     int k, n, p, sk, maxm, slots, nexp_max, mats, ns;
++    const int* work; // prompt rows: int32 [2 * items], (distinct expert, member group) pairs with members; null: decode
++    const int* nwork; // int32 [1], the items in `work`
+ };
+ 
+-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
+-template <int CB, int K2, int NT>
+-__device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
+-                                           const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
++// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc for MB member tiles: each tile of weights is
++// decoded once and used for every member tile (a row's sums keep their order whatever MB is).
++template <int CB, int K2, int NT, int MB>
++__device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* const (&x0)[MB],
++                                           const half* const (&x1)[MB], const bool (&ok0)[MB], const bool (&ok1)[MB], int lane,
++                                           float (&acc)[MB][NT][2][4]) {
+     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+     const size_t kstride = (size_t)ntiles * TW;
+     for (int i = 0; i < nkt; ++i) {
+@@ -35,28 +44,44 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
+ #pragma unroll
+         for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+         const int k = (kt0 + i) * 16;
+-        const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
+-                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
+-                               ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u,
+-                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u};
++        uint32_t a[MB][4];
++#pragma unroll
++        for (int mb = 0; mb < MB; ++mb) {
++            a[mb][0] = ok0[mb] ? *reinterpret_cast<const uint32_t*>(x0[mb] + k) : 0u;
++            a[mb][1] = ok1[mb] ? *reinterpret_cast<const uint32_t*>(x1[mb] + k) : 0u;
++            a[mb][2] = ok0[mb] ? *reinterpret_cast<const uint32_t*>(x0[mb] + k + 8) : 0u;
++            a[mb][3] = ok1[mb] ? *reinterpret_cast<const uint32_t*>(x1[mb] + k + 8) : 0u;
++        }
+ #pragma unroll
+         for (int j = 0; j < NT; ++j) {
+             uint32_t b0[2], b1[2];
+             decode_lane<K2, CB>(w[j], lane, b0, b1);
+-            mma16816(acc[j][0], a, b0);
+-            mma16816(acc[j][1], a, b1);
++#pragma unroll
++            for (int mb = 0; mb < MB; ++mb) {
++                mma16816(acc[mb][j][0], a[mb], b0);
++                mma16816(acc[mb][j][1], a[mb], b1);
++            }
+         }
+     }
+ }
+ 
+-// Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
+-template <int CB, int NT, int W>
++// Program (expert u, n block, split, member group): 16 MB members times W_q over the split's K range, in warp order.
++template <int CB, int NT, int W, int MB>
+ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
+-    if (u >= a.ucount[0]) return;
+-    const int MT = (a.maxm + 15) / 16;
+-    const int mtile = zz % MT;
+-    const int split = (zz / MT) % a.sk;
+-    const int mat = zz / MT / a.sk;
++    int mtile, split, mat;
++    if (a.work) { // prompt rows: y walks the work list, z the matrix and split
++        if (u >= a.nwork[0]) return;
++        mtile = a.work[2 * u + 1];
++        u = a.work[2 * u];
++        split = zz % a.sk;
++        mat = zz / a.sk;
++    } else {
++        if (u >= a.ucount[0]) return;
++        const int MT = (a.maxm + 16 * MB - 1) / (16 * MB);
++        mtile = zz % MT;
++        split = (zz / MT) % a.sk;
++        mat = zz / MT / a.sk;
++    }
+     const half* X = mat ? a.x1 : a.x0;
+     const int e = a.uids[u];
+     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
+@@ -65,34 +90,44 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+     const int g = lane >> 2, t = lane & 3;
+     const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4); // row stride of the trellis, in tiles
+ 
+-    __shared__ int rows_sh[16];
+-    if (threadIdx.x < 16) {
+-        const int m = mtile * 16 + threadIdx.x;
++    __shared__ int rows_sh[16 * MB];
++    for (int i = threadIdx.x; i < 16 * MB; i += blockDim.x) {
++        const int m = mtile * 16 * MB + i;
+         const int code = m < a.maxm ? a.members[u * a.maxm + m] : -1;
+-        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
++        rows_sh[i] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
+     }
+     __syncthreads();
+-    if (rows_sh[0] < 0) return; // members come first, so this tile is empty
+-    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+-    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
+-    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
++    if (rows_sh[0] < 0) return; // members come first, so this group is empty
++    const half* x0[MB];
++    const half* x1[MB];
++    bool ok0[MB], ok1[MB];
++#pragma unroll
++    for (int mb = 0; mb < MB; ++mb) {
++        const int r0 = rows_sh[mb * 16 + g], r1 = rows_sh[mb * 16 + g + 8];
++        ok0[mb] = r0 >= 0;
++        ok1[mb] = r1 >= 0;
++        x0[mb] = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
++        x1[mb] = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
++    }
+     const int per_warp = (a.k >> 4) / a.sk / W;
+     const int kt0 = split * (per_warp * W) + warp * per_warp;
+     const int nt0 = nblock * NT;
+ 
+-    float acc[NT][2][4];
++    float acc[MB][NT][2][4];
+ #pragma unroll
+-    for (int i = 0; i < NT; ++i)
++    for (int mb = 0; mb < MB; ++mb)
+ #pragma unroll
+-        for (int h = 0; h < 2; ++h)
++        for (int i = 0; i < NT; ++i)
+ #pragma unroll
+-            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[mb][i][h][c] = 0.f;
+ 
+     __shared__ __align__(16) float red[W][16][NT * 16];
+     switch (k2) {
+ #define TF_EXL3X_CASE(K2_)                                                                                   \
+     case K2_:                                                                                                \
+-        warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
++        warp_tiles<CB, K2_, NT, MB>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, lane, acc);              \
+         break;
+         TF_EXL3X_CASE(2)
+         TF_EXL3X_CASE(3)
+@@ -115,24 +150,31 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+     }
+ 
+ #pragma unroll
+-    for (int i = 0; i < NT; ++i)
+-#pragma unroll
+-        for (int h = 0; h < 2; ++h) {
+-            const int col = i * 16 + h * 8 + 2 * t;
+-            red[warp][g][col] = acc[i][h][0];
+-            red[warp][g][col + 1] = acc[i][h][1];
+-            red[warp][g + 8][col] = acc[i][h][2];
+-            red[warp][g + 8][col + 1] = acc[i][h][3];
++    for (int mb = 0; mb < MB; ++mb) {
++        if (mb > 0) {
++            if (rows_sh[mb * 16] < 0) break; // block-uniform: the remaining member tiles are empty
++            __syncthreads();
+         }
+-    __syncthreads();
+-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+-        const int row = idx / (NT * 16), col = idx % (NT * 16);
+-        const int r = rows_sh[row];
+-        if (r < 0) continue;
+-        float s = red[0][row][col];
+ #pragma unroll
+-        for (int w = 1; w < W; ++w) s += red[w][row][col];
+-        a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = i * 16 + h * 8 + 2 * t;
++                red[warp][g][col] = acc[mb][i][h][0];
++                red[warp][g][col + 1] = acc[mb][i][h][1];
++                red[warp][g + 8][col] = acc[mb][i][h][2];
++                red[warp][g + 8][col + 1] = acc[mb][i][h][3];
++            }
++        __syncthreads();
++        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[mb * 16 + row];
++            if (r < 0) continue;
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < W; ++w) s += red[w][row][col];
++            a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
++        }
+     }
+ }
+ 
+@@ -141,15 +183,30 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+ // ---------------------------------------------------------------------------------------------------------------
+ 
+ extern "C" __global__ void tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {  // 3inst, any width
+-    tf_exl3::grouped_body<0, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++    tf_exl3::grouped_body<0, 8, 4, 1>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// Prompt rows: 64 columns and 64 members a program, one weight decode for all of them.
++extern "C" __global__ void tf_exl3_grouped_mb_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, tf_exl3::GROUPED_NT, 4, tf_exl3::GROUPED_MB>(a, blockIdx.y, blockIdx.x, blockIdx.z);
+ }
+ 
+ extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, any width
+-    tf_exl3::grouped_body<1, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++    tf_exl3::grouped_body<1, 8, 4, 1>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// Prompt rows: 64 columns and 64 members a program, one weight decode for all of them.
++extern "C" __global__ void tf_exl3_grouped_mb_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, tf_exl3::GROUPED_NT, 4, tf_exl3::GROUPED_MB>(a, blockIdx.y, blockIdx.x, blockIdx.z);
+ }
+ 
+ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
+-    tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++    tf_exl3::grouped_body<2, 8, 4, 1>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// Prompt rows: 64 columns and 64 members a program, one weight decode for all of them.
++extern "C" __global__ void tf_exl3_grouped_mb_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, tf_exl3::GROUPED_NT, 4, tf_exl3::GROUPED_MB>(a, blockIdx.y, blockIdx.x, blockIdx.z);
+ }
+ 
+ namespace tf_exl3 {
+@@ -166,6 +223,35 @@ struct GroupArgs {
+     int rows, slots, experts, maxm;
+ };
+ 
++// The prompt rows' work list: each distinct expert's member groups of `group` members, in expert order (one block).
++extern "C" __global__ void __launch_bounds__(1024) tf_exl3_worklist(const int* ucount, const int* members, int maxm, int group,
++                                                                   int* work, int* nwork) {
++    __shared__ int groups[1024];
++    __shared__ int base[1024];
++    const int n = ucount[0];
++    for (int u = threadIdx.x; u < 1024; u += blockDim.x) {
++        int c = 0;
++        if (u < n)
++            while (c < maxm && members[u * maxm + c] >= 0) ++c;
++        groups[u] = (c + group - 1) / group;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        int t = 0;
++        for (int u = 0; u < n; ++u) {
++            base[u] = t;
++            t += groups[u];
++        }
++        nwork[0] = t;
++    }
++    __syncthreads();
++    for (int u = threadIdx.x; u < n; u += blockDim.x)
++        for (int g = 0; g < groups[u]; ++g) {
++            work[2 * (base[u] + g)] = u;
++            work[2 * (base[u] + g) + 1] = g;
++        }
++}
++
+ extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const GroupArgs a) {
+     extern __shared__ int sh_pick[];
+     __shared__ int warp_tot[GROUP_THREADS / 32];
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index e665dd3a..99e1c266 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -56,6 +56,8 @@ pub const Scratch = struct {
+     ids: u64, // int32 [min(P, E)], distinct routed experts in id order
+     count: u64, // int32 [1]
+     members: u64, // int32 [min(P, E), rows], row * 32 + slot, -1 after the last member
++    work: u64, // int32 [2 * workItems()], prompt rows' (expert, member group) pairs
++    nwork: u64, // int32 [1]
+     rows: usize, // the row capacity the buffers hold
+     slots: usize, // slots a row, at most 32
+ };
+@@ -68,7 +70,12 @@ pub fn scratchBytes(l: Layer, rows: usize, slots: usize) !usize {
+     const maxu = @min(p, l.experts);
+     return align256(p * l.dims * 2) + align256(p * l.dims * 2) + align256(p * l.width * 2) +
+         align256(@max(2 * g_sk * l.width, d_sk * l.dims) * p * 4) + align256(p * l.dims * 4) +
+-        align256(maxu * 4) + 256 + align256(maxu * rows * 4);
++        align256(maxu * 4) + 256 + align256(maxu * rows * 4) + align256(2 * workItems(p, maxu) * 4) + 256;
++}
++
++/// Prompt rows' work items at most: every member group of 64, plus one partial group per distinct expert.
++fn workItems(p: usize, maxu: usize) usize {
++    return (p + prompt_shape.members - 1) / prompt_shape.members + maxu;
+ }
+ 
+ fn align256(n: usize) usize {
+@@ -97,15 +104,34 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
+     const ids = take(&at, maxu * 4);
+     const count = take(&at, 4);
+     const members = take(&at, maxu * rows * 4);
+-    return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .rows = rows, .slots = slots };
++    const work = take(&at, 2 * workItems(p, maxu) * 4);
++    const nwork = take(&at, 4);
++    return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .work = work, .nwork = nwork, .rows = rows, .slots = slots };
++}
++
++/// The grouped programs' shapes: decode rows 128 columns and 16 members; prompt rows (exl3_experts.cu GROUPED_NT and
++/// GROUPED_MB) 64 columns and 64 members, one weight decode for all of them.
++const Shape = struct { cols: usize, members: usize };
++const decode_shape: Shape = .{ .cols = 128, .members = 16 };
++const prompt_shape: Shape = .{ .cols = 64, .members = 64 };
++/// Rows from which a call takes the prompt shape (a row's sums are the same in either).
++pub const prompt_rows = 256;
++/// Dynamic shared memory the grouping takes at most: rows * slots ids (99 KB is sm_120/121's opt-in limit).
++pub const group_shared_max = 96 * 1024;
++
++/// Rows one call groups at most for `slots` slots a row.
++pub fn maxRows(slots: usize) usize {
++    return group_shared_max / (slots * 4);
+ }
+ 
+ /// The loaded kernels.
+ pub const Experts = struct {
+     mod: Module,
+     group: Function,
++    worklist: Function,
+     rot_in: Function,
+     grouped: [3]Function, // one per codebook
++    grouped_mb: [3]Function, // the prompt rows' shape, one per codebook
+     gateup: Function,
+     down_combine: Function,
+ 
+@@ -114,20 +140,28 @@ pub const Experts = struct {
+         var e: Experts = .{
+             .mod = try Module.load(d, kernels.exl3_experts),
+             .group = undefined,
++            .worklist = undefined,
+             .rot_in = undefined,
+             .grouped = undefined,
++            .grouped_mb = undefined,
+             .gateup = undefined,
+             .down_combine = undefined,
+         };
+         errdefer e.mod.unload();
+         e.group = try e.mod.function("tf_exl3_group");
+-        try e.group.allowDynamicShared(64 * 1024);
++        try e.group.allowDynamicShared(group_shared_max);
+         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
++        e.worklist = try e.mod.function("tf_exl3_worklist");
+         e.grouped = .{
+             try e.mod.function("tf_exl3_grouped_0"),
+             try e.mod.function("tf_exl3_grouped_1"),
+             try e.mod.function("tf_exl3_grouped_2"),
+         };
++        e.grouped_mb = .{
++            try e.mod.function("tf_exl3_grouped_mb_0"),
++            try e.mod.function("tf_exl3_grouped_mb_1"),
++            try e.mod.function("tf_exl3_grouped_mb_2"),
++        };
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+         e.down_combine = try e.mod.function("tf_exl3_down_combine");
+         return e;
+@@ -149,7 +183,10 @@ pub const Experts = struct {
+         const d_sk = try plan(w, d, false);
+         const p = rows * slots;
+         const maxu = @min(p, l.experts);
+-        const mt = (rows + 15) / 16;
++        const shape = if (rows >= prompt_rows) prompt_shape else decode_shape;
++        const grouped = if (rows >= prompt_rows) e.grouped_mb[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)];
++        const mt = (rows + shape.members - 1) / shape.members;
++        if (rows * slots * 4 > group_shared_max) return error.TooManyRows;
+         const i32d = struct {
+             fn f(v: usize) i32 {
+                 return @intCast(v);
+@@ -166,6 +203,18 @@ pub const Experts = struct {
+         a.add(i32d(l.experts));
+         a.add(i32d(rows));
+         try launch_.launch(e.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(rows * slots * 4) }, s, &a);
++        const listed = rows >= prompt_rows; // prompt rows: programs only for the member groups that exist
++        const items = workItems(p, maxu);
++        if (listed) {
++            var wl: launch_.Args = .{};
++            wl.add(sc.count);
++            wl.add(sc.members);
++            wl.add(i32d(rows));
++            wl.add(i32d(prompt_shape.members));
++            wl.add(sc.work);
++            wl.add(sc.nwork);
++            try launch_.launch(e.worklist, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 } }, s, &wl);
++        }
+ 
+         var r: launch_.Args = .{};
+         r.add(x);
+@@ -201,7 +250,14 @@ pub const Experts = struct {
+         g.add(i32d(maxu));
+         g.add(@as(i32, 2));
+         g.add(i32d(l.gu_stride));
+-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
++        g.add(if (listed) sc.work else @as(u64, 0));
++        g.add(if (listed) sc.nwork else @as(u64, 0));
++        // prompt rows: column blocks fastest over the work list; decode rows: the experts fastest
++        const gate_grid: launch_.Dim3 = if (listed)
++            .{ .x = @intCast(w / shape.cols), .y = @intCast(items), .z = @intCast(2 * g_sk) }
++        else
++            .{ .x = @intCast(maxu), .y = @intCast(w / shape.cols), .z = @intCast(2 * g_sk * mt) };
++        try launch_.launch(grouped, .{ .grid = gate_grid, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+ 
+         var ep: launch_.Args = .{};
+         ep.add(sc.z);
+@@ -238,7 +294,13 @@ pub const Experts = struct {
+         dn.add(i32d(maxu));
+         dn.add(@as(i32, 1));
+         dn.add(@as(i32, 0));
+-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
++        dn.add(if (listed) sc.work else @as(u64, 0));
++        dn.add(if (listed) sc.nwork else @as(u64, 0));
++        const down_grid: launch_.Dim3 = if (listed)
++            .{ .x = @intCast(d / shape.cols), .y = @intCast(items), .z = @intCast(d_sk) }
++        else
++            .{ .x = @intCast(maxu), .y = @intCast(d / shape.cols), .z = @intCast(d_sk * mt) };
++        try launch_.launch(grouped, .{ .grid = down_grid, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+ 
+         var cb: launch_.Args = .{};
+         cb.add(sc.z);
+@@ -295,5 +357,6 @@ test "the scratch layout is 256-aligned and covered by scratchBytes" {
+     try std.testing.expectEqual(@as(u64, 0), sc.ids % 256);
+     try std.testing.expectEqual(@as(u64, 0), sc.count % 256);
+     try std.testing.expectEqual(@as(u64, 0), sc.members % 256);
+-    try std.testing.expectEqual(@as(usize, @intFromPtr(&buf) + bytes), sc.members + @as(usize, 9) * 64 * 4);
++    try std.testing.expectEqual(@as(u64, 0), sc.work % 256);
++    try std.testing.expectEqual(@as(usize, @intFromPtr(&buf) + bytes), sc.nwork + 256);
+ }
+diff --git a/zig/src/cuda/qlinear.zig b/zig/src/cuda/qlinear.zig
+index 63ac3e33..0d94abbd 100644
+--- a/zig/src/cuda/qlinear.zig
++++ b/zig/src/cuda/qlinear.zig
+@@ -117,19 +117,29 @@ pub const Linear = struct {
+         }
+     }
+ 
+-    /// Decode rows as decode(), out (rows, n) fp32 unrounded: a tensor-parallel rank's partial rows (nvfp4 only).
++    /// Decode rows as decode(), out (rows, n) fp32 unrounded: a tensor-parallel rank's partial rows (nvfp4 and exl3).
+     pub fn decodeF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
+         const q = switch (w) {
+             .nvfp4 => |q| q,
++            .exl3 => |q| {
++                const e = l.exl3 orelse return error.FormatNotLoaded;
++                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
++                return e.decode(s, q, in.x, .bf16, rows, out, .f32);
++            },
+             else => return error.EpilogueNotBuilt,
+         };
+         return l.onLaneAs(s, q, .fp4, in, out, .f32, rows);
+     }
+ 
+-    /// Prompt rows as prompt(), out (rows, n) fp32 unrounded (nvfp4 only).
++    /// Prompt rows as prompt(), out (rows, n) fp32 unrounded (nvfp4 and exl3).
+     pub fn promptF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
+         const q = switch (w) {
+             .nvfp4 => |q| q,
++            .exl3 => |q| {
++                const e = l.exl3 orelse return error.FormatNotLoaded;
++                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
++                return e.prompt(s, q, in.x, .bf16, rows, out, .f32);
++            },
+             else => return error.EpilogueNotBuilt,
+         };
+         return l.onPromptAs(s, q, .fp4, in, out, .f32, rows);
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index feb7402b..a59b3ce1 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const glue = @import("cuda_glue.zig");
+ const b16 = @import("cuda_b16.zig");
++const mat = @import("cuda_mat.zig");
+ const latent = @import("cuda_latent.zig");
+ const sparse = @import("cuda_sparse.zig");
+ 
+@@ -11,17 +12,20 @@ const sparse = @import("cuda_sparse.zig");
+ pub const prompt_att_rows = 512;
+ 
+ /// The indexer's weights, replicated: [wk | weights_proj] [d + heads][dims], gate, key LayerNorm, pool bias, wq_b.
+-pub const Index = struct { kw: u64, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: u64, heads: usize, d: usize };
++pub const Index = struct { kw: u64, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: mat.Mat, heads: usize, d: usize };
+ 
+ /// One DSA layer on a rank of `heads` heads: proj, norms, q_b, kv_b per head as wk/wv, o, indexer; shapes from config.
++/// An EXL3 checkpoint keeps q_a and kv_a apart (`q_a`, `kv_a`; `proj` unused).
+ pub const Layer = struct {
+     proj: u64,
++    q_a: ?cuda.exl3.Weight = null,
++    kv_a: ?cuda.exl3.Weight = null,
+     q_norm: u64,
+     kv_norm: u64,
+-    q_b: u64,
++    q_b: mat.Mat,
+     wk: u64,
+     wv: u64,
+-    o: u64,
++    o: mat.Mat,
+     index: Index,
+     heads: usize,
+     qk: usize,
+@@ -72,7 +76,7 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x
+ /// forward.out_proj's fill for the DSA block: o_proj of rows lo..hi (s.vn) into out [hi - lo][dims] fp32.
+ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
+     const w = l.heads * l.dv;
+-    try b16.matmul(set, stream, s.vn + lo * w * 2, w, l.o, out, s.mm_part, hi - lo, l.dims, w, true);
++    try mat.matmul(set, stream, s.vn + lo * w * 2, w, l.o, out, s.mm_part, hi - lo, l.dims, w, true);
+ }
+ 
+ /// The block up to its out_proj (s.vn holds the expanded rows).
+@@ -90,15 +94,24 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
+ /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
+ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
+     const width = l.q_lora + l.lw;
+-    try b16.matmul(set, stream, x, x_stride, l.proj, s.dp, s.mm_part, rows, width, l.dims, false);
+-    try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+-    try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+-    try b16.matmul(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
++    if (l.q_a) |qa| {
++        // EXL3: q_a rows packed at s.dp, kv_a rows packed after them (s.dp holds rows x width)
++        const kv_rows = s.dp + rows * l.q_lora * 2;
++        try mat.matmul(set, stream, x, x_stride, .{ .exl3 = qa }, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
++        try mat.matmul(set, stream, x, x_stride, .{ .exl3 = l.kv_a.? }, kv_rows, s.mm_part, rows, l.lw, l.dims, false);
++        try glue.rmsnorm(set, stream, s.dp, l.q_lora, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
++        try glue.rmsnorm(set, stream, kv_rows, l.lw, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
++    } else {
++        try b16.matmul(set, stream, x, x_stride, l.proj, s.dp, s.mm_part, rows, width, l.dims, false);
++        try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
++        try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
++    }
++    try mat.matmul(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+     const ix = l.index;
+     try b16.matmul(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
+     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
+     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+-    if (qi) try b16.matmul(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
++    if (qi) try mat.matmul(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+ }
+ 
+ /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index ee38e00b..b258efe6 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -97,12 +97,19 @@ pub const Engine = struct {
+         const a = arena.allocator();
+         const cfg_path = try std.fs.path.join(a, &.{ checkpoint, "config.json" });
+         const text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, a, .limited(1 << 24));
+-        var why: modelopt.Why = .{};
+-        modelopt.admit(gpa, text, &why) catch |err| { // a quant_algo other than NVFP4 is refused before anything loads
+-            std.log.err("{s}: {s}", .{ cfg_path, why.text() });
+-            return err;
+-        };
+         const c = try config.parse(gpa, text);
++        const exl3 = c.head_unit == 128; // config.parse: an EXL3 checkpoint (quant_method exl3)
++        if (!exl3) {
++            var why: modelopt.Why = .{};
++            modelopt.admit(gpa, text, &why) catch |err| { // a quant_algo other than NVFP4 is refused before anything loads
++                std.log.err("{s}: {s}", .{ cfg_path, why.text() });
++                return err;
++            };
++        }
++        if (exl3 and world != 1) {
++            std.log.err("{s}: an EXL3 checkpoint runs on one rank (TF_GLM_WORLD=1)", .{cfg_path});
++            return error.Exl3NeedsOneRank;
++        }
+         var stream = try cuda.Stream.init(d, false);
+         errdefer stream.deinit();
+         const config_hash = try ranks.hashFile(a, io, cfg_path);
+@@ -124,6 +131,7 @@ pub const Engine = struct {
+         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
+         var m = try fw.Modules.load(d, ctx);
+         errdefer m.deinit();
++        if (exl3) try m.loadExl3(d);
+         var pieces = try fw.Pieces.init(d, o.settings.pieces);
+         errdefer pieces.deinit();
+         if (o.settings.layers > c.layers) return error.BadLayers;
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 1e57e55a..c1ef1581 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -18,6 +18,7 @@ const quant = @import("cuda_quant.zig");
+ const q4 = @import("cuda_q4.zig");
+ const state = @import("cuda_state.zig");
+ const shared = @import("cuda_shared.zig");
++const mat = @import("cuda_mat.zig");
+ 
+ pub const prefill_rows = state.prefill_rows;
+ pub const window_rows = state.window_rows;
+@@ -37,6 +38,8 @@ pub const Modules = struct {
+     pack_dense: cuda.Function,
+     quant: quant.Kernels,
+     q4: q4.Kernels,
++    dense: ?*cuda.exl3.Dense = null, // an EXL3 checkpoint's linears and their scratch
++    x3: ?*cuda.exl3_experts.Experts = null, // and its grouped experts
+ 
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+         const k = cuda.kernels;
+@@ -60,9 +63,25 @@ pub const Modules = struct {
+         m.quant = try quant.Kernels.load(m.mods[4]);
+         m.q4 = try q4.Kernels.load(m.mods[5], m.mods[3], ctx);
+         m.glue = try glue.Kernels.load(m.mods[6]);
++        m.dense = null;
++        m.x3 = null;
+         return m;
+     }
+ 
++    /// The EXL3 kernels, for a checkpoint whose weights are EXL3 groups.
++    pub fn loadExl3(m: *Modules, d: *const cuda.Driver) !void {
++        const pa = std.heap.page_allocator;
++        const de = try pa.create(cuda.exl3.Dense);
++        errdefer pa.destroy(de);
++        de.* = try cuda.exl3.Dense.load(d);
++        errdefer de.unload();
++        const x = try pa.create(cuda.exl3_experts.Experts);
++        errdefer pa.destroy(x);
++        x.* = try cuda.exl3_experts.Experts.load(d);
++        m.dense = de;
++        m.x3 = x;
++    }
++
+     /// What weights.load runs: the dense packing, and for the MTP head the quantizers and the 4-bit tiling.
+     pub fn tools(m: *const Modules) weights.Tools {
+         return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4 };
+@@ -73,6 +92,14 @@ pub const Modules = struct {
+     }
+ 
+     pub fn deinit(m: *Modules) void {
++        if (m.dense) |de| {
++            de.unload();
++            std.heap.page_allocator.destroy(de);
++        }
++        if (m.x3) |x| {
++            x.unload();
++            std.heap.page_allocator.destroy(x);
++        }
+         for (&m.mods) |*x| x.unload();
+         m.lane.unload();
+         m.prompt.unload();
+@@ -160,7 +187,7 @@ pub const Forward = struct {
+     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue };
++        return .{ .glue = &f.m.glue, .dense = f.m.dense, .copy_rows = f.m.copy_rows };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+@@ -244,11 +271,11 @@ pub const Forward = struct {
+     }
+ 
+     fn mlpKernels(f: *const Forward) mlp.Kernels {
+-        return .{ .set = f.set(), .linear = .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt }, .copy_rows = f.m.copy_rows };
++        return .{ .set = f.set(), .linear = .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = f.m.dense }, .copy_rows = f.m.copy_rows };
+     }
+ 
+     fn moeKernels(f: *const Forward) moe.Kernels {
+-        return .{ .set = f.set(), .experts = &f.m.experts, .put_slot = f.m.put_slot };
++        return .{ .set = f.set(), .experts = &f.m.experts, .put_slot = f.m.put_slot, .x3 = f.m.x3 };
+     }
+ 
+     const Site = enum { mixer, ffn };
+@@ -454,7 +481,9 @@ pub const Forward = struct {
+         var cut: [max_pieces][2]usize = undefined;
+         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
+         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
+-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
++        // one rank exchanges nothing: the pieces' copies and events would be overhead alone
++        const alone = f.ranks.len == 1 and f.ranks[0].w.share.world == 1;
++        if (!alone and (pieces > 1 or (pieces == 1 and f.splits(R)))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+         try f.finish(R);
+     }
+ 
+@@ -494,7 +523,7 @@ pub const Forward = struct {
+             try glue.rmsnorm(f.set(), f.stream, b.hidden, c.hidden, r.w.norm, b.fnormed, c.hidden, b.fxs, c.eps, R, c.hidden);
+             const head_rows: usize = if (b.prefill) 1 else R;
+             const first = if (b.prefill) R - 1 else 0;
+-            try b16.matmul(f.set(), f.stream, b.fnormed + first * c.hidden * 2, c.hidden, r.w.head, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);
++            try mat.matmul(f.set(), f.stream, b.fnormed + first * c.hidden * 2, c.hidden, r.w.head, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);
+         }
+     }
+ 
+@@ -515,7 +544,7 @@ pub const Forward = struct {
+             if (r.st.mtp_len == 0) try f.d.check(f.d.api.cuMemsetD8Async(b.me, 0, D * 2, f.stream.handle), "cuMemsetD8Async"); // position 0's embedding is zeroed
+             try glue.rmsnorm(f.set(), f.stream, b.me, D, m.enorm, b.mcat, 2 * D, null, c.eps, n, D);
+             try glue.rmsnorm(f.set(), f.stream, b.hin, D, m.hnorm, b.mcat + D * 2, 2 * D, null, c.eps, n, D);
+-            try b16.matmul(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
++            try mat.matmul(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
+             try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
+             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
+             try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+@@ -534,7 +563,11 @@ pub const Forward = struct {
+             const b = r.b;
+             try glue.residualAdd(f.set(), f.stream, b.mx, b.mx, b.gathered, n, D, r.w.share.world);
+             try glue.rmsnorm(f.set(), f.stream, b.mx + (n - 1) * D * 2, D, m.norm, b.fnormed, D, b.fxs, c.eps, 1, D);
+-            if (!b.prefill) try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, m.draft, b.logits, 1);
++            // an EXL3 checkpoint drafts through its own head (no BF16 head to quantize a 4-bit draft head from)
++            if (!b.prefill) switch (r.w.head) {
++                .exl3 => try mat.matmul(f.set(), f.stream, b.fnormed, D, r.w.head, b.logits, b.kda.mm_part, 1, r.w.share.vocab.len(), D, false),
++                .bf16 => try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, m.draft.?, b.logits, 1),
++            };
+         }
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 733edcdb..9cb126ec 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -4,7 +4,11 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ 
+ /// What the forward's kernels launch from: our glue's functions.
+-pub const Set = struct { glue: *const Kernels };
++pub const Set = struct {
++    glue: *const Kernels,
++    dense: ?*cuda.exl3.Dense = null, // an EXL3 checkpoint's linears (cuda_mat.zig)
++    copy_rows: ?cuda.Function = null, // glm_ops' row copy, for projections an EXL3 checkpoint keeps apart
++};
+ 
+ /// Our glm_glue.cu's functions.
+ pub const Kernels = struct {
+diff --git a/zig/src/families/glm/cuda_kda_block.zig b/zig/src/families/glm/cuda_kda_block.zig
+index 918cf48a..0c87a067 100644
+--- a/zig/src/families/glm/cuda_kda_block.zig
++++ b/zig/src/families/glm/cuda_kda_block.zig
+@@ -5,13 +5,16 @@ const cuda = @import("cuda");
+ const glue = @import("cuda_glue.zig");
+ const kda = @import("cuda_kda.zig");
+ const b16 = @import("cuda_b16.zig");
++const mat = @import("cuda_mat.zig");
+ 
+ /// One KDA layer, `heads` heads: proj bf16 [3 heads 128 + 256 + heads][dims], f_b, g_b, o, the chain's taps and norm.
++/// An EXL3 checkpoint keeps [q | k | v] apart (`qkv`); `proj` then holds the bf16 [f_a | g_a | b] rows alone.
+ pub const Layer = struct {
+     proj: u64,
++    qkv: ?cuda.exl3.Weight = null,
+     fb: u64,
+     gb: u64,
+-    o: u64,
++    o: mat.Mat,
+     conv_w: u64,
+     a_log: u64,
+     dt_bias: u64,
+@@ -27,7 +30,7 @@ pub const Layer = struct {
+ };
+ 
+ /// The block's scratch for `rows` rows: projection, decay and gate rows, chain saves and scratch, B16 split-K partials.
+-pub const Scratch = struct { p: u64, ka: u64, kg: u64, saves: kda.Saves, wide: kda.Wide, mm_part: u64 };
++pub const Scratch = struct { p: u64, ka: u64, kg: u64, saves: kda.Saves, wide: kda.Wide, mm_part: u64, xt: u64 = 0 };
+ 
+ /// forward.kda_block: out [rows][dims] fp32 partial; `wide`: three-kernel chain; `prompt`: commits the conv window.
+ pub fn block(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, out: u64) !void {
+@@ -38,7 +41,7 @@ pub fn block(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Laye
+ /// forward.out_proj's fill for the KDA block: o_proj of rows lo..hi (s.saves.out) into out [hi - lo][dims] fp32.
+ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
+     const n = l.heads * kda.dk;
+-    try b16.matmul(set, stream, s.saves.out + lo * n * 2, n, l.o, out, s.mm_part, hi - lo, l.dims, n, true);
++    try mat.matmul(set, stream, s.saves.out + lo * n * 2, n, l.o, out, s.mm_part, hi - lo, l.dims, n, true);
+ }
+ 
+ /// The block up to its out_proj: the projections, the chain, and a prompt chunk's conv window commit.
+@@ -53,7 +56,13 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
+     const n = l.heads * kda.dk;
+     const w = l.width();
+     const fa = 3 * n;
+-    try b16.matmul(set, stream, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
++    if (l.qkv) |q| {
++        // EXL3: [q | k | v] and the bf16 [f_a | g_a | b] rows apart, each copied into its columns of s.p
++        try mat.matmul(set, stream, x, x_stride, .{ .exl3 = q }, s.xt, s.mm_part, rows, fa, l.dims, false);
++        try mat.copyRows(set, stream, s.xt, fa * 2, s.p, w * 2, rows, fa * 2);
++        try b16.matmul(set, stream, x, x_stride, l.proj, s.xt, s.mm_part, rows, w - fa, l.dims, false);
++        try mat.copyRows(set, stream, s.xt, (w - fa) * 2, s.p + fa * 2, w * 2, rows, (w - fa) * 2);
++    } else try b16.matmul(set, stream, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
+     try b16.matmul(set, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
+     try b16.matmul(set, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
+ }
+diff --git a/zig/src/families/glm/cuda_mat.zig b/zig/src/families/glm/cuda_mat.zig
+new file mode 100644
+index 00000000..501cf046
+--- /dev/null
++++ b/zig/src/families/glm/cuda_mat.zig
+@@ -0,0 +1,38 @@
++//! A GLM-5.3-Flash projection on CUDA as its checkpoint stores it: BF16 (the B16 path) or an EXL3 trellis.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const glue = @import("cuda_glue.zig");
++const b16 = @import("cuda_b16.zig");
++
++/// A projection's weights: bf16 [n][k] on the device, or an EXL3 group (cuda/exl3.zig).
++pub const Mat = union(enum) {
++    bf16: u64,
++    exl3: cuda.exl3.Weight,
++};
++
++/// out [m][n] bf16 (fp32 with `wide`) = x . w, x [m][k] bf16 `x_stride` apart (EXL3: packed rows only).
++pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: Mat, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
++    switch (w) {
++        .bf16 => |p| return b16.matmul(set, stream, x, x_stride, p, out, part, m, n, k, wide),
++        .exl3 => |q| {
++            const de = set.dense orelse return error.FormatNotLoaded;
++            if (q.k != k or q.n != n) return error.Exl3Shape;
++            if (x_stride != k) return error.RowStride;
++            return de.decode(stream, q, x, .bf16, m, out, if (wide) .f32 else .bf16);
++        },
++    }
++}
++
++/// Rows of `bytes` from src (`src_stride` bytes apart) into dst (`dst_stride` apart): glm_ops' tf_glm_copy_rows.
++pub fn copyRows(set: glue.Set, stream: cuda.Stream, src: u64, src_stride: usize, dst: u64, dst_stride: usize, rows: usize, bytes: usize) !void {
++    const f = set.copy_rows orelse return error.FormatNotLoaded;
++    var a: cuda.Args = .{};
++    a.add(src);
++    a.add(@as(c_longlong, @intCast(src_stride)));
++    a.add(dst);
++    a.add(@as(c_longlong, @intCast(dst_stride)));
++    a.add(@as(c_int, @intCast(rows)));
++    a.add(@as(c_int, @intCast(bytes)));
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((rows * bytes + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
++}
+diff --git a/zig/src/families/glm/cuda_mlp.zig b/zig/src/families/glm/cuda_mlp.zig
+index 8e8d5eba..868bb164 100644
+--- a/zig/src/families/glm/cuda_mlp.zig
++++ b/zig/src/families/glm/cuda_mlp.zig
+@@ -4,8 +4,8 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const glue = @import("cuda_glue.zig");
+ 
+-/// One dense layer on a rank: gate and up [width][dims] and down [dims][width], NVFP4 as Fp4Linear holds them.
+-pub const Layer = struct { gate: cuda.qmmf.Weight, up: cuda.qmmf.Weight, down: cuda.qmmf.Weight, width: usize, dims: usize, limit: f32 };
++/// One dense layer on a rank: gate and up [width][dims] and down [dims][width], NVFP4 as Fp4Linear holds them, or EXL3.
++pub const Layer = struct { gate: cuda.qlinear.Weight, up: cuda.qlinear.Weight, down: cuda.qlinear.Weight, width: usize, dims: usize, limit: f32 };
+ 
+ /// The block's scratch for up to `rows` rows: one projection's rows, the [gate | up] rows, the activation and its sums.
+ pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64 };
+@@ -13,8 +13,7 @@ pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64 };
+ pub const Kernels = struct { set: glue.Set, linear: cuda.qlinear.Linear, copy_rows: cuda.Function };
+ 
+ /// Fp4Linear.__call__ (prefill on a prompt chunk): bf16 out, or fp32 with `wide`; the prompt GEMM needs `ldx` % 8 == 0.
+-fn mm(k: Kernels, stream: cuda.Stream, w: cuda.qmmf.Weight, x: u64, ldx: usize, rows: usize, out: u64, wide: bool, prompt: bool) !void {
+-    const q: cuda.qlinear.Weight = .{ .nvfp4 = w };
++fn mm(k: Kernels, stream: cuda.Stream, q: cuda.qlinear.Weight, x: u64, ldx: usize, rows: usize, out: u64, wide: bool, prompt: bool) !void {
+     const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx };
+     if (prompt) {
+         std.debug.assert(x % 16 == 0 and (rows == 1 or ldx % 8 == 0));
+@@ -37,7 +36,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi
+ /// The block up to its down projection: [gate | up] and SwiGLU into s.act.
+ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
+     const w = l.width;
+-    for ([_]cuda.qmmf.Weight{ l.gate, l.up }, 0..) |proj, j| {
++    for ([_]cuda.qlinear.Weight{ l.gate, l.up }, 0..) |proj, j| {
+         // Fp4Linear(out=a column slice): the rows computed contiguous, then copied into their half of each row
+         try mm(k, stream, proj, x, x_stride, rows, s.tmp, false, prompt);
+         var a: cuda.Args = .{};
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index ec860a18..c97a2575 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -5,12 +5,15 @@ const cuda = @import("cuda");
+ const glue = @import("cuda_glue.zig");
+ const experts = @import("cuda_experts.zig");
+ const b16 = @import("cuda_b16.zig");
++const mat = @import("cuda_mat.zig");
+ 
+ /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
++/// An EXL3 checkpoint's experts are `x3`: the routed ones and the shared one stacked last (the pick's shared slot).
+ pub const Layer = struct {
+     router: u64,
+     bias: u64,
+     routed: cuda.experts.Layer,
++    x3: ?cuda.exl3_experts.Layer = null,
+     count: usize,
+     shared_gu: u64,
+     shared_down: u64,
+@@ -34,10 +37,14 @@ pub const Scratch = struct {
+     sxs: u64, // fp32 [rows][shared / 64]
+     sy: u64, // fp32 [rows][dims]
+     mm_part: u64, // fp32 split-K partials of the shared expert's matmuls
++    x3: u64 = 0, // the EXL3 experts' scratch for x3_rows rows (exl3_experts.scratchBytes)
+ };
+ 
++/// Rows one EXL3 experts call takes: a whole prompt chunk, so each expert's weights are decoded for many members at once.
++pub const x3_rows = 2048;
++
+ /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
+-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, put_slot: cuda.Function };
++pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, put_slot: cuda.Function, x3: ?*const cuda.exl3_experts.Experts = null };
+ 
+ /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
+ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
+@@ -52,6 +59,17 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     const shared_id: i32 = @intCast(l.count);
+     try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
+     try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
++    if (l.x3) |xl| {
++        // EXL3: every slot (the shared expert's included) weighted and summed into s.sy, x3_rows rows a call
++        const x3k = k.x3 orelse return error.FormatNotLoaded;
++        var r: usize = 0;
++        while (r < rows) : (r += x3_rows) {
++            const m = @min(rows - r, x3_rows);
++            const sc = try cuda.exl3_experts.scratch(s.x3, xl, m, slots);
++            try x3k.run(stream, xl, x + r * x_stride * 2, x_stride, .bf16, s.pick + r * slots * 4, s.wts + r * slots * 4, m, s.sy + r * d * 4, sc);
++        }
++        return;
++    }
+     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt };
+     try experts.route(k.experts, stream, s.pick, rows * slots, plan);
+     try experts.run(k.experts, stream, .gate_up, l.routed, plan, x, x_stride, rows, s.eact, shared_id);
+@@ -63,6 +81,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     const d = l.routed.dims;
+     const slots = l.top_k + 1;
+     const n = hi - lo;
++    if (l.x3 != null) return mat.copyRows(k.set, stream, s.sy + lo * d * 4, d * 4, out, d * 4, n, d * 4);
+     const eb: usize = if (prompt) 2 else 4; // the slot rows: bf16 in a prompt chunk
+     try b16.matmul(k.set, stream, x + lo * x_stride * 2, x_stride, l.shared_gu, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index e85cb25a..5ae00e3a 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -12,7 +12,7 @@ const config = @import("config.zig");
+ const shard = @import("cuda_shard.zig");
+ 
+ pub const model_type = "glm5_next";
+-pub const formats: []const []const u8 = &.{"modelopt-nvfp4"};
++pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "exl3" };
+ // cc-defer: a fixed window; the Python family sizes it from free memory (capacity.admit), port that when serving needs
+ pub const default_context: i64 = 8192;
+ pub const max_segments: u32 = 1;
+@@ -209,7 +209,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
+             .{ ranks.max_world, ranks.max_world },
+         ),
+-        error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4 checkpoints (the log names what config.json has)",
++        error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4 and EXL3 checkpoints (the log names what config.json has)",
++        error.Exl3NeedsOneRank => "an EXL3 GLM-5.3-Flash checkpoint runs on one GPU: set TF_GLM_RANK=0 and TF_GLM_WORLD=1",
+         else => null,
+     };
+ }
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 32559505..9061d031 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -59,6 +59,15 @@ fn b16Shapes(w: *const weights.Weights) [10][2]usize {
+     };
+ }
+ 
++/// The first EXL3 experts layer of the weights, whose shapes every MoE layer shares (null: not an EXL3 checkpoint).
++fn exl3Experts(w: *const weights.Weights) ?cuda.exl3_experts.Layer {
++    for (w.layers) |l| switch (l.ffn) {
++        .moe => |m| if (m.x3) |x| return x,
++        .dense => {},
++    };
++    return null;
++}
++
+ /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.
+ pub const Buffers = struct {
+     arena: Arena,
+@@ -160,6 +169,8 @@ pub const Buffers = struct {
+             rows * (D / 64) * 4,  (if (prefill) 1 else rows) * s.vocab.len() * 2,
+             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
+             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
++            if (exl3Experts(w)) |_| rows * 3 * n * 2 else 4, // xt: an EXL3 checkpoint's [q | k | v] rows before their copy
++            if (exl3Experts(w)) |xl| try cuda.exl3_experts.scratchBytes(xl, @min(rows, moe.x3_rows), slots) else 4, // x3
+         };
+         var p: [sizes.len]u64 = undefined;
+         const a = try arena(d, &sizes, &p);
+@@ -178,7 +189,7 @@ pub const Buffers = struct {
+             .hcpart = p[6],
+             .gathered = p[7],
+             .kproj = p[8],
+-            .kda = .{ .p = 0, .ka = p[9], .kg = p[10], .saves = .{ .out = p[11], .state_out = 0, .k = p[12], .v = p[13], .g = p[14], .b = p[15] }, .wide = .{ .q = p[16], .y = p[17] }, .mm_part = p[42] },
++            .kda = .{ .p = 0, .ka = p[9], .kg = p[10], .saves = .{ .out = p[11], .state_out = 0, .k = p[12], .v = p[13], .g = p[14], .b = p[15] }, .wide = .{ .q = p[16], .y = p[17] }, .mm_part = p[42], .xt = p[71] },
+             .dsa = .{
+                 .dp = p[18],
+                 .qr = p[19],
+@@ -202,7 +213,7 @@ pub const Buffers = struct {
+                 .at = p[43],
+             },
+             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47] },
+-            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
++            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42], .x3 = p[72] },
+             .hidden = p[62],
+             .fnormed = p[63],
+             .fxs = p[64],
+diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
+index 80bc44a8..ad4269c0 100644
+--- a/zig/src/families/glm/cuda_weights.zig
++++ b/zig/src/families/glm/cuda_weights.zig
+@@ -1,4 +1,4 @@
+-//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4), named by its paths for digests.
++//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4 or EXL3), named by its paths for digests.
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
+@@ -12,6 +12,8 @@ const mlp = @import("cuda_mlp.zig");
+ const moe = @import("cuda_moe.zig");
+ const quant = @import("cuda_quant.zig");
+ const q4 = @import("cuda_q4.zig");
++const mat = @import("cuda_mat.zig");
++const exl3_load = core.exl3_load;
+ 
+ const Tensor = core.checkpoint.Tensor;
+ const prefix = "model.language_model.";
+@@ -24,8 +26,9 @@ pub const Ffn = union(enum) { dense: mlp.Layer, moe: moe.Layer };
+ 
+ pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
+ 
+-/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer (NVFP4 experts), shared_head.norm, 4-bit draft head.
+-pub const Mtp = struct { enorm: u64, hnorm: u64, eh: u64, norm: u64, layer: Layer, draft: q4.Q4 };
++/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer, shared_head.norm, 4-bit draft head (an EXL3
++/// checkpoint drafts through its EXL3 head: no draft head).
++pub const Mtp = struct { enorm: u64, hnorm: u64, eh: mat.Mat, norm: u64, layer: Layer, draft: ?q4.Q4 };
+ 
+ /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
+ pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null };
+@@ -40,12 +43,14 @@ pub const Weights = struct {
+     embed: u64 = 0, // bf16 [vocab][dims]
+     layers: []Layer = &.{},
+     norm: u64 = 0,
+-    head: u64 = 0, // bf16 [share.vocab][dims]
++    head: mat.Mat = .{ .bf16 = 0 }, // bf16 [share.vocab][dims], or an EXL3 group
+     mtp: ?Mtp = null,
+     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+     named: std.ArrayList(Named) = .empty,
++    exl3: ?cuda.exl3_upload.Uploader = null, // an EXL3 checkpoint's groups on the device
+ 
+     pub fn deinit(w: *Weights) void {
++        if (w.exl3) |*u| u.deinit();
+         for (w.buffers.items) |*b| b.free();
+         for (w.named.items) |n| w.gpa.free(n.name);
+         w.buffers.deinit(w.gpa);
+@@ -78,6 +83,39 @@ const Loader = struct {
+     ck: *core.Checkpoint,
+     host: std.ArrayList(u8) = .empty,
+     name_buf: [192]u8 = undefined,
++    x3: ?*exl3_load.Scan = null, // an EXL3 checkpoint's trellis groups
++    x3_index: std.StringHashMapUnmanaged(usize) = .empty,
++
++    /// The EXL3 group `prefix ++ fmt` (a dense linear) on the device.
++    fn group(L: *Loader, comptime fmt: []const u8, args: anytype) !cuda.exl3.Weight {
++        const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
++        return L.groupNamed(name);
++    }
++
++    fn groupNamed(L: *Loader, name: []const u8) !cuda.exl3.Weight {
++        const scan = L.x3.?;
++        const gi = L.x3_index.get(name) orelse {
++            std.log.err("glm: no EXL3 group {s}", .{name});
++            return error.MissingTensor;
++        };
++        var arena = std.heap.ArenaAllocator.init(L.gpa);
++        defer arena.deinit();
++        const parts = try scan.parts(arena.allocator(), gi);
++        return L.w.exl3.?.dense(parts, scan.groups[gi]);
++    }
++
++    /// One expert projection's trellis, scales and width, as exl3_upload.layer reads them.
++    fn expertProj(L: *Loader, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !cuda.exl3_upload.Proj {
++        const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
++        const scan = L.x3.?;
++        const gi = L.x3_index.get(name) orelse {
++            std.log.err("glm: no EXL3 group {s}", .{name});
++            return error.MissingTensor;
++        };
++        const parts = try scan.parts(a, gi);
++        if (parts.suh_packed) return error.PackedScales;
++        return .{ .trellis = parts.trellis.bytes, .suh = parts.suh.bytes, .svh = parts.svh.bytes, .k2 = scan.groups[gi].halves };
++    }
+ 
+     fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+         const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
+@@ -102,6 +140,7 @@ const Loader = struct {
+         for (lo..hi) |i| {
+             const v: f32 = switch (t.dtype) {
+                 .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
++                .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)))),
+                 .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
+                 else => return error.UnexpectedTensor,
+             };
+@@ -164,7 +203,31 @@ const Loader = struct {
+         const norm = try L.put("layers.{d}.kda.norm", .{i});
+         try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * dk, h.hi * dk, .bf16);
+         const o = try L.put("layers.{d}.kda.o", .{i});
+-        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
++        return .{ .proj = proj, .fb = fb, .gb = gb, .o = .{ .bf16 = o }, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
++    }
++
++    /// kda(i) from an EXL3 checkpoint at TP=1: [q | k | v] and o EXL3, [f_a | g_a | b], f_b and g_b fp16 as bf16, one conv.
++    fn kdaX(L: *Loader, i: u32) !kda_block.Layer {
++        const c = &L.w.config;
++        const h = L.w.share.kda;
++        if (h.lo != 0 or h.hi != c.kda_heads) return error.Exl3NeedsOneRank;
++        const qkv = try L.group("layers.{d}.self_attn.qkv_proj", .{i});
++        inline for (.{ "f_a", "g_a", "b" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
++        const proj = try L.put("layers.{d}.kda.proj", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), .bf16);
++        const fb = try L.put("layers.{d}.kda.fb", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), .bf16);
++        const gb = try L.put("layers.{d}.kda.gb", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.conv1d.weight", .{i}), .f32);
++        const conv = try L.put("layers.{d}.kda.conv", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.A_log", .{i}), .f32);
++        const a_log = try L.put("layers.{d}.kda.a_log", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.dt_bias", .{i}), .f32);
++        const dt = try L.put("layers.{d}.kda.dt_bias", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
++        const norm = try L.put("layers.{d}.kda.norm", .{i});
++        const o = try L.group("layers.{d}.self_attn.o_proj", .{i});
++        return .{ .proj = proj, .qkv = qkv, .fb = fb, .gb = gb, .o = .{ .exl3 = o }, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+     }
+ 
+     /// weights.load's dsa(i) (latent): [q_a | kv_a], norms, q_b by heads, kv_b as wk/wv (AbsorbW), o by cols, indexer.
+@@ -205,11 +268,66 @@ const Loader = struct {
+             .proj = proj,
+             .q_norm = q_norm,
+             .kv_norm = kv_norm,
+-            .q_b = q_b,
++            .q_b = .{ .bf16 = q_b },
++            .wk = wk,
++            .wv = wv,
++            .o = .{ .bf16 = o },
++            .index = .{ .kw = kw, .gate = gate, .ln_w = ln_w, .ln_b = ln_b, .ape = ape, .qb = .{ .bf16 = qb }, .heads = c.i_heads, .d = c.i_dim },
++            .heads = h.len(),
++            .qk = qk,
++            .dv = c.v_dim,
++            .lw = c.kv_lora,
++            .q_lora = c.q_lora,
++            .dims = c.hidden,
++            .eps = c.eps,
++            .dense_limit = c.keyWidth(),
++        };
++    }
++
++    /// dsa(i) from an EXL3 checkpoint at TP=1: q_a, kv_a, q_b, o and the indexer's wq_b EXL3; kv_b and the rest fp16 as bf16.
++    fn dsaX(L: *Loader, i: u32) !dsa_block.Layer {
++        const c = &L.w.config;
++        const h = L.w.share.mla;
++        if (h.lo != 0 or h.hi != c.mla_heads) return error.Exl3NeedsOneRank;
++        const qk = c.nope;
++        const q_a = try L.group("layers.{d}.self_attn.q_a_proj", .{i});
++        const kv_a = try L.group("layers.{d}.self_attn.kv_a_proj_with_mqa", .{i});
++        if (q_a.n != c.q_lora or kv_a.n != c.kv_lora) return error.UnexpectedTensor;
++        try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
++        const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
++        const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
++        const q_b = try L.group("layers.{d}.self_attn.q_b_proj", .{i});
++        const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
++        const per = qk + c.v_dim;
++        const total = c.mla_heads * per;
++        for (0..c.mla_heads) |head| try L.rows(kv_b, head * per, head * per + qk, total, .bf16);
++        const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
++        for (0..c.mla_heads) |head| try L.rows(kv_b, head * per + qk, (head + 1) * per, total, .bf16);
++        const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
++        const o = try L.group("layers.{d}.self_attn.o_proj", .{i});
++        inline for (.{ "wk", "weights_proj" }) |x| try L.whole(try L.get("layers.{d}.self_attn.indexer." ++ x ++ ".weight", .{i}), .bf16);
++        const kw = try L.put("layers.{d}.dsa.index.kw", .{i});
++        const qb = try L.group("layers.{d}.self_attn.indexer.wq_b", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
++        const ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
++        const ln_b = try L.put("layers.{d}.dsa.index.ln_b", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_gate", .{i}), .bf16);
++        const gate = try L.put("layers.{d}.dsa.index.gate", .{i});
++        try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_ape", .{i}), .bf16);
++        const ape = try L.put("layers.{d}.dsa.index.ape", .{i});
++        return .{
++            .proj = 0,
++            .q_a = q_a,
++            .kv_a = kv_a,
++            .q_norm = q_norm,
++            .kv_norm = kv_norm,
++            .q_b = .{ .exl3 = q_b },
+             .wk = wk,
+             .wv = wv,
+-            .o = o,
+-            .index = .{ .kw = kw, .gate = gate, .ln_w = ln_w, .ln_b = ln_b, .ape = ape, .qb = qb, .heads = c.i_heads, .d = c.i_dim },
++            .o = .{ .exl3 = o },
++            .index = .{ .kw = kw, .gate = gate, .ln_w = ln_w, .ln_b = ln_b, .ape = ape, .qb = .{ .exl3 = qb }, .heads = c.i_heads, .d = c.i_dim },
+             .heads = h.len(),
+             .qk = qk,
+             .dv = c.v_dim,
+@@ -221,6 +339,62 @@ const Loader = struct {
+         };
+     }
+ 
++    /// The dense MLP from an EXL3 checkpoint at TP=1: gate, up and down EXL3.
++    fn denseX(L: *Loader, i: u32) !mlp.Layer {
++        const c = &L.w.config;
++        const s = L.w.share.dense;
++        if (s.lo != 0 or s.hi != c.dense_inter) return error.Exl3NeedsOneRank;
++        return .{
++            .gate = .{ .exl3 = try L.group("layers.{d}.mlp.gate_proj", .{i}) },
++            .up = .{ .exl3 = try L.group("layers.{d}.mlp.up_proj", .{i}) },
++            .down = .{ .exl3 = try L.group("layers.{d}.mlp.down_proj", .{i}) },
++            .width = s.len(),
++            .dims = c.hidden,
++            .limit = c.swiglu_limit,
++        };
++    }
++
++    /// The MoE from an EXL3 checkpoint at TP=1: router fp16 as bf16, the routed experts and the shared one (last) EXL3.
++    fn moeX(L: *Loader, i: u32) !moe.Layer {
++        const c = &L.w.config;
++        const d: usize = c.hidden;
++        if (L.w.share.moe.len() != c.moe_inter or L.w.share.shared.len() != c.shared_inter) return error.Exl3NeedsOneRank;
++        if (c.shared_inter != c.moe_inter) return error.UnexpectedTensor; // the shared expert stacks as one more expert
++        try L.whole(try L.get("layers.{d}.mlp.gate.weight", .{i}), .bf16);
++        const router = try L.put("layers.{d}.moe.router", .{i});
++        try L.whole(try L.get("layers.{d}.mlp.gate.e_score_correction_bias", .{i}), .f32);
++        const bias = try L.put("layers.{d}.moe.bias", .{i});
++        var arena = std.heap.ArenaAllocator.init(L.gpa);
++        defer arena.deinit();
++        const a = arena.allocator();
++        const count: usize = c.experts;
++        var lists: [3][]cuda.exl3_upload.Proj = undefined;
++        inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |name, m| {
++            lists[m] = try a.alloc(cuda.exl3_upload.Proj, count + 1);
++            for (0..count) |e| lists[m][e] = try L.expertProj(a, "layers.{d}.mlp.experts.{d}." ++ name, .{ i, e });
++            lists[m][count] = try L.expertProj(a, "layers.{d}.mlp.shared_experts." ++ name, .{i});
++        }
++        const cb: cuda.exl3.Codebook = switch (L.x3.?.groups[L.x3_index.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.0.gate_proj", .{i})).?].codebook) {
++            .inst3 => .inst3,
++            .mcg => .mcg,
++            .mul1 => .mul1,
++        };
++        const xl = try cuda.exl3_upload.layer(&L.w.exl3.?, a, d, c.moe_inter, cb, c.swiglu_limit, 0, lists[0], lists[1], lists[2]);
++        return .{
++            .router = router,
++            .bias = bias,
++            .routed = .{ .format = .nvfp4, .up = 0, .down = 0, .width = c.moe_inter, .dims = d, .experts = count, .limit = c.swiglu_limit },
++            .x3 = xl,
++            .count = count,
++            .shared_gu = 0,
++            .shared_down = 0,
++            .shared = c.shared_inter,
++            .top_k = c.topk,
++            .scale = c.routed_scale,
++            .norm = c.norm_topk,
++        };
++    }
++
+     /// An NVFP4 linear's rows [lo, hi), inputs [klo, khi) as Fp4Linear.from_checkpoint (tf_pack_dense, packScales).
+     fn fp4(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, klo: usize, khi: usize) !cuda.qmmf.Weight {
+         const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, .{i});
+@@ -259,9 +433,9 @@ const Loader = struct {
+         const s = L.w.share.dense;
+         const d = c.hidden;
+         return .{
+-            .gate = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d),
+-            .up = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d),
+-            .down = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi),
++            .gate = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) },
++            .up = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) },
++            .down = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) },
+             .width = s.len(),
+             .dims = d,
+             .limit = c.swiglu_limit,
+@@ -411,13 +585,20 @@ const Loader = struct {
+         try L.whole(try L.get("layers.{d}.post_attention_layernorm.weight", .{i}), .bf16);
+         const post_norm = try L.put("layers.{d}.post_norm", .{i});
+         const none: Hc = .{ .fn_w = 0, .base = 0, .scale = 0 };
+-        const layer_w: Layer = .{ .index = i, .attn_hc = none, .ffn_hc = none, .in_norm = in_norm, .post_norm = post_norm, .mixer = .{ .mla = try L.dsa(i) }, .ffn = .{ .moe = try L.moeLayer(i) } };
++        const x3 = L.x3 != null;
++        const layer_w: Layer = .{ .index = i, .attn_hc = none, .ffn_hc = none, .in_norm = in_norm, .post_norm = post_norm, .mixer = .{ .mla = if (x3) try L.dsaX(i) else try L.dsa(i) }, .ffn = .{ .moe = if (x3) try L.moeX(i) else try L.moeLayer(i) } };
+         L.ck.release();
++        if (L.x3) |sc| sc.ck.release();
+         var out: [4]u64 = undefined;
+         for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
++            if (x3 and std.mem.eql(u8, what, "eh")) {
++                p.* = 0;
++                continue;
++            }
+             try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
+             p.* = try L.put("mtp.{s}", .{what});
+         }
++        if (x3) return .{ .enorm = out[0], .hnorm = out[1], .eh = .{ .exl3 = try L.group("layers.{d}.eh_proj", .{i}) }, .norm = out[3], .layer = layer_w, .draft = null };
+         // the draft head: quantize4 of the BF16 head's rows, then make_q4's tiling
+         const qk = L.tools.quant orelse return error.NoQuantizer;
+         const tk = L.tools.q4 orelse return error.NoQuantizer;
+@@ -430,7 +611,7 @@ const Loader = struct {
+             b.* = try L.scratch(size);
+             made += 1;
+         }
+-        try quant.q4(qk, L.stream, L.w.head, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
++        try quant.q4(qk, L.stream, L.w.head.bf16, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
+         var tiled: [3]u64 = undefined;
+         for (&tiled, q4.bytes(n, k), [_][]const u8{ "words", "scales", "biases" }) |*p, size, what| {
+             const b = try cuda.DeviceBuffer.alloc(L.d, size);
+@@ -441,7 +622,7 @@ const Loader = struct {
+         const draft: q4.Q4 = .{ .w = tiled[0], .s = tiled[1], .b = tiled[2], .n = n, .k = k, .npad = q4.npadOf(n) };
+         try q4.pack(tk, L.stream, raw[0].ptr, raw[1].ptr, raw[2].ptr, draft);
+         try L.stream.synchronize();
+-        return .{ .enorm = out[0], .hnorm = out[1], .eh = out[2], .norm = out[3], .layer = layer_w, .draft = draft };
++        return .{ .enorm = out[0], .hnorm = out[1], .eh = .{ .bf16 = out[2] }, .norm = out[3], .layer = layer_w, .draft = draft };
+     }
+ 
+     fn layer(L: *Loader, i: u32) !Layer {
+@@ -457,10 +638,13 @@ const Loader = struct {
+             .in_norm = in_norm,
+             .post_norm = post_norm,
+             .mixer = switch (c.kind(i)) {
+-                .kda => .{ .kda = try L.kda(i) },
+-                .mla => .{ .mla = try L.dsa(i) },
++                .kda => .{ .kda = if (L.x3 != null) try L.kdaX(i) else try L.kda(i) },
++                .mla => .{ .mla = if (L.x3 != null) try L.dsaX(i) else try L.dsa(i) },
+             },
+-            .ffn = if (c.isMoe(i)) .{ .moe = try L.moeLayer(i) } else .{ .dense = try L.dense(i) },
++            .ffn = if (c.isMoe(i))
++                .{ .moe = if (L.x3 != null) try L.moeX(i) else try L.moeLayer(i) }
++            else
++                .{ .dense = if (L.x3 != null) try L.denseX(i) else try L.dense(i) },
+         };
+     }
+ };
+@@ -475,18 +659,35 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
+     defer head_ck.close();
+     var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
+     defer L.host.deinit(gpa);
++    var scan: ?exl3_load.Scan = null;
++    defer if (scan) |*sc| sc.deinit();
++    defer L.x3_index.deinit(gpa);
++    if (c.head_unit == 128) { // an EXL3 checkpoint (config.parse): its trellis groups by name
++        scan = try exl3_load.scan(gpa, io, dir);
++        L.x3 = &scan.?;
++        for (scan.?.groups, 0..) |g, gi| try L.x3_index.put(gpa, g.prefix, gi);
++        w.exl3 = .{ .d = d, .gpa = gpa };
++        std.log.info("glm: EXL3 checkpoint, {d} trellis groups ({d} refused)", .{ scan.?.groups.len, scan.?.bad });
++    }
+     w.layers = try gpa.alloc(Layer, layers.len);
+     for (layers, w.layers) |i, *l| {
+         if (i >= c.layers) return error.BadLayer;
+         l.* = try L.layer(i);
+         ck.release(); // a rank reads about half the checkpoint: its pages would crowd the GPU's allocations out
++        if (scan) |*sc| sc.ck.release();
++        if (scan != null and (i % 8 == 0 or i + 1 == c.layers)) std.log.info("glm: layer {d} loaded, {d:.1} GiB of EXL3 groups on the device", .{ i, @as(f64, @floatFromInt(w.exl3.?.bytes)) / (1 << 30) });
+     }
+     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
+     w.embed = try L.put("embed", .{});
+     try L.whole(try L.get("norm.weight", .{}), .bf16);
+     w.norm = try L.put("norm", .{});
+-    try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
+-    w.head = try L.put("head", .{});
++    if (scan != null) {
++        if (share.vocab.lo != 0 or share.vocab.hi != c.vocab) return error.Exl3NeedsOneRank;
++        w.head = .{ .exl3 = try L.groupNamed("lm_head") };
++    } else {
++        try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
++        w.head = .{ .bf16 = try L.put("head", .{}) };
++    }
+     if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
+     return w;
+ }
