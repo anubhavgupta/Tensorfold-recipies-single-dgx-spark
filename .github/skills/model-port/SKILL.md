@@ -1,6 +1,6 @@
 ---
 name: model-port
-description: "Port, serve, patch, benchmark and optimise an LLM (target + speculative drafter, optional vision) on TensorFold on an NVIDIA DGX Spark (GB10, 128 GB unified memory), as a recipe directory in ~/projects/tensorfold (start.sh/end.sh/patches/bench/README). Use when the user asks to set up a new model or quant (EXL3, MLX 4-bit, GGUF-derived, NVFP4), add a drafter (DFlash2, MTP), make TensorFold patches, compare recipes, measure decode/prefill/throughput/max concurrency at full context, or investigate why one recipe is faster or lower quality than another."
+description: "Port, serve, patch, benchmark and optimise an LLM (target + speculative drafter, optional vision) on TensorFold on an NVIDIA DGX Spark (GB10, 128 GB unified memory), as a recipe directory in ~/projects/tensorfold (start.sh/end.sh/patches/bench/README). Use when the user asks to set up a new model or quant (EXL3, MLX 4-bit, GGUF-derived, NVFP4), add a drafter (DFlash2, MTP), make TensorFold patches, compare recipes, measure decode/prefill/throughput/max concurrency at full context, diagnose missed/malformed tool calls or streaming/schema/EOS problems, or investigate why one recipe is faster or lower quality than another."
 ---
 
 # Porting a model to TensorFold on one DGX Spark
@@ -127,3 +127,92 @@ Helper scripts (in `scripts/` beside this file):
 - `/tmp` trees can vanish: rebuild with `tf-tree.sh` + patches.
 - Commit with the trailer `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`; `git status`
   before `git add`; leave the machine in a stated state (which server runs, on which port).
+
+## 10. Tool-call reliability: reproduce, diagnose, fix and verify
+
+Include a functional tool-call check when validating a new recipe or changed chat template/parser, not just a
+throughput benchmark. For reported failures, perform autonomous synthetic reproductions; do not stop after one
+weather-call smoke test or require the user to produce the first basic reproduction. Never execute generated
+shell/file/network tools: simulate successful tool results in the test conversation.
+
+### Establish the actual runtime and failure boundary
+
+1. Inspect the recipe, active container/version/command, mounted overlays/patches, and the parser actually imported
+   by that backend. Python CUDA, native/Zig and other runtimes may use different paths. Do not infer parser selection
+   from the model name or assume another backend's fix applies.
+2. Compare the loaded `chat_template.jinja` with `tokenizer_config.json`'s template; record which takes precedence,
+   supported XML/JSON formats, thinking controls, actual EOS IDs, stop strings and reply budget. A custom template
+   offering a format is not evidence that the checkpoint follows it reliably.
+3. Compare each failing request across raw generated token IDs/text, reasoning separation, final parsed calls,
+   internal streaming events, and the reconstructed HTTP/SSE response. Internal callbacks are not proof of what
+   the client received. Distinguish a call the model never generated from one lost/corrupted after generation.
+4. Keep synthetic fixtures and expected argument values/types. If traces are needed, use opt-in local capture:
+   private directories/files (0700/0600), Git-ignored output, no HTTP authorization headers, and no external uploads.
+   Warn that full conversations, tool arguments and media URLs may still contain secrets. Log capture failures
+   explicitly; preserve generation exceptions. Avoid adding internally requested token IDs to client responses.
+
+### Minimum reproduction matrix
+
+| Area | Required cases |
+|---|---|
+| Transport and thinking | Streamed/non-streamed HTTP; thinking on/off; ordinary chat without tools |
+| Tool policy | `auto`, `required`/named calls when supported, single-call policy and multiple calls |
+| Argument fidelity | Strings (including `"3"`/`"null"` as strings), numbers, booleans, arrays, nested objects, nulls; nullable `type` arrays, `anyOf`/`oneOf`; relevant schema references/constraints |
+| Text boundaries | Multiline code, significant whitespace, escaped quotes/backslashes, Unicode, dotted tool names, literal tool/function/parameter tags inside argument values |
+| Formats and failures | Native format plus supported alternatives, mixed calls, unknown names, duplicate/missing arguments, malformed JSON, missing closing tags and deliberate token-limit cuts |
+| Agent loop | Append assistant calls and matching simulated tool results; continue until the requested multi-tool task completes or genuinely fails |
+
+For streaming regressions, feed every partial prefix or equivalent chunk-boundary coverage. Reconstruct argument
+JSON and compare names, values, types, indices, ordering and call counts with the final parser. Preserve complete
+earlier calls when a later call is truncated, but never emit a truncated call as executable. Confirm raw tool markup
+does not leak into ordinary content. A model may validly choose sequential calls despite parallel calls being allowed:
+one call in the first assistant turn alone is not proof of omission.
+
+### Isolate generation problems with controlled ablations
+
+- Hold rendered prompt/token IDs, seed, sampling, reply budget and cache conditions constant where possible.
+  Do not change diagnostic IDs inside prompts between A/B requests and then attribute differences to streaming
+  or drafting. Separate greedy reproducibility checks from repeated stochastic quality measurements.
+- Compare drafting on/off using exact raw token IDs, not just visible text or call counts. Agreement rules out a
+  drafter-only cause for those cases, not all backend or checkpoint-quality issues.
+- For early endings, inspect the actual emitted EOS ID, token count, stop configuration and budget. Thinking shares
+  the reply token limit. Compare ordinary argument text with literal protocol markers and safely escaped equivalents;
+  check whether the tokenizer recognizes markers in user/tool data as real control tokens.
+- A bounded `ignore_eos` probe can identify what follows an EOS; never adopt it as a production repair. It can generate
+  fabricated user/assistant turns rather than complete the interrupted argument.
+- Compare custom/native templates and XML/JSON modes when supported. Raw-completion probes can isolate generation
+  from chat parsing only when they use the same rendered prompt and compatible generation settings.
+- Inspect what constraints actually reach generation. `tool_choice: required` may force only an opener/name;
+  argument decoding, schema validation and grammar-constrained generation are separate capabilities. Do not claim
+  full-schema guarantees from primitive type decoding or a parser patch.
+- Report confirmed defects, reproduced triggers, plausible explanations and untested hypotheses separately.
+  Distinguishing checkpoint training from quantization requires a reference checkpoint/backend or alternate quant;
+  neither good perplexity nor identical draft-on/off output proves quantization is irrelevant.
+
+### Fix only demonstrated defects, then exercise the real recipe
+
+- Reuse a shared interpretation for final parsing, streaming and tool-text filtering. Regex-only envelope matching
+  must not terminate on a tool-closing tag inside a JSON string or XML parameter value. Test lexical escapes and
+  parameter boundaries; document genuinely ambiguous/unrepresentable delimiter content instead of guessing.
+- Decode supported union types without coercing declared plain strings. Do not invent missing arguments, silently
+  repair truncated structures, drop invalid values, or treat malformed calls as successful empty-argument calls.
+  Reject/log invalid calls and state which schema constructs are not supported.
+- Prefer complete-call emission when partial argument streaming cannot be made consistent and safe. Document this
+  latency/UX change and retain a stock-behavior switch. Keep reasoning/prose streaming and single-call limits intact.
+- Add CPU regression fixtures for the captured failures, verify patch application to a pristine matching image,
+  and test launcher mounts/flags, rollback, version guards and tracing transparency. Reuse existing recipe helpers;
+  do not introduce another parser implementation merely for a test harness.
+- Replay identical saved generations through the fix before generating new samples. Then exercise real streamed
+  and non-streamed HTTP calls, the multi-turn loop, and no-tool chat. A successful unit parse alone is insufficient.
+- Keep runtime patch/module mounts and documentation self-contained in the recipe. Do not modify weights, sampling
+  or unrelated kernels to conceal a parser defect. Preserve the exactness rules when generation code does change.
+- At completion, disable sensitive tracing, restart only if needed and safe for active requests, verify readiness
+  and a corrected call, and confirm capture output no longer grows. State whether the hook remains installed but
+  disabled; keep logs/captures out of commits. Document fixes, intentional behavior changes and remaining limitations.
+
+Prior art (inspect before reusing; these integrations target TensorFold 0.6.5):
+`flash-2/tools/tool_calls.py`, `flash-2/patches/0001-tool-parser.patch`,
+`flash-2/tools/test_tool_calls.py`, `flash-2/tools/repro_tool_calls.py`,
+`flash-2/tools/diagnose_generation.py`, `flash-2/tools/tool_trace.py`, and
+`flash-2/overlay/README.md`. The generation diagnostic's sequential replay uses a retained private synthetic fixture;
+for a fresh recipe, build a self-contained conversation fixture rather than depending on another session's captures.
