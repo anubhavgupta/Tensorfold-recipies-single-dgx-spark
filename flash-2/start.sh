@@ -11,6 +11,9 @@
 #   PARALLEL (9) CONTEXT (262144) KV_DTYPE (int8) VISION (1; EXL3 needs PARALLEL >= 2) VISION_MAX_IMAGES (50)
 #   VISION_IMAGE_TOKENS (16384) THINKING (1) MAX_TOKENS (32768) TEMPERATURE/TOP_P/TOP_K (1.0/0.95/20; 0.7/0.80 without thinking)
 #   OVERLAY (1: mount overlay/exl3, the faster prompt kernels; 0: stock)  TENSORFOLD_MTL (5)
+#   TOOL_TRACE (0: opt-in sensitive tool request/output capture; 1 needs stock 0.6.5, PATCHES=0)
+#   TOOL_PARSER_FIX (1: boundary-aware calls and union types; 0: stock parser; needs 0.6.5, PATCHES=0)
+#   TOOL_TRACE_DIR (./tool-traces beside this script; private local JSON files, no automatic retention limit)
 #   MTP_DRAFTS (6) MTP_CONFIDENCE (0.60)  PATCHES (0: use ../qwen38-flash-next/patches, untested on EXL3)
 #   VISION_CACHE (1: overlay/cache, prefix caching for image requests)  VISION_LIMITS (1: overlay/limits, bigger image/video byte limits)  PORT (8888) HOST (0.0.0.0) NAME (tf-flash-2-exl3) SERVED_NAME (Qwen3.8-Flash-Next) FOREGROUND (0)
 # Not available for EXL3 packs: --ple-on-ssd, --tp 2. Logs: docker logs -f tf-flash-2-exl3   Stop: ./flash-2/end.sh
@@ -93,8 +96,29 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
 fi
 
 wrapper=(--tf-name "$NAME" --tf-version "$TF_VERSION" --tf-docker-arg=--ulimit=stack=67108864)
+if [[ "${TOOL_PARSER_FIX:-1}" == 1 || "${TOOL_TRACE:-0}" == 1 ]]; then
+  [[ "$TF_VERSION" == 0.6.5 && "$PATCHES" == 0 ]] || {
+    echo "Tool parser fix/tracing requires TF_VERSION=0.6.5 and PATCHES=0; set TOOL_PARSER_FIX=0 for other builds" >&2; exit 1;
+  }
+  wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/tools/tool_trace.py:/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/tool_trace.py:ro")
+  if [[ "${TOOL_PARSER_FIX:-1}" == 1 ]]; then
+    wrapper+=(--tf-patches "$SCRIPT_DIR/patches"
+              --tf-docker-arg=-v "--tf-docker-arg=$SCRIPT_DIR/tools/tool_calls.py:/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/tool_calls.py:ro")
+  else
+    wrapper+=(--tf-patches "$SCRIPT_DIR/tools/patches")
+  fi
+fi
+if [[ "${TOOL_TRACE:-0}" == 1 ]]; then
+  TOOL_TRACE_DIR="${TOOL_TRACE_DIR:-$SCRIPT_DIR/tool-traces}"
+  mkdir -p -- "$TOOL_TRACE_DIR"
+  chmod 700 -- "$TOOL_TRACE_DIR"
+  TOOL_TRACE_DIR="$(cd "$TOOL_TRACE_DIR" && pwd)"
+  export TENSORFOLD_TOOL_TRACE_DIR=/tool-traces
+  wrapper+=(--tf-docker-arg=-v "--tf-docker-arg=$TOOL_TRACE_DIR:/tool-traces")
+  echo "WARNING: tool tracing captures prompts, tool arguments and model output in $TOOL_TRACE_DIR; disable after reproducing." >&2
+fi
 # Faster EXL3 prompt processing (bit-identical output): overlay/exl3 replaces the 0.6.5 expert kernels, see
-# overlay/README.md. OVERLAY=0 runs stock 0.6.5. TENSORFOLD_MTL (4, 5, 6, 8) sets the row tiles that share one weight decode.
+# overlay/README.md. OVERLAY=0 runs stock prompt kernels. TENSORFOLD_MTL (4, 5, 6, 8) sets the row tiles that share one weight decode.
 if [[ "${OVERLAY:-1}" == 1 && "$TF_VERSION" == 0.6.5 ]]; then
   _ex=/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3
   for _f in experts_grouped.cuh experts.cu experts.py; do
