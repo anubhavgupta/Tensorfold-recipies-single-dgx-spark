@@ -1,0 +1,180 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8888/v1",
+ "code/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   105.4
+  ],
+  "per_stream_mean": 105.4,
+  "aggregate_window": 105.8,
+  "aggregate_steady": 105.8,
+  "errors": []
+ },
+ "code/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   49.1,
+   44.1,
+   45.6,
+   45.3
+  ],
+  "per_stream_mean": 46.0,
+  "aggregate_window": 172.2,
+  "aggregate_steady": 184.8,
+  "errors": []
+ },
+ "code/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   29.8,
+   28.5,
+   27.4,
+   26.6,
+   26.6,
+   26.3,
+   26.1,
+   26.1,
+   25.4
+  ],
+  "per_stream_mean": 27.0,
+  "aggregate_window": 228.8,
+  "aggregate_steady": 243.7,
+  "errors": []
+ },
+ "prose/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   52.7
+  ],
+  "per_stream_mean": 52.7,
+  "aggregate_window": 52.9,
+  "aggregate_steady": 52.9,
+  "errors": []
+ },
+ "prose/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   26.7,
+   24.8,
+   24.1,
+   23.5
+  ],
+  "per_stream_mean": 24.8,
+  "aggregate_window": 94.5,
+  "aggregate_steady": 99.5,
+  "errors": []
+ },
+ "prose/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   17.4,
+   17.0,
+   16.7,
+   16.0,
+   15.8,
+   15.5,
+   15.2,
+   15.1,
+   15.1
+  ],
+  "per_stream_mean": 16.0,
+  "aggregate_window": 136.2,
+  "aggregate_steady": 144.3,
+  "errors": []
+ },
+ "devops/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   84.6
+  ],
+  "per_stream_mean": 84.6,
+  "aggregate_window": 85.0,
+  "aggregate_steady": 85.0,
+  "errors": []
+ },
+ "devops/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   44.8,
+   40.4,
+   39.0,
+   37.7
+  ],
+  "per_stream_mean": 40.5,
+  "aggregate_window": 151.1,
+  "aggregate_steady": 162.5,
+  "errors": []
+ },
+ "devops/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   28.3,
+   28.3,
+   23.7,
+   24.7,
+   24.4,
+   23.9,
+   22.8,
+   22.7,
+   22.2
+  ],
+  "per_stream_mean": 24.6,
+  "aggregate_window": 191.2,
+  "aggregate_steady": 221.8,
+  "errors": []
+ },
+ "json/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   100.6
+  ],
+  "per_stream_mean": 100.6,
+  "aggregate_window": 100.9,
+  "aggregate_steady": 100.9,
+  "errors": []
+ },
+ "json/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   55.7,
+   53.3,
+   50.1,
+   49.1
+  ],
+  "per_stream_mean": 52.0,
+  "aggregate_window": 197.3,
+  "aggregate_steady": 209.1,
+  "errors": []
+ },
+ "json/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   31.9,
+   33.4,
+   31.2,
+   30.6,
+   30.1,
+   29.7,
+   29.7,
+   29.5,
+   27.6
+  ],
+  "per_stream_mean": 30.4,
+  "aggregate_window": 249.8,
+  "aggregate_steady": 274.9,
+  "errors": []
+ }
+}

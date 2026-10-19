@@ -1,0 +1,771 @@
+DFlash2 drafts for Flash Next (incoai/Qwen3.8-Flash-Next-DFlash2) instead of the MTP head, on the concurrent
+(--parallel >= 2) one-GPU engine. Drafts only change speed: every draft is verified by the target.
+- cuda/dflash2.py (new): the drafter (5 layers, block 8, top-16 candidates a position, selector chain), reusing GLM's
+  DFlash2 port (glm5_next/cuda/dflash2.py: prep kernel, chain rule, 4-bit linears). A 2,176-row context ring per stream
+  slot; every round's context rows and draft blocks of all drafting streams run as one batched pass each (CUDA graphs:
+  tap passes of 8..64 rows, block passes of 1..PARALLEL streams; 9 streams: drafting 21.5 -> 5.4 ms a round). A context
+  starts at a resumed prompt's resume point (keys before it masked). Logits over Flash Next's draft vocabulary (the EXL3
+  head's rows requantized to 4 bits); TENSORFOLD_DFLASH_VOCAB=full scores the whole head.
+- forward.py: the taps are the mean of the 4 hyper-connection streams after target layers 5/15/25/35/45 (as the
+  checkpoint's SGLang capture patch), read right after the next layer's write-back; the target's arithmetic is unchanged.
+- multi.py, multi_fill.py: each round's committed rows feed their stream's context, prompt passes feed the prompt's last
+  window, drafts follow each round and each prompt end. The lone-stream graph slot stays MTP-only (EXL3 verify is
+  GPU-bound: graphs did not speed one stream up, and moving a stream into the slot slowed later requests).
+- engine.py, __init__.py: --drafter DIR (a DFlash2 checkpoint) loads no MTP head and counts the drafter (weights, head,
+  rings) in the startup estimate; --mtp-drafts (default 7) and --mtp-confidence (default 0.5, swept 0.15/0.3/0.5/0.7)
+  set the drafts a round and the floor of a chain's probability product.
+- TENSORFOLD_DFLASH_TIMING=1 prints the mean verify and drafting ms every 50 rounds (synchronizes; for profiling).
+Needs 0005 (same functions). Off: DRAFTER=none (MTP as in flash-2; start.sh then leaves this patch out).
+Verified on a GB10 (0.6.6, 4.05bpw_h6_ng6): greedy drafted replies equal "draft": false byte for byte, including a
+16,993-token prompt, a resumed chat turn and an image prompt; 4 concurrent drafted replies equal each alone undrafted;
+greedy suite (1/4/9 clients) accepted 79% / 73% / 84% / 57% of drafts (code / DevOps / JSON / prose), 4.7 / 4.1 / 6.0 /
+2.1 tokens a round.
+
+--- tensorfold/families/qwen4_exp/cuda/dflash2.py	1970-01-01 05:30:00.000000000 +0530
++++ tensorfold/families/qwen4_exp/cuda/dflash2.py	2026-10-19 23:47:49.440177351 +0530
+@@ -0,0 +1,476 @@
++"""DFlash2 drafts for Flash Next's shared rounds: one drafter's weights, a context ring per stream slot.
++
++The drafter reads the target's hidden states after layers ``target_layer_ids`` (each the mean of the four
++hyper-connection streams, as the checkpoint was trained), keeps them as keys and values of its own sliding-window
++attention, and drafts a block from the pending token. Drafts only change speed: every one is verified by the target.
++The block, its two-tap convolutions, the selector chain and the 4-bit weights are GLM's DFlash2 port
++(``glm5_next.cuda.dflash2``); this module batches every stream of a round into one context pass and one block
++pass (a ring per stream slot, blocks that do not mix), lets a context start at a resumed prompt's resume point,
++and drafts over Flash Next's draft vocabulary.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++from safetensors import safe_open
++
++from tensorfold.engine.exact_sampling import Sampling, uniform_rows
++from tensorfold.families.glm5_next.cuda import glue as gglue
++from tensorfold.families.glm5_next.cuda import qmm as gqmm
++from tensorfold.families.glm5_next.cuda.dflash2 import EDGE, NOISE, NO_LIMIT, DraftLayer, _prep_kernel
++
++from . import qmm as fqmm
++from .forward import _embed
++
++TAP_ROWS = 64          # context rows a tap pass takes at a time (graphs in steps of 8 rows)
++
++
++def vocab_choice() -> str:
++    """TENSORFOLD_DFLASH_VOCAB: ``draft`` (default, Flash Next's draft vocabulary, 4-bit head) or ``full``."""
++
++    v = os.environ.get("TENSORFOLD_DFLASH_VOCAB", "draft").strip().lower()
++    if v not in ("draft", "full"):
++        raise ValueError(f"TENSORFOLD_DFLASH_VOCAB: draft or full, not {v!r}")
++    return v
++
++
++def is_dflash2(path: str | Path) -> bool:
++    try:
++        cfg = json.loads((Path(path) / "config.json").read_text())
++    except (OSError, ValueError):
++        return False
++    return "dflash_config" in cfg and any("DFlash" in a for a in cfg.get("architectures", []))
++
++
++@triton.jit
++def _dconv_kernel(X, DYN, BASE, RES, OUT, D: tl.constexpr, G: tl.constexpr, GS: tl.constexpr, NB: tl.constexpr,
++                  BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr):
++    """GLM's two-tap grouped dynamic convolution, over blocks of NB rows (a block's first row has no previous row)."""
++
++    row = tl.program_id(0)
++    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    ok = c < D
++    x = tl.load(X + row * D + c, mask=ok, other=0.0).to(tl.float32)
++    prev = tl.load(X + (row - 1) * D + c, mask=ok & (row % NB > 0), other=0.0).to(tl.float32)
++    grp = c // GS
++    d0 = tl.load(DYN + ((row * 2 + BRANCH) * 2) * G + grp, mask=ok, other=0.0).to(tl.float32)
++    d1 = tl.load(DYN + ((row * 2 + BRANCH) * 2 + 1) * G + grp, mask=ok, other=0.0).to(tl.float32)
++    b0 = tl.load(BASE + (BRANCH * 2) * D + c, mask=ok, other=0.0).to(tl.float32)
++    b1 = tl.load(BASE + (BRANCH * 2 + 1) * D + c, mask=ok, other=0.0).to(tl.float32)
++    k0 = (b0 + d0).to(tl.bfloat16).to(tl.float32)
++    k1 = (b1 + d1).to(tl.bfloat16).to(tl.float32)
++    y = (x * k0 + prev * k1).to(tl.bfloat16)
++    if HAS_RES:
++        r = tl.load(RES + row * D + c, mask=ok, other=0.0).to(tl.float32)
++        y = (r + y.to(tl.float32)).to(tl.bfloat16)
++    tl.store(OUT + row * D + c, y, mask=ok)
++
++
++def _dconv(x, dyn, base, branch: int, group_size: int, nb: int, residual=None):
++    rows, d = x.shape
++    x = x.contiguous()
++    out = torch.empty_like(x)
++    block = 1024
++    _dconv_kernel[(rows, triton.cdiv(d, block))](x, dyn.contiguous(), base, residual if residual is not None else x,
++                                                 out, D=d, G=d // group_size, GS=group_size, NB=nb, BRANCH=branch,
++                                                 HAS_RES=residual is not None, BLOCK=block, num_warps=4)
++    return out
++
++
++@triton.jit
++def _dattn_kernel(Q, K, V, OUT, SLOT, POS, LO, R, window, scale, N: tl.constexpr, G: tl.constexpr,
++                  NH: tl.constexpr, KVH: tl.constexpr, HD: tl.constexpr, CAP: tl.constexpr, BK: tl.constexpr,
++                  CAUSAL: tl.constexpr):
++    """GLM's block attention, one program a KV head and stream: the stream's ring from LO on, and its block."""
++
++    kvh = tl.program_id(0)
++    b = tl.program_id(1)
++    M: tl.constexpr = G * N
++    m = tl.arange(0, M)
++    qh = kvh * G + m // N
++    qr = m % N
++    d = tl.arange(0, HD)
++    q = tl.load(Q + (qh[:, None] * R + b * N + qr[:, None]) * HD + d[None, :])
++    slot = tl.load(SLOT + b)
++    s = tl.load(POS + b).to(tl.int32)
++    first = tl.load(LO + b).to(tl.int32)
++    base = (slot * KVH + kvh) * CAP
++    klen = s + N
++    qpos = s + qr
++    m_i = tl.full([M], -1e30, tl.float32)
++    l_i = tl.zeros([M], tl.float32)
++    acc = tl.zeros([M, HD], tl.float32)
++    lo = tl.maximum(tl.maximum(s - window, 0), first) // BK * BK
++    for start in range(lo, klen, BK):
++        kk = start + tl.arange(0, BK)
++        kin = (kk < klen) & (kk >= first)
++        row = kk % CAP
++        k = tl.load(K + (base + row[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        v = tl.load(V + (base + row[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        sc = tl.dot(q, tl.trans(k)) * scale
++        ok = kin[None, :] & (((kk[None, :] < s) & (qpos[:, None] - kk[None, :] <= window)) | (kk[None, :] >= s))
++        if CAUSAL:
++            ok = ok & (kk[None, :] <= qpos[:, None])
++        sc = tl.where(ok, sc, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(sc, axis=1))
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(sc - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++        m_i = m_new
++    out = acc / l_i[:, None]
++    tl.store(OUT + (b * N + qr[:, None]) * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
++
++
++class DFlash2:
++    """The drafter's weights and a context ring for each of the decoder's states; every pass covers all streams."""
++
++    def __init__(self, draft_dir: str | Path, w, states: list) -> None:
++        from tensorfold.cuda.geometry import draft_ring_rows
++
++        path = Path(draft_dir)
++        cfg = json.loads((path / "config.json").read_text())
++        dc = cfg["dflash_config"]
++        self.w, self.dev = w, w.device
++        self.D = int(cfg["hidden_size"])
++        if self.D != w.cfg.hidden:
++            raise ValueError(f"the DFlash2 drafter's width {self.D} is not the target's {w.cfg.hidden}")
++        self.hd = int(cfg["head_dim"])
++        self.heads, self.kvh = int(cfg["num_attention_heads"]), int(cfg["num_key_value_heads"])
++        self.eps = float(cfg["rms_norm_eps"])
++        theta = float(cfg["rope_parameters"]["rope_theta"])
++        self.mask_id = int(dc["mask_token_id"])
++        self.gs = int(dc["conv_group_size"])
++        if int(dc["conv_kernel_size"]) != 2:
++            raise ValueError("only two-tap convolutions are ported")
++        self.block = int(dc["block_size"])
++        self.top_k = int(dc["selector_top_k"])
++        self.tap_layers = tuple(int(i) for i in dc["target_layer_ids"])
++        if max(self.tap_layers) + 1 >= w.cfg.layers:
++            raise ValueError(f"DFlash2 taps {self.tap_layers} need a layer after each in a {w.cfg.layers}-layer target")
++        self.window = int(cfg["sliding_window"]) - 1
++        self.causal = bool(cfg.get("is_causal", True))
++        self.inter = int(cfg["intermediate_size"])
++        dev = self.dev
++
++        def gpu(t: torch.Tensor) -> torch.Tensor:
++            return t.to(dev, torch.bfloat16).contiguous()
++
++        q4 = gqmm.quantize4
++        with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
++            get = f.get_tensor
++            self.fc = q4(gpu(get("fc.weight")))
++            self.hidden_norm = gpu(get("hidden_norm.weight"))
++            self.norm_weight = gpu(get("norm.weight"))
++            self.hproj = gpu(get("candidate_selector.hidden_projection.weight"))
++            self.pred = get("candidate_selector.predecessor_codebook").float().numpy().astype(np.float64)
++            self.succ = get("candidate_selector.successor_codebook").float().numpy().astype(np.float64)
++            self.layers: list[DraftLayer] = []
++            for i in range(int(cfg["num_hidden_layers"])):
++                p = f"layers.{i}."
++                q, k, v = (get(p + f"self_attn.{x}_proj.weight") for x in "qkv")
++                for conv in ("attention_conv", "mlp_conv"):
++                    if tuple(get(p + conv + ".base_kernel").shape) != (2, 2, self.D):
++                        raise ValueError(f"unexpected {conv} base kernel shape")
++                self.layers.append(DraftLayer(
++                    in_norm=gpu(get(p + "input_layernorm.weight")),
++                    post_norm=gpu(get(p + "post_attention_layernorm.weight")),
++                    a_base=gpu(get(p + "attention_conv.base_kernel")),
++                    a_kp=q4(gpu(get(p + "attention_conv.kernel_projection.weight"))),
++                    m_base=gpu(get(p + "mlp_conv.base_kernel")),
++                    m_kp=q4(gpu(get(p + "mlp_conv.kernel_projection.weight"))),
++                    qkv=q4(gpu(torch.cat((q, k, v)))),
++                    kv=q4(gpu(torch.cat((k, v)))),
++                    q_norm=gpu(get(p + "self_attn.q_norm.weight")),
++                    k_norm=gpu(get(p + "self_attn.k_norm.weight")),
++                    o=q4(gpu(get(p + "self_attn.o_proj.weight"))),
++                    gu=q4(gpu(torch.cat((get(p + "mlp.gate_proj.weight"), get(p + "mlp.up_proj.weight"))))),
++                    down=q4(gpu(get(p + "mlp.down_proj.weight")))))
++        self.head, self.head_ids = self._head()
++        torch.cuda.empty_cache()
++        self.inv_freq = 1.0 / theta ** (torch.arange(self.hd // 2, device=dev, dtype=torch.float32) * 2 / self.hd)
++        self.cap = draft_ring_rows(self.window, self.block)
++        # one context ring a stream slot, plus a last one that padded rows write to
++        self.index = {id(st): i for i, st in enumerate(states)}
++        S, n = len(states), self.block
++        self.S = S
++        self.kc = [torch.zeros((S + 1, self.kvh, self.cap, self.hd), dtype=torch.bfloat16, device=dev)
++                   for _ in self.layers]
++        self.vc = [torch.zeros_like(k) for k in self.kc]
++        self.end = [0] * S          # a slot's next context position
++        self.lo = [0] * S           # its first valid one (a context starts over where a resumed prompt does)
++        width = len(self.tap_layers) * self.D
++        # a tap pass's static inputs: rows, and each row's slot, ring row and position
++        self.t_in = torch.zeros((TAP_ROWS, width), dtype=torch.bfloat16, device=dev)
++        self.t_meta = torch.zeros((3, TAP_ROWS), dtype=torch.int64, device=dev)
++        self.t_host = torch.zeros((3, TAP_ROWS), dtype=torch.int64).pin_memory()
++        # a block pass's static inputs (a stream's pending id, slot, position, first valid position) and outputs
++        self.b_ids = torch.full((S * n,), self.mask_id, dtype=torch.int32, device=dev)
++        self.b_meta = torch.zeros((4, S), dtype=torch.int64, device=dev)
++        self.b_host = torch.zeros((4, S), dtype=torch.int64).pin_memory()
++        self.b_rows = torch.arange(n, device=dev)
++        self.packed = torch.zeros((S * (n - 1), 2 * self.top_k), dtype=torch.float32, device=dev)
++        self.proj = torch.zeros((S * (n - 1), self.hproj.shape[0]), dtype=torch.float32, device=dev)
++        self.packed_host = torch.zeros_like(self.packed, device="cpu").pin_memory()
++        self.proj_host = torch.zeros_like(self.proj, device="cpu").pin_memory()
++        self.pool = None
++        self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        self.block_graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        # TENSORFOLD_DFLASH_TIMING=1: every 50 rounds, the mean round and drafting ms (synchronized, so slower)
++        self.timing = os.environ.get("TENSORFOLD_DFLASH_TIMING", "0") == "1"
++        self.times: list[tuple[float, float, int, int]] = []
++
++    def timed(self, t0: float, t1: float, t2: float, streams: int, rows: int) -> None:
++        self.times.append((t1 - t0, t2 - t1, streams, rows))
++        if len(self.times) == 50:
++            n = len(self.times)
++            print(f"[tensorfold] dflash2 timing: verify+commit {1e3 * sum(t[0] for t in self.times) / n:.1f} ms, "
++                  f"drafting {1e3 * sum(t[1] for t in self.times) / n:.1f} ms a round; "
++                  f"{sum(t[2] for t in self.times) / n:.1f} streams, {sum(t[3] for t in self.times) / n:.1f} rows",
++                  flush=True)
++            self.times.clear()
++
++    def _head(self):
++        """Draft logits: Flash Next's draft-vocabulary rows of the head at 4 bits (or the full EXL3/4-bit head)."""
++
++        w = self.w
++        if vocab_choice() == "full":
++            return w.head, None
++        if w.draft_head is not None:
++            return w.draft_head, w.draft_ids
++        from .exl3 import requant_rows
++        from .weights import draft_token_ids
++
++        ids = draft_token_ids("default")
++        ids = torch.from_numpy(ids[ids < w.cfg.vocab]).to(self.dev)
++        return fqmm.make_q4(*requant_rows(w.head, ids, self.dev)), ids
++
++    def attach(self, b) -> None:
++        """Give a forward's buffers a tap row for each of its rows: the mean stream after each tapped layer."""
++
++        b.taps = torch.zeros((b.rows, len(self.tap_layers) * self.D), dtype=torch.bfloat16, device=self.dev)
++        b.tap_at = {id(self.w.layers[i + 1]): k for k, i in enumerate(self.tap_layers)}
++
++    def nbytes(self) -> int:
++        mats = sum(q.nbytes() for L in self.layers for q in (L.a_kp, L.m_kp, L.qkv, L.kv, L.o, L.gu, L.down))
++        head = self.head.nbytes() if self.head_ids is not None else 0
++        return mats + self.fc.nbytes() + head + 2 * sum(t.numel() * 2 for t in self.kc)
++
++    # -- pieces -------------------------------------------------------------------------------------------------
++    def _norm(self, x: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        rows = x.shape[0]
++        out = torch.empty((rows, self.D), dtype=torch.bfloat16, device=self.dev)
++        xs = torch.empty((rows, self.D // 64), dtype=torch.float32, device=self.dev)
++        gglue.rmsnorm(x, weight, self.eps, out, xs)
++        return out, xs
++
++    def _logits(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Top ``top_k`` draft logits [rows, k] fp32 and their token ids [rows, k] int32."""
++
++        if self.head_ids is None:                           # the full head: an EXL3 linear (fp32 out) or 4-bit
++            if isinstance(self.head, fqmm.Q4):
++                logits = fqmm.matmul(h, self.head)
++            else:
++                logits = torch.empty((h.shape[0], self.head.n), dtype=torch.float32, device=self.dev)
++                self.head(h, logits)
++            vals, idx = torch.topk(logits.float(), self.top_k, dim=-1)
++            return vals, idx.to(torch.int32)
++        vals, local = torch.topk(fqmm.matmul(h, self.head).float(), self.top_k, dim=-1)
++        return vals, self.head_ids[local].to(torch.int32)
++
++    def _rotary(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        phase = pos.to(torch.float32)[:, None] * self.inv_freq[None, :]
++        return phase.cos().contiguous(), phase.sin().contiguous()
++
++    def _prep(self, qkv: torch.Tensor, L: DraftLayer, cos: torch.Tensor, sin: torch.Tensor, heads: int):
++        rows = qkv.shape[0]
++        q = torch.empty((heads, rows, self.hd), dtype=torch.bfloat16, device=self.dev) if heads else qkv
++        k = torch.empty((self.kvh, rows, self.hd), dtype=torch.bfloat16, device=self.dev)
++        v = torch.empty_like(k)
++        _prep_kernel[(rows, heads + 2 * self.kvh)](qkv, L.q_norm, L.k_norm, cos, sin, q, k, v, rows, qkv.stride(0),
++                                                   self.eps, H=heads, HKV=self.kvh, HALF=self.hd // 2, num_warps=1)
++        return q, k, v
++
++    def _store(self, i: int, slots: torch.Tensor, rows: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
++        self.kc[i][slots, :, rows] = k.transpose(0, 1)
++        self.vc[i][slots, :, rows] = v.transpose(0, 1)
++
++    # -- the contexts -------------------------------------------------------------------------------------------
++    def _taps_compute(self, rows: int) -> None:
++        """Context rows: each tap row's keys and values into its slot's ring at its position."""
++
++        slots, ring, pos = self.t_meta[0, :rows], self.t_meta[1, :rows], self.t_meta[2, :rows]
++        ctx, _ = self._norm(gqmm.matmul(self.t_in[:rows], self.fc), self.hidden_norm)
++        cos, sin = self._rotary(pos)
++        for i, L in enumerate(self.layers):
++            _, k, v = self._prep(gqmm.matmul(ctx, L.kv), L, cos, sin, 0)
++            self._store(i, slots, ring, k, v)
++
++    @torch.no_grad()
++    def add_taps(self, parts: list[tuple[object, torch.Tensor, int]]) -> None:
++        """(state, committed rows' taps [n, taps * D], first position) for each stream; a gap starts its context over."""
++
++        rows: list[tuple[int, int]] = []                  # (slot, position) a row
++        chunks = []
++        for st, taps, at in parts:
++            i = self.index[id(st)]
++            if at != self.end[i]:
++                self.end[i] = self.lo[i] = at
++            n = taps.shape[0]
++            rows += [(i, at + r) for r in range(n)]
++            chunks.append(taps)
++            self.end[i] = at + n
++        if not rows:
++            return
++        allt = chunks[0] if len(chunks) == 1 else torch.cat(chunks)
++        for start in range(0, len(rows), TAP_ROWS):
++            part = rows[start:start + TAP_ROWS]
++            n = len(part)
++            bucket = -(-n // 8) * 8
++            meta = self.t_host.numpy()
++            meta[0, :bucket], meta[1, :bucket], meta[2, :bucket] = self.S, 0, 0       # padding: the spare ring
++            for r, (i, p) in enumerate(part):
++                meta[0, r], meta[1, r], meta[2, r] = i, p % self.cap, p
++            self.t_meta.copy_(self.t_host, non_blocking=True)
++            self.t_in[:n].copy_(allt[start:start + n])
++            g = self.tap_graphs.get(bucket)
++            if g is not None:
++                g.replay()
++            else:
++                self._taps_compute(bucket)
++
++    # -- drafts -------------------------------------------------------------------------------------------------
++    def _block_compute(self, count: int) -> None:
++        """[pending, mask x (block - 1)] for ``count`` streams at their contexts' ends: candidates and selector rows."""
++
++        n = self.block
++        R = count * n
++        slots, pos, lo = self.b_meta[1, :count], self.b_meta[2, :count], self.b_meta[3, :count]
++        x = torch.empty((R, self.D), dtype=torch.bfloat16, device=self.dev)
++        _embed(self.w, self.b_ids[:R], 1, x)
++        rpos = (pos[:, None] + self.b_rows[None, :]).reshape(-1)
++        rslot = slots[:, None].expand(count, n).reshape(-1)
++        ring = rpos % self.cap
++        cos, sin = self._rotary(rpos)
++        for i, L in enumerate(self.layers):
++            normed, xs = self._norm(x, L.in_norm)
++            dyn = gqmm.matmul(normed, L.a_kp, xs)
++            q, k, v = self._prep(gqmm.matmul(_dconv(normed, dyn, L.a_base, 0, self.gs, n), L.qkv), L, cos, sin,
++                                 self.heads)
++            self._store(i, rslot, ring, k, v)
++            out = torch.empty((R, self.heads * self.hd), dtype=torch.bfloat16, device=self.dev)
++            _dattn_kernel[(self.kvh, count)](q, self.kc[i], self.vc[i], out, slots, pos, lo, R, self.window,
++                                             self.hd ** -0.5, N=n, G=self.heads // self.kvh, NH=self.heads,
++                                             KVH=self.kvh, HD=self.hd, CAP=self.cap, BK=64, CAUSAL=self.causal,
++                                             num_warps=4)
++            x = _dconv(gqmm.matmul(out, L.o), dyn, L.a_base, 1, self.gs, n, x)
++            normed, xs = self._norm(x, L.post_norm)
++            dyn = gqmm.matmul(normed, L.m_kp, xs)
++            gu = gqmm.matmul(_dconv(normed, dyn, L.m_base, 0, self.gs, n), L.gu)
++            act = torch.empty((R, self.inter), dtype=torch.bfloat16, device=self.dev)
++            axs = torch.empty((R, self.inter // 64), dtype=torch.float32, device=self.dev)
++            gglue.swiglu(gu, act, axs, NO_LIMIT)
++            x = _dconv(gqmm.matmul(act, L.down, axs), dyn, L.m_base, 1, self.gs, n, x)
++        h, _ = self._norm(x.view(count, n, self.D)[:, 1:].reshape(count * (n - 1), self.D), self.norm_weight)
++        vals, gids = self._logits(h)
++        m = count * (n - 1)
++        self.packed[:m, :self.top_k].copy_(vals)
++        self.packed[:m, self.top_k:].copy_(gids.view(torch.float32))
++        self.proj[:m].copy_(F.linear(h, self.hproj).float())
++
++    @torch.no_grad()
++    def capture(self) -> None:
++        """CUDA graphs for tap passes of 8, 16, .. 64 rows and block passes of 1 .. S streams (on the spare ring)."""
++
++        self.pool = torch.cuda.graph_pool_handle()
++        meta = self.t_host.numpy()
++        meta[0], meta[1], meta[2] = self.S, 0, 0
++        self.t_meta.copy_(self.t_host)
++        for rows in range(8, TAP_ROWS + 1, 8):
++            for _ in range(2):
++                self._taps_compute(rows)
++            torch.cuda.synchronize()
++            g = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(g, pool=self.pool):
++                self._taps_compute(rows)
++            self.tap_graphs[rows] = g
++        b = self.b_host.numpy()
++        b[0], b[1], b[2], b[3] = 0, self.S, 0, 0
++        self.b_meta.copy_(self.b_host)
++        for count in range(1, self.S + 1):
++            for _ in range(2):
++                self._block_compute(count)
++            torch.cuda.synchronize()
++            g = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(g, pool=self.pool):
++                self._block_compute(count)
++            self.block_graphs[count] = g
++        torch.cuda.synchronize()
++
++    @torch.no_grad()
++    def propose(self, asks: list[tuple[object, int, int, Sampling | None]], confidence: float = 0.0) -> list[list[int]]:
++        """(state, pending token, drafts wanted, sampling) a stream: each one's drafts after its pending token."""
++
++        out: list[list[int]] = [[] for _ in asks]
++        todo = [(j, self.index[id(st)], pending, min(depth, self.block - 1), smp)
++                for j, (st, pending, depth, smp) in enumerate(asks)]
++        todo = [t for t in todo if t[3] >= 1 and self.end[t[1]] > self.lo[t[1]]]
++        if not todo:
++            return out
++        count, n = len(todo), self.block
++        b = self.b_host.numpy()
++        for r, (_, i, pending, _, _) in enumerate(todo):
++            b[0, r], b[1, r], b[2, r], b[3, r] = pending, i, self.end[i], self.lo[i]
++        self.b_meta.copy_(self.b_host, non_blocking=True)
++        self.b_ids.view(self.S, n)[:count, 0].copy_(self.b_meta[0, :count])
++        g = self.block_graphs.get(count)
++        if g is not None:
++            g.replay()
++        else:
++            self._block_compute(count)
++        m = count * (n - 1)
++        self.packed_host[:m].copy_(self.packed[:m])
++        self.proj_host[:m].copy_(self.proj[:m])
++        k = self.top_k
++        packed = self.packed_host[:m].view(count, n - 1, 2 * k)
++        values = packed[:, :, :k].numpy().astype(np.float64)
++        tokens = packed[:, :, k:].contiguous().view(torch.int32).numpy().astype(np.int64)
++        proj = self.proj_host[:m].view(count, n - 1, -1).numpy().astype(np.float64)
++        for r, (j, i, pending, depth, smp) in enumerate(todo):
++            out[j] = self._chain(tokens[r, :depth], values[r, :depth], proj[r, :depth], pending, self.end[i] + 1,
++                                 smp, confidence)
++        return out
++
++    def _chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
++               sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
++        """GLM's chain: selector edges, the target's keyed noise when sampled; stops under ``confidence``."""
++
++        depth = tokens.shape[0]
++        sampled = sampling is not None and sampling.temperature > 0
++        temp = float(sampling.temperature) if sampled else 1.0
++        noise = None
++        if sampled:
++            noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
++        out: list[int] = []
++        prev, chain = anchor, 1.0
++        for i in range(depth):
++            edge = self.succ[tokens[i]] @ (self.pred[prev] * proj[i])
++            score = (values[i] + EDGE * edge) / temp
++            pick = score + NOISE * noise[i] if noise is not None else score
++            j = int(np.argmax(pick))
++            if confidence > 0:
++                p = np.exp(score - score.max())
++                chain *= float(p[j] / p.sum())
++                if i > 0 and chain < confidence:
++                    break
++            prev = int(tokens[i, j])
++            out.append(prev)
++        return out
+--- tensorfold/families/qwen4_exp/cuda/engine.py	2026-10-19 23:13:36.317242388 +0530
++++ tensorfold/families/qwen4_exp/cuda/engine.py	2026-10-19 23:47:49.444504744 +0530
+@@ -55,6 +55,25 @@
+         load()
+ 
+ 
++def _draft_admission(streams: int) -> dict:
++    """The DFlash2 drafter in the startup estimate: its 4-bit weights and draft head, a context ring a stream slot."""
++
++    from tensorfold.cuda.capacity import Geometry
++    from tensorfold.cuda.geometry import dflash2_weights, draft_ring_rows
++
++    def geometry(t: dict) -> Geometry:
++        layers, heads, hd = int(t["num_hidden_layers"]), int(t["num_key_value_heads"]), int(t["head_dim"])
++        block, hidden = int(t["dflash_config"]["block_size"]), int(t["hidden_size"])
++        taps = len(t["dflash_config"]["target_layer_ids"])
++        ring = draft_ring_rows(int(t["sliding_window"]) - 1, block)
++        per_slot = 2 * layers * heads * hd * ring * 2 + 64 * taps * hidden * 2
++        head = 80_000 * hidden * 9 // 16                   # the draft vocabulary's 4-bit head rows
++        scratch = 16 * 64 * (hidden + int(t["intermediate_size"])) * 4
++        return Geometry(lambda slots: streams * per_slot + head + scratch, 0)
++
++    return {"draft_weights": lambda d: dflash2_weights(d, 1), "draft_geometry": geometry}
++
++
+ class FlashNextEngine:
+     """``eos``, ``generate`` (rank 0 or one GPU) and ``follow`` (rank 1), as ``tensorfold.cuda.server`` expects."""
+ 
+@@ -62,7 +81,8 @@
+                  draft_vocab: str | int | None = "default", max_len: int | None = None,
+                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
+                  prefetch: bool = True, graphs: bool = True, streams: int = 1, ple_on_ssd: bool = False,
+-                 kv_dtype: str = "bf16", share: float = 0.0, vision: bool = False, vision_urls: bool = False) -> None:
++                 kv_dtype: str = "bf16", share: float = 0.0, vision: bool = False, vision_urls: bool = False,
++                 drafter: Path | None = None) -> None:
+         import torch
+ 
+         from .exl3_pack import admission, extra_files, is_exl3
+@@ -73,6 +93,8 @@
+         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
+             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
+                              "2, or serve the MLX checkpoint (TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
++        if drafter is not None and (streams < 2 or tp != 1):
++            raise ValueError("DFlash2 drafts on Flash Next run on one GPU with --parallel 2 or more")
+         if vision and (streams < 2 or tp != 1):
+             raise ValueError("image input on Flash Next runs on one GPU with --parallel 2 or more")
+         if exl3 and ple_on_ssd:
+@@ -110,7 +132,8 @@
+             self.comm = open_comm(rank, 2, master, port)
+             self.comm.barrier()
+         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
+-        each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
++        each, mtp, bits = self.depth + 1, self.depth > 0 and drafter is None, BITS_OF[self.kv_dtype]
++        self.drafter = drafter if self.depth > 0 else None
+         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
+         rows0 = chunk or PREFILL_ROWS
+         geometry = ((lambda text: indexed_stream_geometry(text, streams + int(graphs and mtp), each, KEEP, mtp=mtp,
+@@ -127,7 +150,9 @@
+                                    capacity_geometry(geometry, model_dir, vision, rank, workspace),
+                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
+                                    rank=rank, world=tp,
+-                                   gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
++                                   gather=gather, extra_files=extra_files(model_dir) if exl3 else (),
++                                   **(_draft_admission(streams) if self.drafter is not None else {}),
++                                   draft_dir=self.drafter)
+         self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
+             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
+             fp8=prompt_precision.fp8())
+@@ -146,7 +171,7 @@
+ 
+         reads: list = []                              # the n-gram tables' pages, read while the weights load
+         try:
+-            w = load(model_dir, mtp=self.depth > 0, tp=(rank, 2) if tp == 2 else None,
++            w = load(model_dir, mtp=mtp, tp=(rank, 2) if tp == 2 else None,
+                      draft_vocab=draft_vocab if self.depth > 0 else None, ple_on_ssd=ple_on_ssd,
+                      table_reads=reads if prefetch and not ple_on_ssd else None)
+         except BaseException:
+@@ -159,7 +184,7 @@
+         w.comm = self.comm
+         if self.comm is not None:
+             self.comm.ready("loading")               # a peer stuck loading is named, not waited on in NCCL
+-        if self.depth > 0 and w.mtp is None:
++        if mtp and w.mtp is None:
+             raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
+                              "that has it, or --no-drafts for the serial reference (one token a round)")
+         self.w = w
+@@ -191,7 +216,8 @@
+             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
+                                       confidence=self.confidence, keep=KEEP, points=self.points,
+                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
+-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs)
++                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs,
++                                      drafter=self.drafter)
+             self.scheduler = Scheduler(self.multi, max_streams=streams)
+         else:
+             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
+@@ -248,7 +274,10 @@
+         self.served = 0
+         self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)
+         self.serial = None                                # the serial requests' engine, made on first use
+-        rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
++        rule = (f"1 to {self.depth} DFlash2 drafts a round ({self.drafter.name if hasattr(self.drafter, 'name') else self.drafter}), "
++                f"a chain stops where its probability falls under {self.confidence:.0%}; drafter "
++                f"{self.multi.dflash.nbytes() / 2**30:.2f} GiB" if self.drafter is not None else
++                f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
+                 f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
+         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
+                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
+--- tensorfold/families/qwen4_exp/cuda/forward.py	2026-10-19 23:13:36.317295301 +0530
++++ tensorfold/families/qwen4_exp/cuda/forward.py	2026-10-19 23:17:44.540584776 +0530
+@@ -383,6 +383,11 @@
+             hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, 2, inj[:R], b.inj_a, h, y=a, wts=wts)
+         else:
+             hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, mode, inj[:R], b.inj_a, h, branch=a)
++    tap = getattr(b, "tap_at", None)
++    if tap is not None and id(layer) in tap:
++        # DFlash2's tap: the previous layer's completed output (now written back), the mean of its streams
++        k, d = tap[id(layer)], c.hidden
++        b.taps[:R, k * d:(k + 1) * d] = h[:R].view(R, c.streams, d).mean(dim=1)
+     if layer.linear:
+         mode, branch = gdn_block(layer, w, segs, b, R, cuts)
+     else:
+--- tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-10-19 23:13:36.323198560 +0530
++++ tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-10-19 23:33:40.590544124 +0530
+@@ -159,6 +159,13 @@
+             mtp_compute(self.w, mtp_stage(self.w, self.pbuf, absorb), self.pbuf)
+             for st, nxt, _ in absorb:
+                 st.set_mtp_len(st.mtp_len + len(nxt))
++        if getattr(self, "dflash", None) is not None:       # DFlash2: the rows its window can still reach
++            parts = []
++            for (s, a, n), (st, a0, _) in zip(pieces, segs):
++                start = max(a, len(s.prompt) - self.dflash.window - 1)
++                if s.draft and start < a + n:
++                    parts.append((st, self.pbuf.taps[a0 + start - a:a0 + n], start))
++            self.dflash.add_taps(parts)
+         for (s, a, n), (st, a0, _) in zip(pieces, segs):
+             commit(self.w, st, self.pbuf, n, n, at=a0)
+         for s, mtp_len, tail, snap in points:            # a point that ends its piece: the state as committed
+@@ -218,6 +225,10 @@
+             s.context = list(s.prompt)
+             s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
+                              self.confidence) if mtp and s.count > 1 else []
++            if getattr(self, "dflash", None) is not None and s.draft and s.count > 1 and self.depth > 0:
++                if self.dflash.end[self.dflash.index[id(st)]] == st.pos:
++                    s.drafts = self.dflash.propose([(st, first, min(self.depth, s.count - 1), s.sampling)],
++                                                   self.confidence)[0]
+             s.started = time.perf_counter()
+             self.streams[s.sid] = s
+             s.take([first], self._ends(s))
+--- tensorfold/families/qwen4_exp/cuda/multi.py	2026-10-19 23:13:36.322521637 +0530
++++ tensorfold/families/qwen4_exp/cuda/multi.py	2026-10-19 23:47:49.439962644 +0530
+@@ -49,7 +49,8 @@
+ 
+     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
+                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
+-                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0) -> None:
++                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
++                 drafter=None) -> None:
+         self.link = self.follower = None
+         self.planning, self.pass_plan, self.mixed_plan = False, None, None
+         self.pass_index, self.pass_width = 0, prefill_rows
+@@ -91,6 +92,15 @@
+         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
+         self.keep_min = keep                         # snapshots always kept; up to prefixes.KEEP_MAX while memory allows
+         self.keep = max(keep, prefixes.KEEP_MAX)
++        self.dflash = None                           # DFlash2 (--drafter): drafts from the target's taps, not MTP
++        if drafter is not None:
++            from .dflash2 import DFlash2
++
++            self.dflash = DFlash2(drafter, w, self.slots)
++            for b in (self.buf, self.pbuf):            # (no graph slot: it drafts with MTP only)
++                self.dflash.attach(b)
++            if graphs:
++                self.dflash.capture()
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
+@@ -403,7 +413,13 @@
+                     s.error = exc
+             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
+             kept.append((s, a0, rows[:len(path)], new, last))
++        if self.dflash is not None and self.dflash.timing:
++            torch.cuda.synchronize()
++            t1 = time.perf_counter()
+         self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++        if self.dflash is not None and self.dflash.timing:
++            torch.cuda.synchronize()
++            self.dflash.timed(t0, t1, time.perf_counter(), len(live), sum(len(t) for _, t in windows))
+         for s, _, _, new, _ in kept:
+             if s.error is not None:
+                 s.done = True
+@@ -421,6 +437,8 @@
+     def _draft_all(self, streams: list) -> None:
+         """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+ 
++        if self.dflash is not None:
++            return self._dflash_all(streams)
+         for s, _, _ in streams:
+             s.drafts = []
+         room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
+@@ -458,6 +476,19 @@
+                 s.st.mtp_drafted += 1
+             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+ 
++    def _dflash_all(self, streams: list) -> None:
++        """Every drafting stream's context takes the round's committed rows, then all draft in one block pass."""
++
++        parts, asks = [], []
++        for s, a0, keep in streams:
++            s.drafts = []
++            n = len(keep)                                # the committed rows: the window's first n (a chain)
++            parts.append((s.st, self.buf.taps[a0:a0 + n], s.st.pos - n))
++            asks.append((s.st, keep[-1], min(self.depth, s.count - len(s.out) - n), s.sampling))
++        self.dflash.add_taps(parts)
++        for (s, _, _), drafts in zip(streams, self.dflash.propose(asks, self.confidence)):
++            s.drafts = drafts
++
+     def _mtp(self, segs: list) -> torch.Tensor:
+         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
+ 
+--- tensorfold/families/qwen4_exp/__init__.py	2026-10-19 23:13:36.316385223 +0530
++++ tensorfold/families/qwen4_exp/__init__.py	2026-10-20 00:05:58.186946392 +0530
+@@ -167,6 +167,10 @@
+ CUDA_DECODE_SHARE = True           # --parallel rounds size their prompt pass by --decode-share (0: whole passes)
+ CUDA_PREFILL_FP8 = True            # --prefill-fp8: an NVFP4 checkpoint's MXFP8 linears have an FP8 prompt kernel
+ 
++DFLASH_DEPTH = 7                   # a DFlash2 block of 8 drafts at most 7 positions
++DFLASH_CONFIDENCE = 0.5            # a DFlash2 chain stops where its probability product falls under this
++
++
+ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
+                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
+                 mtp_confidence: float | None = None, context: int | None = None, ple_on_ssd: bool = False,
+@@ -181,23 +185,29 @@
+     if is_exl3(Path(model_dir)):
+         print("[tensorfold] EXL3 packs are experimental: replies are exact; see "
+               "docs/recipes/qwen3.8-flash-next.md#exl3-checkpoints-experimental for how they compare", flush=True)
+-    if drafter:
+-        raise ValueError(f"{TITLE} drafts with its own MTP head on CUDA: a separate draft model does not apply")
++    from .cuda.dflash2 import is_dflash2
++
++    if drafter and not is_dflash2(drafter):
++        raise ValueError(f"{TITLE} on CUDA drafts with its own MTP head or a DFlash2 draft model "
++                         f"(incoai/Qwen3.8-Flash-Next-DFlash2): {drafter} is neither")
+     from .cuda import CONFIDENCE, DEPTH
+     from .cuda.engine import FlashNextEngine
+ 
+     if kv_dtype not in CUDA_KV_DTYPES:       # refuse an unknown cache before any weight is read (no torch import)
+         raise ValueError(f"kv-dtype {kv_dtype!r}: this engine serves {' or '.join(CUDA_KV_DTYPES)}")
+-    depth = 0 if no_drafts else DEPTH if mtp_drafts is None else int(mtp_drafts)
+-    if depth and not has_mtp(Path(model_dir)):
++    # DFlash2: --mtp-drafts and --mtp-confidence set its drafts a round (7 by default, its block less one) and the
++    # probability its chain stops under (DFLASH_CONFIDENCE by default)
++    depth = 0 if no_drafts else (DFLASH_DEPTH if drafter else DEPTH) if mtp_drafts is None else int(mtp_drafts)
++    if depth and not drafter and not has_mtp(Path(model_dir)):
+         raise ValueError(f"this checkpoint has no MTP head, which {TITLE}'s CUDA engine drafts with ({MODELS[0]} "
+                          "has one): without it every round would decode one token. Serve a checkpoint with the "
+                          "head, or pass --no-drafts for the serial reference")
+-    confidence = CONFIDENCE if mtp_confidence is None else float(mtp_confidence)
++    confidence = (DFLASH_CONFIDENCE if drafter else CONFIDENCE) if mtp_confidence is None else float(mtp_confidence)
+     return FlashNextEngine(Path(model_dir), depth=depth, confidence=confidence, max_len=context,
+                            context_explicit=options.get("context_explicit"), tp=int(tp), rank=int(rank),
+                            master=master, port=int(master_port), streams=max(1, int(options.get("parallel") or 1)),
+                            ple_on_ssd=ple_on_ssd, kv_dtype=kv_dtype,
+                            share=0.0 if decode_share is None else float(decode_share),
+                            vision=bool(options.get("vision", False)),
+-                           vision_urls=bool(options.get("vision_urls", False)))
++                           vision_urls=bool(options.get("vision_urls", False)),
++                           drafter=Path(drafter) if drafter and depth else None)

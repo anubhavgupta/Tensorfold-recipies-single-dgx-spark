@@ -1,0 +1,23 @@
+Opt-in tool-call diagnostics for the TensorFold 0.6.5 CUDA server.
+The decorator is mounted by flash-2/start.sh only with TOOL_TRACE=1.
+It records requests, generated tokens/text, emitted deltas and final parsing
+without changing parser decisions. Verified by tools/test_tool_calls.py.
+
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -30,6 +30,7 @@
+ from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
++from tensorfold.cuda.tool_trace import capture_tool_calls
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+ 
+ 
+@@ -390,6 +391,7 @@
+         return Sampling(int(seed) if seed is not None else seed_for(prompt), temp, int(top_k), float(top_p),
+                         float(min_p))
+ 
++    @capture_tool_calls
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
+             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
+         """One reply; once ``cancelled()`` holds, a waiting request raises ``RequestCancelled`` unstarted, a running one stops at its next round and raises it after ``generate``."""

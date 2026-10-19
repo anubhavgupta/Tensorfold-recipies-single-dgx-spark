@@ -1,0 +1,52 @@
+Bigger media limits (was flash-2/overlay/limits): request bodies up to TENSORFOLD_MAX_BODY_MIB (192), 4 videos (64 MiB each, 192 MiB in all), 64 MiB of images. Off: VISION_LIMITS=0.
+
+--- tensorfold/server/request_body.py	2026-10-19 23:13:36.275608179 +0530
++++ tensorfold/server/request_body.py	2026-10-19 23:13:36.292918414 +0530
+@@ -2,12 +2,13 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ from typing import Any
+ 
+ from tensorfold.server.errors import RequestError
+ 
+-LIMIT = 32 * 1024**2
++LIMIT = int(os.environ.get("TENSORFOLD_MAX_BODY_MIB") or 192) * 1024**2
+ _METADATA_LIMIT = 65536
+ 
+ 
+--- tensorfold/vision/images.py	2026-10-19 23:13:36.276808598 +0530
++++ tensorfold/vision/images.py	2026-10-19 23:13:36.293441126 +0530
+@@ -25,12 +25,12 @@
+ class ImageLimits:
+     max_images: int = 4
+     max_encoded_bytes: int = 10 * 1024 * 1024
+-    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_total_encoded_bytes: int = 64 * 1024 * 1024
+     max_dimension: int = 8192
+     max_pixels: int = 16 * 1024 * 1024
+-    max_total_pixels: int = 32 * 1024 * 1024
++    max_total_pixels: int = 400 * 1024 * 1024        # 50 images of 8 MP
+     timeout_seconds: float = 10.0
+-    total_timeout_seconds: float = 30.0
++    total_timeout_seconds: float = 60.0
+     max_redirects: int = 3
+     max_url_chars: int = 4096
+     max_visual_tokens: int = 4096        # the tokens a request's images share (CUDA Qwen: --vision-image-tokens)
+--- tensorfold/vision/videos.py	2026-10-19 23:13:36.276967464 +0530
++++ tensorfold/vision/videos.py	2026-10-19 23:13:36.293488630 +0530
+@@ -19,9 +19,9 @@
+ 
+ @dataclass(frozen=True, slots=True)
+ class VideoLimits:
+-    max_videos: int = 2
+-    max_encoded_bytes: int = 16 * 1024 * 1024         # base64 makes it a third larger in the 32 MiB request body
+-    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_videos: int = 4
++    max_encoded_bytes: int = 64 * 1024 * 1024         # base64 makes it a third larger in the 96 MiB request body
++    max_total_encoded_bytes: int = 192 * 1024 * 1024
+     max_dimension: int = 8192
+     max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
+     fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)

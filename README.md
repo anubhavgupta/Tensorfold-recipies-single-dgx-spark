@@ -10,11 +10,13 @@ client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 a
 | Ternary-Bonsai-2-27B | 44.2 / 87.6 tok/s | 195.8 / 308.9 tok/s |
 | Qwen3.8-Flash-Next | 46.8 / 63.7 tok/s | 186.4 / 260.3 tok/s |
 | Qwen3.8-Flash-Next EXL3 (`flash-2`)* | 54 / 93 tok/s | 158 / 254 tok/s |
+| Qwen3.8-Flash-Next EXL3 + DFlash2 (`flash-3`)*** | 57 / 111 tok/s | 167 / 262 tok/s |
 | Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b`)** | 52 / 52 tok/s | 511 / 515 tok/s |
 | GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2`)** | 31 / 32 tok/s | 40 / 45 tok/s |
 
 \* Different method: 256-token chat replies, 9 clients (see its section).
 \** TensorFold 1.0.12 native (Zig) engine with this repo's patches; peak at 16 (Dory) and 4 (GLM) clients.
+\*** flash-2 moved to TensorFold 0.6.6 (the last Python engine) with the DFlash2 drafter instead of MTP; flash-2's method.
 
 Full results in [Benchmarks](#benchmarks).
 
@@ -110,6 +112,23 @@ Prefill, one cold stream (tok/s):
 | `TENSORFOLD_PREFILL_ROWS` 4096 / 8192 | +3% / +4% prefill at 32K, but one fewer full-window stream; the default 2048 stays |
 
 Details and diffs: `flash-2/overlay/README.md`; raw results: `instructions.md` (rounds 2-4).
+
+### Qwen3.8-Flash-Next EXL3 + DFlash2 (`flash-3/start.sh`)
+
+flash-2 on TensorFold 0.6.6 with its overlays as patches, drafting with `incoai/Qwen3.8-Flash-Next-DFlash2` instead of
+the MTP head (`flash-3/patches/0006`: target taps, a batched drafter, exact verification). TensorFold 1.0 and later are
+native binaries without EXL3 or DFlash for Flash Next, so 0.6.6 is the latest engine this pack runs on. Same method as
+flash-2 above (greedy, 256 tokens, thinking off, steady aggregate tok/s), back to back with flash-2:
+
+| Content | 1 client: flash-2 / flash-3 | 4 clients | 9 clients |
+|---|---:|---:|---:|
+| Code | 95 / 111 | 178 / 190 | 254 / 262 |
+| Prose | 55 / 57 | 104 / 114 | 157 / 167 |
+| DevOps | 101 / 89 | 167 / 180 | 249 / 261 |
+| JSON | 99 / 105 | 186 / 211 | 294 / 284 |
+
+Sampled at T=0.7, 4 clients: +9% to +15%; 9 clients: −2% to +6%. Greedy replies equal `"draft": false`.
+Details, sweeps and limits: `flash-3/README.md`.
 
 ### Ternary-Bonsai-2-27B (`bonsai-27b/start.sh`)
 
