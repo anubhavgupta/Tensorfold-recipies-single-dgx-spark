@@ -13,10 +13,13 @@ client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 a
 | Qwen3.8-Flash-Next EXL3 + DFlash2 (`flash-3`)*** | 57 / 111 tok/s | 167 / 262 tok/s |
 | Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b`)** | 52 / 52 tok/s | 511 / 515 tok/s |
 | GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2`)** | 31 / 32 tok/s | 40 / 45 tok/s |
+| Ornith-1.5-122B NVFP4 + DFlash2 (`ornith-1.5-122B`)**** | 40 / 49 tok/s | 61 / 93 tok/s |
 
 \* Different method: 256-token chat replies, 9 clients (see its section).
 \** TensorFold 1.0.12 native (Zig) engine with this repo's patches; peak at 16 (Dory) and 4 (GLM) clients.
 \*** flash-2 moved to TensorFold 0.6.6 (the last Python engine) with the DFlash2 drafter instead of MTP; flash-2's method.
+\**** Served with SGLang, not TensorFold; distinct prompts, 512-token replies, greedy, 4 clients each holding a full
+262K context (see its section).
 
 Full results in [Benchmarks](#benchmarks).
 
@@ -248,3 +251,20 @@ The Qwen3.8-27B preset is based on [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-TensorFold](
 Everything else - files, wrapper options, examples, per-preset settings, patches, the chat
 template, updating, offline use and troubleshooting - is in
 [readme-detailed.md](readme-detailed.md).
+
+### Ornith-1.5-122B NVFP4 + DFlash2 on SGLang (`ornith-1.5-122B/start.sh`)
+
+`ornith-ai/Ornith-1.5-122B-NVFP4` (a Qwen3.5-122B-A10B-shaped hybrid GDN MoE, vision on) with the DFlash2 drafter
+`incoai/Ornith-1.5-122B-DFlash2`, served by stock SGLang (`lmsysorg/sglang:dev-cu13`) rather than TensorFold.
+4 streams x 262,144 tokens fit at once (checked with four 245K prompts). Distinct prompts, 512-token replies, greedy,
+thinking off; 6 verified tokens per round (each verified token pulls in more experts, so the drafter's trained block
+of 16 is slower here):
+
+| Clients | Mixed (prose/code/math) | Code |
+|---:|---:|---:|
+| 1 | 39.9 | 49.1 |
+| 2 | 50.1 | 55.6 |
+| 4 | 61.4 | 93.3 |
+
+Without speculation: 30 tok/s single stream. Prefill 2,600-3,200 tok/s up to 32K, 1,535 tok/s at 98K, ~800 tok/s
+averaged over a 245K prompt. Details: `ornith-1.5-122B/README.md`.
