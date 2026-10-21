@@ -1,0 +1,27 @@
+Verify windows of 2-16 rows keep their own width instead of being padded to 16 (cuda_shapes.zig Shape.init).
+
+Ported from MiaAI-Lab/Ornith-1.5-122B-TensorFold patches/0013-qwen35-narrow-verify-windows-unpadded.patch
+(MIT, Copyright (c) Mia's AI Lab). Their reason was exactness with their EXL3 router; here it is speed.
+Stock pads every verify window of 2-16 rows to 16, so the startup sweep of window costs ("CUDA window costs: measured 64
+widths") reads flat from 2 to 16 rows (57-60 ms on a GB10 with Ornith-1.5-122B MLX 4-bit) and the lane scheduler drafts
+~13 tokens a round as if they were free. On a MoE target each extra real row routes to more experts, so they are not:
+unpadded, the sweep rises with the rows (2 rows 39.8 ms, 6 rows 49.5, 16 rows 53.7), the scheduler drafts ~5-6 tokens,
+and a single stream's round falls from ~92 to ~65 ms (mixed prose/code/math 38.9 -> 46.2 tok/s, thinking on 42.5 ->
+50.6, code 66.6 -> 71.8; 4 streams unchanged within noise). Each width 2-16 now captures its own graph.
+Drafted replies still equal "draft": false (one stream and concurrent streams), see README.
+
+diff --git a/zig/src/families/qwen3_5/cuda_shapes.zig b/zig/src/families/qwen3_5/cuda_shapes.zig
+index 18cb353..5b48a5c 100644
+--- a/zig/src/families/qwen3_5/cuda_shapes.zig
++++ b/zig/src/families/qwen3_5/cuda_shapes.zig
+@@ -13,7 +13,9 @@ pub const Shape = struct {
+ 
+     pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
+         std.debug.assert(rows > 0 and rows <= @as(usize, if (record) Round.most_verify else Round.max_rows) and segments > 0 and segments <= rows);
+-        const bucket: usize = if (rows == 1) 1 else std.mem.alignForward(usize, rows, 16);
++        // a verify window up to 16 rows keeps its own width (stock pads 2-16 to 16): the window cost the scheduler measures
++        // then grows with the rows, as the routed experts' reads do, instead of reading as flat from 2 to 16 rows
++        const bucket: usize = if (rows <= 16) rows else std.mem.alignForward(usize, rows, 16);
+         const windows = std.math.ceilPowerOfTwo(usize, segments) catch unreachable;
+         return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps, .slots = slots };
+     }

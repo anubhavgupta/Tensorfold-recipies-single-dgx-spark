@@ -22,6 +22,7 @@ Settings are environment variables or `.env` lines (`scripts/config.sh`): `CONTE
 | `scripts/fix_vision.py` | that repo's index maps the 333 `vision_tower.*` tensors to `model-vision.safetensors`, which it never uploaded. The script fetches those tensors (0.9 GB, bf16, one HTTP range request each) from `BobClawblaw/Ornith-1.5-122B-MLX-4bit` at a pinned revision and writes the file into the snapshot. Three tensors are compared byte for byte with the NVFP4 checkpoint's own tower first: identical |
 | `patches/0001-qwen35-moe-dflash2.patch` | stock 1.1.1 drafts `qwen3_5_moe` only with the checkpoint's MTP layer (`mtp-4bit.safetensors`, which this export does not ship). The dense `qwen3_5` family on the same engine already drafts with DFlash2, so the patch lets `--drafter` open a DFlash2 model for the MoE family too (the MTP path is unchanged), and accepts a drafter trained with a 16-token block as well as 8 |
 | `patches/0002-prompt-attention.patch` | prefill: a tensor-core attention kernel for prompt passes (see [Prefill](#prefill-one-request-nothing-else-running)). `TENSORFOLD_PROMPT_ATTN=0` restores the stock kernel |
+| `patches/0004-narrow-verify-windows.patch` | decode: verify windows of 2-16 rows are no longer padded to 16, so the scheduler drafts ~6 tokens a round instead of ~13 (see [Decode](#decode-toks-per-stream-at-n1-total-at-n2-and-n4)). Ported from MiaAI-Lab's Ornith recipe (MIT) |
 | `patches/0003-prompt-rows-1024.patch` | prefill: prompt passes of 1,024 rows instead of 128, so the 66 GiB of routed experts are read an eighth as often a prompt token |
 
 The image is `tensorfold-native` built from TensorFold v1.1.1 (`b10231b9`) plus the patches with Zig 0.17.0 on
@@ -43,6 +44,25 @@ FP8 attention/GDN projections) under SGLang. TensorFold verifies a draft tree (~
 stream), SGLang a 6-token chain (`DF_BLOCK=6`, its best setting on this box).
 
 ### Decode, tok/s (per stream at N=1; total at N=2 and N=4)
+
+With all four patches (0004 included; same method, same model and drafter):
+
+| Workload | N=1 | N=2 total | N=4 total | SGLang N=1 / N=4 |
+|---|---:|---:|---:|---:|
+| code, greedy, thinking off | **71.8** | 84.5 | 97.6 | 49.1 / 93.3 |
+| mixed, greedy, thinking off | **46.2** | 54.5 | 73.9 | 39.9 / 61.4 |
+| mixed, T=0.6, thinking on | **50.6** | | 73.8 | 34.1 / 64.8 |
+
+**Why 0004 matters.** The lane scheduler picks how many tokens to draft from window costs it measures at startup.
+Stock pads every verify window of 2-16 rows to 16, so those widths all measured 57-60 ms and wide drafts looked free:
+it drafted ~13 tokens a round, and a round took ~92 ms (~60 ms verify plus the drafter and host). On this MoE each
+extra real row routes to more experts, so narrow windows really are cheaper: unpadded, 2 rows cost 39.8 ms, 6 rows
+49.5, 16 rows 53.7; the scheduler drafts 5-6 tokens and a round takes ~65 ms. Fewer tokens are accepted a round (3.0
+vs 3.7 on mixed text) but rounds are ~30% shorter. MiaAI-Lab's engine (same model and drafter) showed the same 5-6
+drafted tokens and 61-67 ms rounds, which is how the cause was found. Drafted replies equal `"draft": false` with one
+stream and with three concurrent streams; the tool-call check passes; one stream at 117K tokens decodes at 23.1 tok/s.
+
+The table below is the build before 0004 (0001 only), kept for the comparison:
 
 | Workload | TF N=1 | SGLang N=1 | TF N=2 | SGLang N=2 | TF N=4 | SGLang N=4 |
 |---|---:|---:|---:|---:|---:|---:|
