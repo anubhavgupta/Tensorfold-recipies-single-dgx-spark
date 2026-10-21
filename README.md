@@ -14,6 +14,7 @@ client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 a
 | Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b`)** | 52 / 52 tok/s | 511 / 515 tok/s |
 | GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2`)** | 31 / 32 tok/s | 40 / 45 tok/s |
 | Ornith-1.5-122B NVFP4 + DFlash2 (`ornith-1.5-122B`)**** | 40 / 49 tok/s | 61 / 93 tok/s |
+| Ornith-1.5-122B MLX 4-bit + DFlash2, TensorFold 1.1.1 (`ornith-1.5-122b-tensorfold`)**** | 42 / 74 tok/s | 70 / 96 tok/s |
 
 \* Different method: 256-token chat replies, 9 clients (see its section).
 \** TensorFold 1.0.12 native (Zig) engine with this repo's patches; peak at 16 (Dory) and 4 (GLM) clients.
@@ -268,3 +269,8 @@ of 16 is slower here):
 
 Without speculation: 30 tok/s single stream. Prefill 2,600-3,200 tok/s up to 32K, 1,535 tok/s at 98K, ~800 tok/s
 averaged over a 245K prompt. Details: `ornith-1.5-122B/README.md`.
+
+The same model on TensorFold 1.1.1's native engine (`ornith-1.5-122b-tensorfold`, MLX 4-bit export, a patch that lets
+the qwen3_5_moe family draft with DFlash2): decode 42 / 74 tok/s single stream (mixed / code) and 70 / 96 at 4 streams,
+ready in ~100 s, but prefill is 600 tok/s at 2K falling to 107 at 98K (128-row prompt passes, prompt attention off the
+tensor cores) and other streams stall during a prompt. Comparison: `ornith-1.5-122b-tensorfold/README.md`.

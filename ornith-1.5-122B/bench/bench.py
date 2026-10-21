@@ -48,7 +48,7 @@ def metrics():
         return {}
     out = {}
     for line in txt.splitlines():
-        m = re.match(r"^(sglang:[A-Za-z_]+)(\{[^}]*\})?\s+([0-9.eE+-]+)$", line)
+        m = re.match(r"^((?:sglang|tensorfold):[A-Za-z_]+)(\{[^}]*\})?\s+([0-9.eE+-]+)$", line)
         if m:
             out[m.group(1)] = out.get(m.group(1), 0.0) + float(m.group(3))
     return out
@@ -100,10 +100,12 @@ def run_parallel(jobs):
 
 
 def spec_delta(m0, m1):
-    """Accept length = output tokens / verify steps over the run, from the server's counters."""
+    """Accept length = output tokens / verify rounds over the run, from the server's counters (SGLang or TensorFold;
+    TensorFold's rounds are per stream, as its per-request log line's rounds= are)."""
     d = {k: m1.get(k, 0) - m0.get(k, 0) for k in m1}
-    toks = d.get("sglang:generation_tokens_total")
-    steps = d.get("sglang:spec_verify_calls_total") or d.get("sglang:spec_verify_ct_total")
+    toks = d.get("sglang:generation_tokens_total") or d.get("tensorfold:generation_tokens_total")
+    steps = d.get("sglang:spec_verify_calls_total") or d.get("sglang:spec_verify_ct_total") \
+        or d.get("tensorfold:decode_rounds_total")
     return toks / steps if toks and steps else None
 
 
