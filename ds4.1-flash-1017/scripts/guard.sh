@@ -18,7 +18,7 @@ LOG="${4:-/dev/null}"
 FLOOR="${5:-524288}"          # 0.5 GiB in KiB
 SWAP_BASE="${6:-0}"           # pre-boot SwapTotal-SwapFree, KiB
 SWAP_MAX=$((64 * 1024))       # 64 MiB growth allowance, KiB
-API_PORT="${API_PORT:-8000}"
+API_PORT="${API_PORT:-8888}"
 # if env.sh is present, take its container/port
 [ -f "$HERE/env.sh" ] && . "$HERE/env.sh" >/dev/null 2>&1 || true
 

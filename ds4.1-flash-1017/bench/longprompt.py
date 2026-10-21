@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 
-URL = "http://127.0.0.1:8000/v1/completions"
+URL = "http://127.0.0.1:8888/v1/completions"
 WORD = "the quick brown fox jumps over a lazy dog while seven wizards quietly vex "
 
 

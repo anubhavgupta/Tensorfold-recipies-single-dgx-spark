@@ -6,7 +6,7 @@ Prints one line per length: target, prompt_tokens, TTFT s, prefill tok/s, MemAva
 """
 import glob, json, os, sys, time, threading, urllib.request
 
-URL = "http://127.0.0.1:8000/v1/completions"
+URL = "http://127.0.0.1:8888/v1/completions"
 
 
 def corpus():

@@ -2,10 +2,10 @@
 """Sampled tool-call check for the dsv41 server (stdlib): N chat requests asking for two get_weather calls at the
 server's default sampling. A reply is clean when it has exactly the calls Paris and Tokyo, each argument object
 parsing to plain strings ({"city": "Paris"} or with "unit": "celsius"), nothing quoted twice, no placeholder keys.
-usage: tool_ab.py [N=8] [URL=http://127.0.0.1:8000]"""
+usage: tool_ab.py [N=8] [URL=http://127.0.0.1:8888]"""
 import json, sys, urllib.request
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-url = (sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8000") + "/v1/chat/completions"
+url = (sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8888") + "/v1/chat/completions"
 tool = {"type": "function", "function": {"name": "get_weather", "description": "Get current weather",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"},
                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}, "required": ["city"]}}}

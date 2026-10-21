@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Does a prefix-cache hit change decode? One long prompt sent three times: cold, then cached twice.
 
-usage: prefix_accept.py <prompt_tokens> <decode_tokens> <out_jsonl> [base_url=http://127.0.0.1:8000]
+usage: prefix_accept.py <prompt_tokens> <decode_tokens> <out_jsonl> [base_url=http://127.0.0.1:8888]
 
 Builds varied log-like text (a per-run nonce on the first line, a passphrase halfway, a question
 that asks for the passphrase and a summary), then sends the same greedy streamed
@@ -13,7 +13,7 @@ the counters are server-wide.
 """
 import json, os, random, sys, time, urllib.request
 target = int(sys.argv[1]); ndec = int(sys.argv[2]); out = sys.argv[3]
-base = (sys.argv[4] if len(sys.argv) > 4 else "http://127.0.0.1:8000").rstrip("/")
+base = (sys.argv[4] if len(sys.argv) > 4 else "http://127.0.0.1:8888").rstrip("/")
 def post(path, body, t):
     r = urllib.request.Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
     with urllib.request.urlopen(r, timeout=t) as f: return json.loads(f.read())

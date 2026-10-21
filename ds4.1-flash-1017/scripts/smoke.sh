@@ -3,7 +3,7 @@
 # returns coherent text and finish_reason=stop.
 set -euo pipefail
 
-API_PORT="${API_PORT:-8000}"
+API_PORT="${API_PORT:-8888}"
 BASE="http://127.0.0.1:${API_PORT}/v1"
 
 # `set -e` plus a failing command substitution exits silently; say what failed.

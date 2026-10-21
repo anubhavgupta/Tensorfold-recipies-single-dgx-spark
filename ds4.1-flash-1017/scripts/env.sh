@@ -44,7 +44,7 @@ RUNS_DIR="${RUNS_DIR:-$RECIPE_HOME/runs}"
 
 # ---- serve ----------------------------------------------------------------
 CONTAINER="${CONTAINER:-dsv41-tp1}"
-API_PORT="${API_PORT:-8000}"
+API_PORT="${API_PORT:-8888}"
 MAXLEN="${MAXLEN:-229376}"      # local default: one ~230K stream (upstream ships 524288, the largest measured clean limit)
 KVB="${KVB:-536870912}"         # local default 0.5 GiB: 380,035 tokens at MAXLEN=229376 (1.66 requests); upstream 1 GiB left
                                 # this box (desktop session, ~2.3 GiB more host memory) under the guard floor in a 225K prefill

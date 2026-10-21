@@ -16,7 +16,7 @@ Copied from [vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vc
 at `f20b9f0` and set up for **one stream at a ~230K context**. Everything below this section is upstream's text.
 
 ```bash
-bash scripts/serve.sh            # ~4-5 min to ready (warm JIT cache); API at http://<host>:8000/v1, model dsv41
+bash scripts/serve.sh            # ~4-5 min to ready (warm JIT cache); API at http://<host>:8888/v1, model dsv41
 bash scripts/smoke.sh            # must print SMOKE PASS
 bash scripts/guard.sh stop       # stops the server and restores the three sysctls
 ```
@@ -29,6 +29,7 @@ What was needed, and what differs from upstream:
 | Pack | `main` (the pinned revision is gone again); all 21 files match `scripts/SHA256SUMS`. The two 101.5 GB shards were finished with `curl -C -` after xet restarts left partial files |
 | No passwordless sudo | `scripts/env.sh` adds `$DOCKER` (plain `docker` for docker-group users, else `sudo -n docker`) and `as_root` (`sudo -n`, else a one-shot privileged `alpine` container that `nsenter`s the host, for sysctl, swapoff/swapon and drop_caches). The guard runs as the user and is stopped through `runs/*/guard.pid` |
 | `MAXLEN=229376` (default here) | upstream ships 524288 |
+| `API_PORT=8888` (default here) | upstream serves on 8000 (still the port inside the container; `serve.sh` publishes it on `API_PORT`) |
 | `KVB=0.5 GiB` (default here) | 380,035 tokens at 229,376 (1.66 full requests). With upstream's 1 GiB the guard stopped a 225K prefill at 505 MiB `MemAvailable`: this box runs a desktop session (~2.3 GiB more host memory than upstream's box: 2.3-2.4 GiB available at ready instead of 3.7-3.8) |
 | `ROW_COST` empty (default here) | upstream's `adaptive_verification_row_cost: 0.01` comes from vLLM patch 0184 (spark-ds41f r6x); this r6w base refuses the key at startup, so DSpark uses r6w's timed verification budget. `ROW_COST=0.01` passes it again (needs an r6x base) |
 | First boot | the cold-cache compile hit the guard floor at 229K; one boot at `MAXLEN=32768` warmed `~/.cache/dsv41-ds41f/kkref/jit`, after which 229K boots compile nothing |
@@ -98,7 +99,7 @@ bash scripts/guard.sh status         # container + endpoint + memory snapshot
 bash scripts/smoke.sh                # plain completion, must contain "Paris"
 ```
 
-The API is OpenAI-compatible at `http://<host>:8000/v1`, model id `dsv41`.
+The API is OpenAI-compatible at `http://<host>:8888/v1`, model id `dsv41`.
 `DRY_RUN=1 bash scripts/serve.sh` prints the full launch configuration without
 touching the box.
 

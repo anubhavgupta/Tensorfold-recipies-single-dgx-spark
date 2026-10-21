@@ -20,7 +20,7 @@ import sys
 import time
 import urllib.request
 
-_PORT = os.environ.get("API_PORT", "8000")
+_PORT = os.environ.get("API_PORT", "8888")
 URL = f"http://127.0.0.1:{_PORT}/v1/completions"
 METRICS = f"http://127.0.0.1:{_PORT}/metrics"
 
