@@ -272,8 +272,10 @@ averaged over a 245K prompt. Details: `ornith-1.5-122B/README.md`.
 
 The same model on TensorFold 1.1.1's native engine (`ornith-1.5-122b-tensorfold`, MLX 4-bit export, a patch that lets
 the qwen3_5_moe family draft with DFlash2): decode 42 / 74 tok/s single stream (mixed / code) and 70 / 96 at 4 streams,
-ready in ~100 s, but prefill is 600 tok/s at 2K falling to 107 at 98K (128-row prompt passes, prompt attention off the
-tensor cores) and other streams stall during a prompt. Comparison: `ornith-1.5-122b-tensorfold/README.md`.
+ready in ~90 s. Two more patches fix its prefill (tensor-core prompt attention, 1,024-row prompt passes): 1,466 /
+1,525 / 1,380 / 1,063 tok/s at 2K / 8K / 31K / 98K, from 597 / 497 / 271 / 107 stock. Other streams still pause during
+a prompt, and decode at depth uses stock's attention (12.5 tok/s for one stream at 245K). Comparison:
+`ornith-1.5-122b-tensorfold/README.md`.
 
 ### DeepSeek-V4.1-Flash-1017 SAGE EXL3 1.62bpw on vLLM (`ds4.1-flash-1017/scripts/serve.sh`)
 

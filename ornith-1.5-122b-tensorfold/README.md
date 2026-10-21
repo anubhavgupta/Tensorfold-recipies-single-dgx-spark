@@ -21,15 +21,18 @@ Settings are environment variables or `.env` lines (`scripts/config.sh`): `CONTE
 | Checkpoint `ornith-ai/Ornith-1.5-122B-MLX-4bit` (68.7 GB) instead of the NVFP4 one | TensorFold's CUDA engine reads Qwen3.5-MoE only as MLX affine 4-bit, group 64 (router gates 8-bit) |
 | `scripts/fix_vision.py` | that repo's index maps the 333 `vision_tower.*` tensors to `model-vision.safetensors`, which it never uploaded. The script fetches those tensors (0.9 GB, bf16, one HTTP range request each) from `BobClawblaw/Ornith-1.5-122B-MLX-4bit` at a pinned revision and writes the file into the snapshot. Three tensors are compared byte for byte with the NVFP4 checkpoint's own tower first: identical |
 | `patches/0001-qwen35-moe-dflash2.patch` | stock 1.1.1 drafts `qwen3_5_moe` only with the checkpoint's MTP layer (`mtp-4bit.safetensors`, which this export does not ship). The dense `qwen3_5` family on the same engine already drafts with DFlash2, so the patch lets `--drafter` open a DFlash2 model for the MoE family too (the MTP path is unchanged), and accepts a drafter trained with a 16-token block as well as 8 |
+| `patches/0002-prompt-attention.patch` | prefill: a tensor-core attention kernel for prompt passes (see [Prefill](#prefill-one-request-nothing-else-running)). `TENSORFOLD_PROMPT_ATTN=0` restores the stock kernel |
+| `patches/0003-prompt-rows-1024.patch` | prefill: prompt passes of 1,024 rows instead of 128, so the 66 GiB of routed experts are read an eighth as often a prompt token |
 
-The image is `tensorfold-native` built from TensorFold v1.1.1 (`b10231b9`) plus the patch with Zig 0.17.0 on
-`nvcr.io/nvidia/pytorch:26.07-py3` (`scripts/prepare.sh`, rebuilt when the patch changes).
+The image is `tensorfold-native` built from TensorFold v1.1.1 (`b10231b9`) plus the patches with Zig 0.17.0 on
+`nvcr.io/nvidia/pytorch:26.07-py3` (`scripts/prepare.sh`, rebuilt when a patch changes).
 
 Checks: drafted greedy replies equal `"draft": false` (same digest); `bench/tools_check.py` passes (streamed and not,
 thinking on/off, parallel calls, typed/nested/multiline arguments, a multi-turn loop with simulated results, a no-tool
 chat); an image of a red rectangle and a blue circle is described correctly. At startup the engine reports
-`model 66.39 GiB; 4 streams at once, 6.69 GiB each at a 262144-token window, of 41.2 GiB left after a 8.0 GiB reserve`;
-minimum `MemAvailable` over the whole run below was 12 GB.
+`model 68.47 GiB; 4 streams at once, 6.79 GiB each at a 262144-token window, of 39.5 GiB left after a 8.0 GiB reserve;
+prompts in passes of up to 1024 rows` (stock: 66.39 GiB, 6.69 GiB, 41.2 GiB, 128 rows; the difference is the larger
+prompt scratch).
 
 ## TensorFold 1.1.1 vs SGLang (`ornith-1.5-122B`)
 
@@ -56,37 +59,76 @@ TensorFold's tree verify accepts more per round (7.0 vs 3.7 tokens on code) at a
 
 ### Prefill (one request, nothing else running)
 
-| Prompt tokens | TensorFold TTFT | TensorFold tok/s | SGLang tok/s |
-|---:|---:|---:|---:|
-| 1,997 | 3.3 s | 597 | 2,762 |
-| 7,877 | 15.9 s | 497 | 3,243 |
-| 31,397 | 116 s | 271 | 2,561 |
-| 98,037 | 919 s | 107 | 1,535 |
+`bench.py prefill`: unique word-salad prompts, `max_tokens=1`, thinking off.
 
-TensorFold reads prompts in passes of at most 128 rows (`max_rows` in `cuda_engine.zig`). A pass costs ~0.2 s at the
-start of a prompt (128 rows route to nearly all 256 experts, so each pass reads most of the 66 GiB of weights) plus
-~20 us per cached token: its prompt attention runs at ~2.5 TFLOPS, i.e. not on tensor cores. Long prompts therefore
-cost 5-15x more than under SGLang. A 245K prompt would take well over an hour; the 4 x 245K test of the SGLang recipe
-was not repeated here (the engine's admission sizes the 4 full windows up front, see above).
+| Prompt tokens | TF stock 1.1.1 | TF + 0002 (attention) | TF + 0002 + 0003 (1,024-row passes) | SGLang |
+|---:|---:|---:|---:|---:|
+| 2K | 597 tok/s (3.3 s) | 633 | **1,466** (1.4 s) | 2,762 |
+| 8K | 497 (15.9 s) | 639 | **1,525** (5.2 s) | 3,243 |
+| 31K | 271 (116 s) | 593 | **1,380** (22.8 s) | 2,561 |
+| 98K | 107 (919 s) | 501 | **1,063** (92 s) | 1,535 |
+| 212K (needle at 30%) | | | 735 incl. reply (289 s), retrieved | |
+
+Where stock 1.1.1's prompt time went (stream-synced timers around each part of a pass, 8-32K tokens; a 128-row pass
+~205 ms): the routed experts ~144 ms, because 128 rows route to nearly all 256 experts of a layer, so every pass
+streams most of the 66 GiB of expert weights; and attention, ~2 ms a pass at 2K growing to ~1.7 s at 100K, because
+the prompt rows went through the decode kernel, which gives every row its own blocks, reads the whole cache once a
+row and runs on CUDA cores (~1.5 TFLOPS).
+
+- **0002** adds `tf_q35_attn_prompt` (`qwen35_prompt_attn.cuh`): a block takes 8 consecutive prompt rows (a warp
+  each; a row's 16 query heads of one key head are the 16 rows of an mma tile), loads each 16-key tile of keys and
+  values into shared memory once for all 128 queries (double-buffered), and computes Q K^T and P V with `mma.sync`
+  bf16 tensor-core instructions (fp32 sums) and an online softmax. On one layer against the stock kernels
+  (`tools/pa_test.cu`, 128 and 512 rows): outputs equal up to bf16 rounding (max |d| 0.0078), 10x faster at 2K keys
+  and 24x at 100K (~35 TFLOPS). Only prompt passes use it; draft verify windows and decode rows keep the stock
+  kernels, so drafted replies still equal `"draft": false` (checked after every change).
+- **0003** raises the forward's row limit to 1,024 (`max_rows`, its round tables, the kernels' `MAXR`, and
+  `Shape.total` from u8 to u16). The experts then cost 0.30 ms a prompt row instead of 1.12. A 1,024-row pass at
+  8-32K: experts ~312 ms, attention ~195 ms (averaged over depths), GDN scan ~132 ms, the rest ~145 ms. 2,048 rows
+  would buy ~10% for another ~2 GiB of scratch.
+
+Remaining gap to SGLang (~1.5-2x): the GDN recurrence runs a row at a time (~0.13 ms a prompt row), attention is at
+~35 TFLOPS, and the experts still stream at memory bandwidth. Prompt rows now round differently than before
+(attention), so greedy replies differ from stock 1.1.1's in places; drafted and undrafted replies stay equal.
 
 ### A long prompt beside a decoding stream (`bench.py interleave 100000 3000`)
 
 | | 98K prompt TTFT | decoding stream during it |
 |---|---:|---:|
-| TensorFold | 899 s | ~0 tok/s (32 tokens in 899 s) |
+| TensorFold stock | 899 s | ~0 tok/s (32 tokens in 899 s) |
+| TensorFold + 0002 + 0003 | 92 s | ~0 tok/s (14 tokens) |
 | SGLang (`PREFILL_DECODE_INTERVAL=16`) | 78 s | 10-12 tok/s |
 
 The Qwen3.5 CUDA backend runs a prompt whole (the lane core can take a prompt in pieces between rounds, but this backend
-does not implement it), so every other stream waits for the whole prompt.
+does not implement it), so every other stream waits for the whole prompt; the patches make that wait ~10x shorter.
+
+### Full context: 4 streams x 245K tokens
+
+`bench.py long 4 250000 256` (with 0002 + 0003): four distinct 245,037-token prompts at once, 256 new tokens each,
+greedy, thinking off. All four completed; minimum `MemAvailable` 12 GB. Each prompt prefilled in ~340 s (~720 tok/s at
+this depth; stock 1.1.1 would take well over an hour each). The streams decode only between prompt passes, so the
+first three made almost no progress until the fourth prompt was in, then the four decoded together at ~7 tok/s
+combined (all done in 1,533 s).
+
+**Decode at depth is the next limit, and it is stock TensorFold's, not the patches'.** Draft verify windows and decode
+rows still use the stock attention (0002 leaves them alone so drafting stays exact), which re-reads the whole cache
+for every row on CUDA cores. Per round: ~98 ms at 31K, ~238 ms at 245K with one stream (12.5 tok/s, 512 tokens);
+two streams at 117K decoded ~6 tok/s each. SGLang decodes one stream at 245K at 39 tok/s. Using the tensor-core kernel
+for verify windows would need it to be row-invariant (fixed key spans instead of splits sized by the block's longest
+row, tree masks from the ancestor bits, graph-captured grids), so that a drafted reply's bits still equal
+`"draft": false`; not done here.
 
 Decode at depth: after a 31,397-token prompt, one stream decoded 512 tokens at 30.0 tok/s (2.9 tokens a round).
+Decode after the prefill patches (same method as the table above): code 66.6 / 41.7 x 2 / 29.8 x 4 tok/s per stream,
+mixed 38.9 / 25.4 / 20.0, mixed thinking on 42.5 / 20.5; the round time is unchanged (~95 ms), the spread is the
+prompts' acceptance.
 
 ### Which to use
 
-- **TensorFold** for agent/chat traffic with short prompts or good prefix reuse: faster decode (especially code),
-  ~100 s startup instead of ~9 min.
-- **SGLang** when prompts are long or arrive while others decode: 5-15x faster prefill, and other streams keep
-  decoding during it.
+- **TensorFold** (with 0002 and 0003) for agent/chat traffic: faster decode (especially code), prefill within ~1.5-2x
+  of SGLang, ~90 s startup instead of ~9 min.
+- **SGLang** when long prompts arrive while other streams decode (they keep decoding during a prefill), or for the
+  fastest prefill.
 
 ## Other differences
 
@@ -104,5 +146,7 @@ Decode at depth: after a 31,397-token prompt, one stream decoded 512 tokens at 3
 | `scripts/prepare.sh` | builds the image (`--image-only` skips downloads), downloads, fixes the vision shard |
 | `scripts/fix_vision.py` | supplies `model-vision.safetensors` (see above) |
 | `patches/0001-qwen35-moe-dflash2.patch` | DFlash2 drafting for `qwen3_5_moe` |
+| `patches/0002-prompt-attention.patch`, `patches/0003-prompt-rows-1024.patch` | prefill (see above) |
+| `tools/pa_test.cu` | the prompt attention kernel against the stock one on one layer (accuracy, time) |
 | `bench/bench.py`, `bench/tools_check.py` | the SGLang recipe's benchmarks and tool check (read either server's counters) |
-| `results/tf-dflash.md` | raw output of the runs above |
+| `results/tf-dflash.md`, `results/tf-dflash-prefill.md` | raw output of the runs above (stock 1.1.1 + 0001; with 0002 + 0003) |

@@ -1,0 +1,85 @@
+Prompt passes of 1024 rows instead of 128 for the Qwen3.5 hybrids on CUDA (max_rows, Round.max_rows, MAXR, Shape.total).
+
+A 128-row prompt pass of Ornith-1.5-122B spent ~144 of ~205 ms in the routed experts: 128 rows route to nearly all
+256 experts of each layer, so every pass streams most of the 66 GiB of expert weights (measured with stream-synced
+timers per layer kind). With 0002's attention, the experts cost 1.12 ms a prompt row at 128 rows a pass, 0.46 at 512
+and 0.30 at 1024; prefill went 633 -> 1229 -> 1534 tok/s at 8K tokens and 501 -> 922 -> 1087 at 98K. 2048 would buy
+~10% more for another ~2 GiB of scratch. The forward's scratch (sized by max_rows; the attention partials are ~2 GiB),
+the round tables, the image position rows (MAXR), the drafter's absorb buffers and its tap ring (2048 + max_rows rows)
+grow with it; Shape.total widens to u16 (prompt shapes are never graph-keyed; verify windows stay within most_verify
+and keep their graphs, so drafting and decode keep their arithmetic). The prompt cache keeps states on the 1024-row
+grid (snap_grid = max_rows). Needs 0002 (the stock attention kernel would read the cache 1024 times a pass).
+Verified on a GB10 with Ornith-1.5-122B MLX 4-bit + DFlash2: see README (prefill, drafted == "draft": false,
+needle retrieval at depth, decode unchanged, 4 x 245K streams).
+
+diff --git a/zig/kernels/cuda/qwen35.cuh b/zig/kernels/cuda/qwen35.cuh
+index 728614b..e81487a 100644
+--- a/zig/kernels/cuda/qwen35.cuh
++++ b/zig/kernels/cuda/qwen35.cuh
+@@ -12,7 +12,7 @@ constexpr int HD = 256;   // attention head width
+ constexpr int MAXQ = 32;  // attention query heads at most
+ constexpr int MAXW = 64;  // a window's rows at most (the log's rows a stream)
+ constexpr int MAXCH = 64; // attention chunks a row at most (cuda_engine.zig's max_chunks)
+-constexpr int MAXR = 128;  // a forward's rows at most (cuda_engine.zig's max_rows): an image chunk's position rows
++constexpr int MAXR = 1024;  // a forward's rows at most (cuda_engine.zig's max_rows): an image chunk's position rows
+ 
+ // The model's widths: hidden, linear key heads, linear value heads, attention query and key/value heads, linear layers.
+ struct Geo {
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 404000d..629e27d 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -19,8 +19,9 @@ const Seg = caches.Seg;
+ const DeviceBuffer = cuda.DeviceBuffer;
+ const head_dim = geometry.head_dim;
+ 
+-/// Rows of one forward at most: a prompt chunk, or a shared round's windows.
+-pub const max_rows = 128;
++/// Rows of one forward at most: a prompt chunk, or a shared round's windows. 512 (stock 128): a prompt pass reads
++/// every routed expert once, so four times the rows a pass is about four times fewer weight reads a prompt token.
++pub const max_rows = 1024;
+ /// Streams' windows in one forward at most.
+ pub const max_segs = Round.max_segs;
+ /// Rows of a verify forward at most: each row's logits are kept and drawn.
+diff --git a/zig/src/families/qwen3_5/cuda_round.zig b/zig/src/families/qwen3_5/cuda_round.zig
+index 5a2e191..a402a37 100644
+--- a/zig/src/families/qwen3_5/cuda_round.zig
++++ b/zig/src/families/qwen3_5/cuda_round.zig
+@@ -4,7 +4,7 @@ const slots = @import("core").tree_slots;
+ const Seg = @import("cuda_cache.zig").Seg;
+ const Rule = @import("cuda").sample.Rule;
+ pub const Path = @import("cuda_cache.zig").Path;
+-pub const max_rows = 128;
++pub const max_rows = 1024; // cuda_engine.zig's max_rows (stock 128)
+ pub const max_segs = 128;
+ pub const most_verify = 128;
+ pub const most_window = 64;
+diff --git a/zig/src/families/qwen3_5/cuda_shapes.zig b/zig/src/families/qwen3_5/cuda_shapes.zig
+index b6fe8e9..18cb353 100644
+--- a/zig/src/families/qwen3_5/cuda_shapes.zig
++++ b/zig/src/families/qwen3_5/cuda_shapes.zig
+@@ -3,7 +3,7 @@ const std = @import("std");
+ const Round = @import("cuda_round.zig");
+ 
+ pub const Shape = struct {
+-    total: u8,
++    total: u16, // a prompt chunk's rows reach max_rows (512); windows stay within most_verify
+     nseg: u8,
+     record: bool,
+     prompt: bool,
+@@ -12,13 +12,13 @@ pub const Shape = struct {
+     hidden: bool = false,
+ 
+     pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
+-        std.debug.assert(rows > 0 and rows <= Round.most_verify and segments > 0 and segments <= rows);
++        std.debug.assert(rows > 0 and rows <= @as(usize, if (record) Round.most_verify else Round.max_rows) and segments > 0 and segments <= rows);
+         const bucket: usize = if (rows == 1) 1 else std.mem.alignForward(usize, rows, 16);
+         const windows = std.math.ceilPowerOfTwo(usize, segments) catch unreachable;
+         return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps, .slots = slots };
+     }
+ 
+     pub fn key(s: Shape) u32 {
+-        return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27;
++        return @as(u32, s.total) | @as(u32, s.nseg) << 10 | @as(u32, @intFromBool(s.record)) << 18 | @as(u32, @intFromBool(s.prompt)) << 19 | @as(u32, @intFromBool(s.taps)) << 20 | @as(u32, s.slots) << 21 | @as(u32, @intFromBool(s.hidden)) << 29;
+     }
+ };
