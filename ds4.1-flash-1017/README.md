@@ -16,9 +16,9 @@ Copied from [vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vc
 at `f20b9f0` and set up for **one stream at a ~230K context**. Everything below this section is upstream's text.
 
 ```bash
-bash scripts/serve.sh            # ~4-5 min to ready (warm JIT cache); API at http://<host>:8888/v1, model dsv41
-bash scripts/smoke.sh            # must print SMOKE PASS
-bash scripts/guard.sh stop       # stops the server and restores the three sysctls
+./start.sh                       # serve.sh + wait for ready + smoke test; API at http://<host>:8888/v1, model dsv41
+./end.sh                         # guard.sh stop: removes the container, stops the guard, restores the three sysctls
+bash scripts/guard.sh status     # stage, memory, log tail
 ```
 
 What was needed, and what differs from upstream:
@@ -71,28 +71,37 @@ at `--max-model-len 32768` and 3.1-3.2 GiB at the shipped default of 524,288.
 
 Disk, measured on the measurement box: the pack is **326.6 GB** (304 GiB; two
 shards are ~101.5 GB each), the alias side file **8.6 GiB**, the base engine image
-**34.9 GB**, and the derived image adds **~2 GB** on top of it (36.9 GB as listed by
-`docker images`, shared layers). The first boot adds a few GB of JIT cache under
+**34.9 GB** (fetched from Hugging Face instead: an 8.8 GB download, deleted after loading, and
+**~33 GB** in docker for the base plus our layer, measured), and the derived image adds **~2 GB**
+on top of it (36.9 GB as listed by `docker images`, shared layers). The first boot adds a few GB of JIT cache under
 `~/.cache/dsv41-ds41f/kkref/jit`. Budget **~400 GB free** on the NVMe the serve will
 read cold experts from, and keep it well short of full (see "Keep the disk quiet").
 `download_and_verify.sh` and `build_cold_alias.sh` check free space before writing.
 
-Host prerequisites: passwordless `sudo -n docker`, the base engine image (see
-`scripts/build_image.sh`), and `huggingface_hub` with `hf_xet` for the host-side
-download. On a stock Ubuntu 24.04 the documented install needs
+Host prerequisites: passwordless `sudo -n docker`, `zstd`, and `huggingface_hub` with
+`hf_xet` for the host-side downloads. `build_image.sh` fetches the base engine image
+`dsv41-1017-ds41f:r6w` from Hugging Face when it is missing (see "Base image" below). On a stock Ubuntu 24.04 the documented install needs
 `--break-system-packages` (PEP 668 marks the system python externally managed):
 
 ```bash
+sudo apt-get install -y zstd
 python3 -m pip install --user --break-system-packages -U 'huggingface_hub[hf_xet]'
 ```
 
 (`numpy` is only needed for the optional `--select-npz` route-histogram path in
 `tools/ats_build_alias.py`; the shipped `--experts-json` path is stdlib-only.)
 
+`serve.sh` and `guard.sh` run everything through `sudo -n`, so the box's sudoers
+must grant the operator at least: `docker`, `sysctl` (the three `vm.*` keys below),
+`swapoff`/`swapon`, and `tee /proc/sys/vm/drop_caches` (the cache drop is
+`echo 1 | sudo -n tee /proc/sys/vm/drop_caches`; the older
+`sudo sh -c 'echo 1 > ...'` form needs a sudoers rule for `sh` itself, which
+hardened boxes do not grant), plus `pkill` for `guard.sh stop`.
+
 ```bash
 export HF_TOKEN=hf_...               # account must have accepted the model terms
 bash scripts/download_and_verify.sh  # hf_xet download at the pinned revision + sha256 verify
-bash scripts/build_image.sh          # base engine image + our layer (see below)
+bash scripts/build_image.sh          # base image (fetched from HF if missing) + our layer, ~10 min
 bash scripts/build_cold_alias.sh     # 8.59 GiB side file, read-only on the pack
 bash scripts/serve.sh                # detached; arms the memory guard
 bash scripts/guard.sh status         # container + endpoint + memory snapshot
@@ -123,6 +132,39 @@ recipe's pins (vllm-exl3, exllamav3, MoE tile K): an older image under the defau
 tag serves older shim code and fails at weight load with `no module or parameter
 named 'head'`. Rebuild it with `build_image.sh`.
 
+### Base image
+
+The recipe's layer goes on top of `dsv41-1017-ds41f:r6w`: Christopher Owen's spark-ds41f r6w
+with justincasey's DeepSeek-V4.1-Flash-1017 patches, built by `base/docker/Dockerfile` (see
+`base/README.md`). That build needs no GPU but takes hours, so when the image is missing
+`build_image.sh` runs `scripts/fetch_base.sh`, which:
+
+1. downloads [vcruz305/DSV4.1-Flash-1017-Spark-base-image](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-Spark-base-image)
+   at the revision pinned in `scripts/env.sh` (one 8.8 GB `.tar.zst`) and checks its sha256;
+2. loads it as `dsv41-1017-ds41f:r6w-redist` and checks the digest of its single layer and its
+   label set against the pins in `scripts/env.sh`;
+3. builds `dsv41-1017-ds41f:r6w` from it with `base/Dockerfile.cutlass-dsl`, which installs NVIDIA
+   CUTLASS DSL 4.7.1 from PyPI with `pip --require-hashes` (`base/cutlass-dsl.lock`).
+
+The published image leaves out CUTLASS DSL because its licence allows redistributing only its
+Python source; step 3 gets it from NVIDIA's PyPI release under NVIDIA's terms. The Hugging Face
+repo carries the licences of everything else in the image, including the NVIDIA Deep Learning
+Container License and the CUDA EULA that cover the CUDA libraries.
+
+Measured on the Spark (2026-10-20): the download ran at ~55 MB/s (2.5 min), and `build_image.sh`
+with no base present took 402 s (checksum, load, CUTLASS DSL, our layer). The resulting base has
+the same image config and label set as the base this README was measured on, and the same 202,541
+files: every source file is identical, and 18 differ, all build outputs. Those 18 are vLLM's two
+compiled `_C` extensions, NCCL, TileLang's `libtvm_compiler.so` and an NCCL checksum file (rebuilt
+from the same pinned sources; their compiled binaries are not byte-reproducible), pip records of
+three source-built packages, and apt/ldconfig logs. Served from it, the recipe passed smoke and tool calls
+(streaming and non-streaming) and measured 131.0 ms/step, 4.72 accepted tok/step, 36.0 tok/s on
+`bench/bench7.py` (n=9, 0 engine errors), within the spread of the image on the measured base on
+the same day (129.7 ms/step at 4.60 tok/step, and 127.6 at 5.07).
+
+`BASE_FROM_SOURCE=1 bash scripts/build_image.sh` builds the base from `base/` instead.
+`BASE_KEEP_ARCHIVE=1` keeps the downloaded archive in `$BASE_DL_DIR`.
+
 ## The measured flag set (do not deviate without re-measuring)
 
 The engine is a derived image: `dsv41-1017-ds41f:r6w` (Christopher Owen's
@@ -144,6 +186,7 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 | `--max-model-len 524288` | 512K tokens, the largest limit measured clean on one Spark: needle retrieval at 520K, minimum MemAvailable 2.23 GiB under that prefill, short-prompt decode 147.2 ms/step against 140.5-142.0 at 32K (see Measured long context). The model is rated for 1,048,576 (YaRN x16 over 65,536); 1M does not fit (the prefill transient grows with prompt length) |
 | `--max-num-batched-tokens 2112 --long-prefill-token-threshold 2047` | the aligned-prefill chunk; 8192 does not fit |
 | `--kv-cache-memory-bytes 1073741824` | 1 GiB KV at the engine's `auto` (bf16) cache dtype. The token count vLLM reports depends on `--max-model-len` for this hybrid attention (sliding-window and compressed groups): 236,089 at 32K, 394,892 at 64K, 595,001 at 128K, 760,070 at 229K, 959,768 at 524K (1.83x one full-length request) |
+| `--gpu-memory-utilization 0.90` (`GPU_MEM_UTIL`) | **inert in this recipe**: vLLM ignores `--gpu-memory-utilization` whenever `--kv-cache-memory-bytes` is set, and `serve_inner.sh` always passes the latter — at boot the engine logs `reserved ... for KV Cache as specified by kv_cache_memory_bytes config and skipped memory profiling. This does not respect the gpu_memory_utilization config`. Changing `GPU_MEM_UTIL` changes nothing; change `KVB`. The flag is kept only so the invocation matches the measured one |
 | `--enable-prefix-caching` | default on: a request that repeats a cached prefix (follow-up turns, new questions on the same document) skips its prefill, 518K tokens to first token in 2.5-3.7 s instead of 464 s; no step-time cost measured. `PREFIX_CACHING=0` turns it off (see Prefix caching) |
 | `B12X_AUTOTUNE=0` | the base image's optional per-kernel autotune sweep is hours; prebuilt artifacts are the measured path |
 | `--security-opt seccomp=unconfined --security-opt label=disable --ulimit memlock=-1` | the Engram reader initialises io_uring; a default seccomp profile aborts it |
@@ -152,6 +195,75 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 Host side, while serving: `vm.compaction_proactiveness=0`,
 `vm.watermark_boost_factor=0`, `vm.swappiness=0`, swap reset before boot.
 `scripts/guard.sh stop` restores them.
+
+**Engine of record.** The vLLM tree the server actually runs is the patched tree at
+`/opt/spark3/candidate/vllm` inside the container image — not the stock
+`dist-packages` copy. Before renaming, removing or "cleaning up" any
+`--speculative-config` key, grep that tree
+(`sudo -n docker exec dsv41-tp1 grep -rn <key> /opt/spark3/candidate/vllm/vllm/`):
+for example `adaptive_verification_row_cost` (engine default 0.02; this recipe
+sets 0.01) is a real field of the engine's speculative config
+(`vllm/config/speculative.py`), while `adaptive_verification_cost_scale` does not
+exist there; renaming the key leaves the engine at its default row cost without any error.
+
+## Request defaults
+
+`scripts/env.sh` sets `DEFAULT_MAX_TOKENS=32768`, which `serve_inner.sh` serves
+as `max_new_tokens` inside `--override-generation-config` (together with the sampling
+defaults below). It caps only
+requests that send no `max_tokens` of their own — agent clients such as Hermes
+send none, and without the cap a reply that falls into a repetition loop runs
+until the 524,288-token window is full (observed: one reply generated for over
+an hour at ~48 tok/s until the serve was reloaded). A client-sent `max_tokens`
+always wins over the cap. `DEFAULT_MAX_TOKENS=0` passes no override and
+disables the cap.
+
+### Sampling defaults
+
+The pack ships no `generation_config.json`, so a request that sends no sampling parameters
+would run at vLLM's neutral defaults (temperature 1.0, top_p 1.0). Agent clients such as
+Hermes send neither, which is how every agent chat on this serve ran at temperature 1.0 on a
+1.62 bpw quant whose MTP drafts are greedy. `scripts/env.sh` now sets
+`DEFAULT_TEMPERATURE=0.6` and `DEFAULT_TOP_P=0.95`, served through the same
+`--override-generation-config` as the output cap (vLLM accepts `max_new_tokens`,
+`temperature`, `top_k`, `top_p`, `min_p` and `repetition_penalty` there). A client that sends
+its own value still wins per request; an empty value in `env.sh` ships no default. The greedy
+bench (`bench/bench7.py` sends `temperature 0`) is unaffected.
+
+Measured on the live serve, one request at a time (2026-10-21; raw samples in the campaign
+files, `stability/lanes/{sampling,toolcalls}`):
+
+- **Tool calling**, 12 agent scenarios (8 Hermes-like tools, streaming and non-streaming):
+  valid call (right tool, parseable and complete arguments, no leaked markup) in 25/30 (83 %)
+  at the neutral default, 24/28 (86 %) greedy, 25/28 (89 %) at 0.6 / 0.95. Every failure was a
+  wrong or absent call, never a malformed one. The neutral default spent a mean 906 completion
+  tokens and 46.7 s per call (worst short call 2,907 tokens, 167 s); 0.6 / 0.95 did the same
+  calls in 277 tokens and 12.3 s. Greedy fell into a repetition loop on a 60K-token prompt and
+  ran into both 600 s client timeouts.
+- **Chat replies** (1200-token answers, 3 paired prompts): neutral default 15.7-19.5 tok/s,
+  0.6 / 0.95 17.7-22.5 tok/s, greedy 19.3-34.5 tok/s but with a 27x repetition loop on one of
+  the three prompts (the loop's acceptance is what makes it fast; the same signature as the
+  >1 h runaway reply above). No loop at 0.6 / 0.95 on any measured prompt.
+
+`min_p`, `top_k` and `repetition_penalty` were not measured and are not set. Two scenarios
+failed under every setting and are model behaviour, not serve configuration: a ~60K-token
+pasted-log prompt (2/12 valid calls) and a request to record a checklist (1/12).
+
+## Client timeouts and queueing
+
+The serve runs one request at a time (`--max-num-seqs 1`), so a request that
+arrives while another is running waits in vLLM's queue and can sit there for
+minutes with no bytes sent to the client. Prefill itself is also long: at the
+measured ~1K tok/s a ~400K-token prompt takes ~7 min before the first token.
+Set client timeouts accordingly: an agent client needs a stream-stale/read
+timeout of at least 2400 s for long-context requests (a 900 s timeout was
+observed killing a 424K-token prefill mid-stream). The manager's keep-alive wrapper (port 8889) exists precisely so
+this does not kill legitimate prefills: while a request waits in the queue or
+prefills, the wrapper sends SSE comments and leading-whitespace heartbeat
+chunks, so a proxy or client that cuts an "idle" connection after ~180 s does
+not terminate the request — but a client that treats those bytes as
+first-token data will mis-measure TTFT, and a client connected directly to
+port 8000 gets no keep-alive at all and must rely on its own timeout alone.
 
 ## Measured bring-up (single Spark)
 
@@ -188,6 +300,19 @@ MemAvailable floor, 64 MiB swap-growth allowance, 0.05 s sampling
 The guard runs as root and keeps its files (`stage`, `guard.log`, `sysctl.before`) in the
 run directory, which the container cannot see: it gets only `$RUN/ctr` at `/mem`.
 `guard.sh stop` restores only the three sysctls `serve.sh` changes, and only integer values.
+
+**Host memory at ready is a hard requirement, not a tuning knob.** The boots this
+recipe was measured on came up with 2.6-3.3 GiB MemAvailable and 2.5-3.3 GiB of
+page cache at ready (normal boots 2.97-3.41 GiB of cache). With under ~1.5 GiB of
+page cache at ready, the cold experts are re-read from NVMe on every step and
+decode runs ~3x slower for the whole life of the boot — a third party measured
+395 ms/step at 0.5 GiB free against our ~130 ms/step. `serve.sh` writes the
+ready-state split to `$RUN/ready-mem` and leaves a `slow-boot` warning when the
+page cache at ready is under 1.5 GiB; `scripts/guard.sh status` prints both.
+The fix is to free host memory first — `systemctl isolate multi-user.target` and
+stopping heavy services — and then restart the serve once (`scripts/guard.sh
+stop`, then `scripts/serve.sh`). Restarting without freeing memory does not
+help: the condition does not decay on its own (see "Keep the disk quiet").
 
 ## Measured speed
 
@@ -414,8 +539,9 @@ The condition is set by the load and does not decay: 230.1, then 203.9 at +10 mi
 `build_cold_alias.sh`, start the server, stop it (`scripts/guard.sh stop`) and start it
 again before you measure or rely on it; waiting on a slow boot does not help, and
 `drop_caches`/`compact_memory` before the boot do not either. `serve.sh` writes the
-ready-state split to `$RUN/ready-mem`, and `scripts/guard.sh status` prints it and warns
-when the cache is under 1.5 GiB (normal boots 2.97-3.41 GiB, slow ones 0.40-0.81). Earlier,
+ready-state split to `$RUN/ready-mem` and a `slow-boot` warning file when the
+cache at ready is under 1.5 GiB, and `scripts/guard.sh status` prints both and warns
+(normal boots 2.97-3.41 GiB, slow ones 0.40-0.81). Earlier,
 less instrumented runs agree: 358.6 ms/step after a build, 214.3 with `drop_caches` +
 `compact_memory`, 190 -> 228 on one slow boot re-benched after 10 minutes, and 137-140 after
 a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s prefill for
@@ -454,13 +580,36 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   one at 32,313 tokens / 648 s for 6 valid calls. `DSML_STOP=1` (the default) adds the
   stop string `</|DSML| invoke>\n</`, kept in the output, to requests that carry tools:
   12 of 12 replays of the same states ended in 6-278 s with every closed invoke parsed,
-  streaming included. It does not catch the rarer form where the model leaves out
-  `</|DSML| parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
+  streaming included. `DSML_STOP=0` turns it off.
   Checked on the measurement box with `DSML_STOP=1` (the default): one tool request at
   `temperature=0` and five at `temperature=1.0` (`get_weather(city)`, `max_tokens` 2048-4096)
   all ended right after the closed invoke — `finish_reason: tool_calls`, one parsed call with
   `{"city": "Lisbon"}`, 49-56 `completion_tokens` — and a request without tools was unchanged
   (`finish_reason: stop`, 21 tokens).
+
+- **A missing parameter closer is repaired (`DSML_PARAM_REPAIR=1`, the default).** The rarer
+  form of the same failure: the model leaves out `</|DSML| parameter>` and writes the invented
+  closing tags into the argument (`git status</del></chat></dash></b>`). Without the repair the
+  parser drops that argument in a normal reply (the call comes back as `{}`) and keeps the junk
+  inside it when streaming; an agent would run either. The shim repairs only that structural
+  violation: when a parameter's closer is missing, it strips the trailing run of closing tags
+  that have no matching opening tag inside the value and restores the closer, printing one
+  `DSML PARAM REPAIR` line per repaired call. A value whose closer is present is never touched,
+  whatever it contains (`</div></body></html>`, `</div>\n</section>`). When streaming, each
+  call's arguments are held until that call is complete and then sent in one piece (the call's
+  id and name still arrive first); a valid call's assembled arguments are byte-identical to
+  the parser's. Not repaired: a value cut off with no junk run, junk followed by more text, and
+  requests without tools. Tested on the real parser and tokenizer with 17 synthetic replies
+  built from the shape in issue #15, on all four entry points (`parse`, `extract_tool_calls`,
+  `parse_delta`, `extract_tool_calls_streaming`, token by token): the 9 valid / no-junk /
+  no-tools replies come out identical with the repair on and off, the 8 broken ones come out
+  with the model's real argument. Live on this box with the repair on: 16 tool-call replies (two
+  agent prompts, one and three calls per reply, `temperature` 0 and 1.0, streaming and not) all
+  ended `tool_calls` with valid JSON arguments, and the streamed and non-streamed replies at
+  `temperature=0` were identical. One of them hit the failure for real: the model closed a `bash`
+  `cmd` with a plain `</parameter>` instead of the DSML closer; the repair stripped it and the
+  reply's three calls came back clean (without it that call is `{}`). bench7 with the repair:
+  129.7 ms/step. `DSML_PARAM_REPAIR=0` turns it off.
 
 ## Known limits
 
@@ -572,20 +721,22 @@ side file only works because device and host memory are the same pool.
 ## Pack revision
 
 The numbers were measured on a pack downloaded at revision `7cdebca3`. The Hub
-repo's history has since been replaced twice, each time with a single
-`Initial commit` holding the same files (`04f7138b`, then `2a6059359c68`), so old
-commit ids stop resolving. `scripts/env.sh` pins the current one,
-`2a6059359c685cd0ea66e1e6c34e6803322ff095`; the Hub revision has 24 files and the
+repo's history has since been replaced three times, each time with a single
+`Initial commit` holding the same weights (`04f7138b`, `2a6059359c68`, then
+`c852150e06f5`), so old commit ids stop resolving. `scripts/env.sh` pins the current
+one, `c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960`; the Hub revision has 27 files and the
 21 this recipe needs all match `scripts/SHA256SUMS` (sha256 of the 17 shards, the
-index, `config.json`, `tokenizer.json` and `tokenizer_config.json`). The other
-three (`.gitattributes`, `LICENSE`, `README.md`) are not used at serve time.
+index, `config.json`, `tokenizer.json` and `tokenizer_config.json`; checked
+2026-10-20). The other six (`.gitattributes`, `LICENSE`, `README.md`,
+`chat_template.jinja`, `engram_token_map.u32`, `generation_config.json`) are not in
+`SHA256SUMS`.
 
 **`scripts/SHA256SUMS` is the authority, not the commit id.** If the pinned
 revision is gone, `download_and_verify.sh` downloads `main` with a warning and
 the sha256 check decides whether it is the measured pack. A mismatch means the
 weights changed; do not serve it as this recipe.
 
-The Hub revision does not ship `engram_token_map.u32` (517,120 B) or
+Earlier Hub revisions did not ship `engram_token_map.u32` (517,120 B) or
 `chat_template.jinja` (4,015 B), both of which exist in the measurement box's
 copy of the pack. Neither is in `SHA256SUMS` and neither is required: a
 from-scratch install without them boots, passes `smoke.sh`, answers
@@ -597,9 +748,12 @@ from-scratch install without them boots, passes `smoke.sh`, answers
 
 - Engine: [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f)
   release r6w (Apache-2.0): vLLM fork, TileLang SM121 kernels, DeepSeek
-  TileKernels, sparknet. The base image is built per
-  [justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark](https://github.com/justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark)
-  `docker/Dockerfile`.
+  TileKernels, sparknet. The base image is built by `base/docker/Dockerfile`:
+  justincasey's DeepSeek-V4.1-Flash-1017-4x-DGX-Spark recipe at `fa77c26`
+  (Apache-2.0, its `LICENSE` and `NOTICE` kept in `base/`), copied unmodified because
+  that repository is no longer online. The prebuilt copy on Hugging Face
+  (`vcruz305/DSV4.1-Flash-1017-Spark-base-image`) carries the licences and NOTICE of every
+  component in the image; NVIDIA CUTLASS DSL is not in it and is installed from PyPI.
 - Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels
   with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
 - Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by
@@ -614,6 +768,8 @@ from-scratch install without them boots, passes `smoke.sh`, answers
 | `scripts/env.sh` | pins (model revision, image, fork/plugin SHAs), paths, serve knobs |
 | `scripts/download_and_verify.sh` | hf_xet download at the pinned revision + sha256 verification |
 | `scripts/build_image.sh` | base engine + forks + shim image build |
+| `scripts/fetch_base.sh` | fetches the prebuilt base from Hugging Face, verifies it, reinstalls CUTLASS DSL |
+| `base/` | the base image's build files (justincasey's, unmodified), `Dockerfile.cutlass-dsl`, `cutlass-dsl.lock` |
 | `docker/Dockerfile` | the layer: vllm-exl3, exllamav3 at tile-K 16, shim, TP1 decode tiles |
 | `docker/tp1_decode_tiles.py` | TP1 decode tile tables for the base image's FP8 TileLang linears |
 | `scripts/build_cold_alias.sh` | builds the cold-expert side file from your own pack copy |

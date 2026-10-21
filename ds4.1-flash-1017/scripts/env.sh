@@ -11,15 +11,26 @@ MODEL_REPO="vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw"
 # stop resolving. scripts/SHA256SUMS is the authority: download_and_verify.sh
 # falls back to main when this revision is gone, and the sha256 check decides.
 # See README "Pack revision".
-MODEL_REV="${MODEL_REV:-2a6059359c685cd0ea66e1e6c34e6803322ff095}"
+MODEL_REV="${MODEL_REV:-c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960}"
 MODEL_NAME="dsv41-1.62bpw-v3"          # directory name under $MODELS_DIR
 
 # ---- images ---------------------------------------------------------------
 # Base engine: Christopher Owen's spark-ds41f r6w (upstreams pinned at 2dc95329),
-# built per justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark docker/Dockerfile.
+# built by base/docker/Dockerfile (see base/README.md).
 # That Dockerfile's own base is vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf.
 BASE_IMAGE="${BASE_IMAGE:-dsv41-1017-ds41f:r6w}"
 IMAGE="${IMAGE:-dsv41-1017-exl3:r6w}"
+# Prebuilt base: the redistributable copy of $BASE_IMAGE on Hugging Face (CUTLASS DSL removed,
+# reinstalled from PyPI by scripts/fetch_base.sh). Pinned by revision, archive sha256, layer
+# digest and label-set sha256.
+BASE_HF_REPO="${BASE_HF_REPO:-vcruz305/DSV4.1-Flash-1017-Spark-base-image}"
+BASE_HF_REV="${BASE_HF_REV:-17ed433666f4cc6dfa86bcc1d3f4448255fd58fb}"
+BASE_ARCHIVE="dsv41-1017-ds41f-r6w-redist.tar.zst"
+BASE_ARCHIVE_SHA256="97d31344b0e5f8e17bf69e05d679a25b3256a452a7275bc294eb6bd149f58e9a"
+BASE_REDIST_IMAGE="dsv41-1017-ds41f:r6w-redist"
+BASE_REDIST_LAYER="sha256:8d743923e09ad9d435255f9436b5aa1a42d2e88cced04d121b238f8a726990cc"
+BASE_LABELS_SHA256="436ee3f65e6be1cd8f897eeb343c56a9a057a02069eb0d07aaccfcee2b4e73e4"
+BASE_DL_DIR="${BASE_DL_DIR:-$HOME/.cache/dsv41-base-image}"
 
 # Runtime forks baked into the layer above the base, pinned to the commits whose
 # file hashes match the measured server (branches named below).
@@ -44,28 +55,49 @@ RUNS_DIR="${RUNS_DIR:-$RECIPE_HOME/runs}"
 
 # ---- serve ----------------------------------------------------------------
 CONTAINER="${CONTAINER:-dsv41-tp1}"
-API_PORT="${API_PORT:-8888}"
+API_PORT="${API_PORT:-8888}"            # local default (upstream 8000); the container still listens on 8000
+# OpenAI model id the server answers to. Change it only to fit a front end that requires its
+# own id (e.g. a model manager); the bench scripts read the same variable.
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv41}"
+# Output cap for requests that send no max_tokens (agent clients such as Hermes send none). Without
+# it a reply that loops runs until the 524288-token window is full. A client value still wins.
+# 0 = no server default.
+DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
+# Default sampling for requests that send no temperature/top_p. Agent clients (Hermes among them)
+# send neither, so without this they ran at vLLM's neutral temperature 1.0 / top_p 1.0, which on this
+# 1.62 bpw quant behind greedy MTP drafts meant repetition loops, a ~3x longer reply per tool call
+# (906 vs 277 completion tokens, 46.7 vs 12.3 s) and 83 % vs 89 % valid tool calls (README "Request
+# defaults"). 0.6 / 0.95 measured best; 0.95 is the model card's top_p. A client value still wins.
+# Empty = no default.
+DEFAULT_TEMPERATURE="${DEFAULT_TEMPERATURE:-0.6}"
+DEFAULT_TOP_P="${DEFAULT_TOP_P:-0.95}"
 MAXLEN="${MAXLEN:-229376}"      # local default: one ~230K stream (upstream ships 524288, the largest measured clean limit)
-KVB="${KVB:-536870912}"         # local default 0.5 GiB: 380,035 tokens at MAXLEN=229376 (1.66 requests); upstream 1 GiB left
-                                # this box (desktop session, ~2.3 GiB more host memory) under the guard floor in a 225K prefill
+KVB="${KVB:-1073741824}"        # 1 GiB KV pool (upstream default); needs the desktop off (README "This copy")
 MNBT="${MNBT:-2112}"
 LPT="${LPT:-2047}"
 MTP_K="${MTP_K:-5}"
 CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
+# INERT in this recipe: vLLM ignores --gpu-memory-utilization whenever
+# --kv-cache-memory-bytes (KVB below) is set, and serve_inner.sh always passes
+# KVB. At boot the engine logs "reserved ... for KV Cache as specified by
+# kv_cache_memory_bytes config and skipped memory profiling. This does not
+# respect the gpu_memory_utilization config". Changing GPU_MEM_UTIL changes
+# nothing; change KVB. Kept only so the invocation matches the measured one.
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
-ROW_COST="${ROW_COST-}"                 # DSpark adaptive verification's linear step cost; upstream passes 0.01, which needs vLLM
-                                        # patch 0184 (spark-ds41f r6x); the r6w base built here rejects it, so empty = its timed budget
+ROW_COST="${ROW_COST-0.01}"             # DSpark adaptive verification linear row cost (base patch 0007); empty = engine default
 PREFIX_CACHING="${PREFIX_CACHING:-1}"   # 1 = reuse KV of repeated prefixes (default); 0 = every request is a full prefill
 DSML_STOP="${DSML_STOP:-1}"             # 1 = end tool-call replies at the first closing tag after a DSML invoke
+DSML_PARAM_REPAIR="${DSML_PARAM_REPAIR:-1}"  # 1 = strip junk closing-tag runs from DSML parameters whose closer is missing
 ATS_LAYERS="${ATS_LAYERS:-38,39}"
 ATS_MTP="${ATS_MTP:-1}"
 ATS_EMBED="${ATS_EMBED:-1}"
 
 export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
+export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export ROW_COST CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP
+export ROW_COST SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
 export ATS_LAYERS ATS_MTP ATS_EMBED
 
 # ---- privileges (local change: this host has docker-group access but no passwordless sudo) ----
@@ -79,3 +111,4 @@ as_root() {
 }
 export DOCKER
 export -f as_root
+

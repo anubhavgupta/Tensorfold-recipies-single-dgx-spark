@@ -21,13 +21,24 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 # Prefix caching (default on) reuses the KV of a repeated prompt prefix (multi-turn chat,
 # agents, follow-up questions on one long document); PREFIX_CACHING=0 turns it off.
 # See README "Prefix caching".
+# Default output cap for requests without max_tokens (0 = none); see DEFAULT_MAX_TOKENS in env.sh.
+# Default sampling for requests without temperature/top_p (empty = none); see DEFAULT_TEMPERATURE /
+# DEFAULT_TOP_P there. vLLM's get_diff_sampling_param accepts exactly max_new_tokens, temperature,
+# top_k, top_p, min_p and repetition_penalty as --override-generation-config defaults, and a client
+# that sends its own value still wins per request.
+GENCFG=()
+gen_json=""
+[ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && gen_json="${gen_json:+$gen_json,}\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}"
+[ -n "${DEFAULT_TEMPERATURE:-}" ] && gen_json="${gen_json:+$gen_json,}\"temperature\": ${DEFAULT_TEMPERATURE}"
+[ -n "${DEFAULT_TOP_P:-}" ] && gen_json="${gen_json:+$gen_json,}\"top_p\": ${DEFAULT_TOP_P}"
+[ -n "$gen_json" ] && GENCFG=(--override-generation-config "{$gen_json}")
 PCF=--enable-prefix-caching
 [ "${PREFIX_CACHING:-1}" = "0" ] && PCF=--no-enable-prefix-caching
 
 echo "dsv41 serve: model=$MODEL_DIR maxlen=$MAXLEN kv=$KVB mnbt=$MNBT lpt=$LPT mtp_k=$MTP_K graphs=$CG_MODE prefix_caching=${PREFIX_CACHING:-1}"
 
 exec vllm serve "$MODEL_DIR" \
-    --served-model-name dsv41 \
+    --served-model-name "${SERVED_MODEL_NAME:-dsv41}" \
     --host 0.0.0.0 --port 8000 \
     --tokenizer-mode deepseek_v41 \
     --dtype bfloat16 \
@@ -43,7 +54,7 @@ exec vllm serve "$MODEL_DIR" \
     --max-num-batched-tokens "$MNBT" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --kv-cache-memory-bytes "$KVB" \
-    --generation-config vllm \
+    --generation-config vllm "${GENCFG[@]}" \
     --engram-config '{"table_memory":"disk","disk_resident_scales":false,"projection_tp":true}' \
     --attention-backend tilelang \
     --linear-backend tilelang \
