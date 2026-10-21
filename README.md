@@ -274,3 +274,13 @@ The same model on TensorFold 1.1.1's native engine (`ornith-1.5-122b-tensorfold`
 the qwen3_5_moe family draft with DFlash2): decode 42 / 74 tok/s single stream (mixed / code) and 70 / 96 at 4 streams,
 ready in ~100 s, but prefill is 600 tok/s at 2K falling to 107 at 98K (128-row prompt passes, prompt attention off the
 tensor cores) and other streams stall during a prompt. Comparison: `ornith-1.5-122b-tensorfold/README.md`.
+
+### DeepSeek-V4.1-Flash-1017 SAGE EXL3 1.62bpw on vLLM (`ds4.1-flash-1017/scripts/serve.sh`)
+
+A copy of [vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe)
+(vLLM with EXL3 experts, a cold-expert alias side file read from NVMe, DSpark k=5), set up on this Spark for one stream
+at a 229,376-token window: OpenAI API on port 8000, model `dsv41`. Short-prompt decode 41.3 tok/s (128 ms/step,
+4.9 tok/step); a 225K prompt prefills at 725 tok/s and decodes at 28.7 tok/s with the needle found. Local changes
+(base image rebuilt from spark-ds41f, no-sudo helpers, a 0.5 GiB KV pool for this box's memory) are listed at the top
+of `ds4.1-flash-1017/README.md`.
+
