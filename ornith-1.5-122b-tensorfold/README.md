@@ -62,6 +62,16 @@ vs 3.7 on mixed text) but rounds are ~30% shorter. MiaAI-Lab's engine (same mode
 drafted tokens and 61-67 ms rounds, which is how the cause was found. Drafted replies equal `"draft": false` with one
 stream and with three concurrent streams; the tool-call check passes; one stream at 117K tokens decodes at 23.1 tok/s.
 
+**What is left of the gap to MiaAI-Lab's engine** (same model and drafter: 51.3 / 53.3 / 74.6 tok/s single stream for
+mixed / thinking / code, against 46.2 / 50.6 / 71.8 here). Its window costs sit a constant ~2.5-3 ms under these at every
+width from 1 to 16 rows (e.g. 30.0 / 36.1 / 46.8 / 51.4 ms at 1 / 2 / 6 / 16 rows). Toggling its switches on this model:
+programmatic dependent launch (`TF_QWEN_PDL=0`) and the shared expert on a side stream (`TF_QWEN_SIDE_SHARED=0`) change
+nothing; turning off its warp-per-expert MoE router (`TF_QWEN_ROUTER_TILE=1`, their patches 0008/0014/0027) brings its
+curve to this one's within ~1 ms (32.6 / 39.1 / 50.3 / 54.4). So the remaining difference is that router. Their PDL
+(0026) and GDN state ping-pong (0023) were also ported onto this build and measured, PDL on and off alternated twice:
+no change in the window costs (within +-1 ms) or the rounds, so they are not kept. Their batched decode attention (0024)
+and the router were not ported.
+
 The table below is the build before 0004 (0001 only), kept for the comparison:
 
 | Workload | TF N=1 | SGLang N=1 | TF N=2 | SGLang N=2 | TF N=4 | SGLang N=4 |
