@@ -24,6 +24,7 @@ Settings are environment variables or `.env` lines (`scripts/config.sh`): `CONTE
 | `patches/0002-prompt-attention.patch` | prefill: a tensor-core attention kernel for prompt passes (see [Prefill](#prefill-one-request-nothing-else-running)). `TENSORFOLD_PROMPT_ATTN=0` restores the stock kernel |
 | `patches/0004-narrow-verify-windows.patch` | decode: verify windows of 2-16 rows are no longer padded to 16, so the scheduler drafts ~6 tokens a round instead of ~13 (see [Decode](#decode-toks-per-stream-at-n1-total-at-n2-and-n4)). Ported from MiaAI-Lab's Ornith recipe (MIT) |
 | `patches/0003-prompt-rows-1024.patch` | prefill: prompt passes of 1,024 rows instead of 128, so the 66 GiB of routed experts are read an eighth as often a prompt token |
+| `patches/0005-think-close-at-line-start.patch` | replies: the reasoning ends at the first `</think>` that starts a line outside a ``` fence. Stock ends it at the first `</think>` anywhere, so when the model quoted the tag while reasoning (e.g. about a chat template), the rest of its reasoning went into `content`, and the tool-call parser read it. `TENSORFOLD_THINK_LINE_CLOSE=0` restores the stock split |
 
 The image is `tensorfold-native` built from TensorFold v1.1.1 (`b10231b9`) plus the patches with Zig 0.17.0 on
 `nvcr.io/nvidia/pytorch:26.07-py3` (`scripts/prepare.sh`, rebuilt when a patch changes).
@@ -166,6 +167,10 @@ prompts' acceptance.
   TensorFold returns the string `"null"`, SGLang JSON null. Both stay valid against the schema.
 - KV cache: bf16 by default here (fp8 with `KV_CACHE=fp8`, not measured); SGLang uses fp8.
 - Sampling defaults, thinking default and served name match the SGLang recipe.
+- Chat template: the server renders the checkpoint's own `chat_template.jinja` with TensorFold's Jinja engine; its
+  prompt token counts equal Hugging Face `apply_chat_template` for plain, system, thinking-off, reasoning history,
+  tools and a tool loop (`bench/template_check.py`, needs `transformers`). `bench/think_check.py` checks where
+  reasoning, answer and calls land in 11 cases, streamed and not.
 
 ## Files
 
@@ -179,4 +184,6 @@ prompts' acceptance.
 | `patches/0002-prompt-attention.patch`, `patches/0003-prompt-rows-1024.patch` | prefill (see above) |
 | `tools/pa_test.cu` | the prompt attention kernel against the stock one on one layer (accuracy, time) |
 | `bench/bench.py`, `bench/tools_check.py` | the SGLang recipe's benchmarks and tool check (read either server's counters) |
+| `bench/think_check.py`, `bench/template_check.py` | thinking split (reasoning/content/calls) and chat-template checks |
+| `patches/0004-narrow-verify-windows.patch`, `patches/0005-think-close-at-line-start.patch` | decode window widths; reasoning split |
 | `results/tf-dflash.md`, `results/tf-dflash-prefill.md` | raw output of the runs above (stock 1.1.1 + 0001; with 0002 + 0003) |

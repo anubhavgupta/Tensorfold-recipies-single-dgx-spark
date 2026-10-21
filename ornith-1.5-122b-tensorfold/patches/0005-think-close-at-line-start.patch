@@ -1,0 +1,95 @@
+A reply's think block ends at the first `</think>` that starts a line outside a ``` fence (server/reply_text.zig).
+
+Stock ends it at the first `</think>` anywhere. When the model reasons about chat templates or parsers it quotes the tag
+inline (seen in pi: "outputs `<think>\n\n</think>\n\n`, else `<think>\n`"), and everything after the quote, the rest of
+the reasoning, went to `content`, streamed and not; the tool-call parser read it too, so a call the reasoning only
+mentioned could become a real one. `<think>`/`</think>` are ordinary tokens 248068/248069 here (not special), the same ids
+whether quoted or real, so the split decides by position: Qwen 3.5 models close reasoning with "\n</think>\n\n". A finished
+reply with no line-start closer falls back to its first `</think>` (stock); while streaming, an inline one stays reasoning.
+Only the `</think>` markers change (not Gemma's channel markers). usage.reasoning_tokens still counts to the first
+`</think>` token.
+
+TENSORFOLD_THINK_LINE_CLOSE=0 restores the stock split.
+Verified: Zig unit test in reply_text.zig (quoted, fenced, plain, inline, empty block, quoted call; stock tests pass);
+bench/think_check.py (11 cases, streamed and not) and bench/template_check.py on the served model; README.
+
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index 6af44209..0db475d4 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -49,6 +49,66 @@ fn trimNewlines(s: []const u8) []const u8 {
+ 
+ pub const Split = struct { reasoning: []const u8, answer: []const u8 };
+ 
++/// TENSORFOLD_THINK_LINE_CLOSE=0: a think block ends at its first ``</think>`` anywhere (stock).
++fn lineClose() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TENSORFOLD_THINK_LINE_CLOSE")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
++    return S.v.?;
++}
++
++/// Where a ``</think>`` block ends. A reasoning that quotes the tag (a chat template, a parser) writes it inline, e.g.
++/// ``outputs `<think>\n\n</think>` ``, while Qwen's models close their reasoning with ``\n</think>\n\n``: the end is
++/// the first ``</think>`` that starts a line outside a ``` fence. A finished reply with no such closer falls back to
++/// its first ``</think>``; while streaming, an inline one stays reasoning.
++fn thinkClose(text: []const u8, close: []const u8, finished: bool) ?usize {
++    if (!std.mem.eql(u8, close, think_markers.close) or !lineClose()) return find(text, close);
++    return lineCloseAt(text, close, finished);
++}
++
++fn lineCloseAt(text: []const u8, close: []const u8, finished: bool) ?usize {
++    var first: ?usize = null;
++    var at: usize = 0;
++    while (findTag(text, at, close)) |i| {
++        if (first == null) first = i;
++        if ((i == 0 or text[i - 1] == '\n') and std.mem.count(u8, text[0..i], "```") % 2 == 0) return i;
++        at = i + close.len;
++    }
++    return if (finished) first else null;
++}
++
++test "a quoted </think> stays reasoning" {
++    const a = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const x = arena.allocator();
++    const quoted = "The template emits `<think>\\n\\n</think>\\n\\n`, else `<think>\\n`. So it is a variable.\n</think>\n\nIt is correct.";
++    for ([_]bool{ true, false }) |fin| {
++        const s = try splitThinking(x, quoted, fin, think_markers);
++        try std.testing.expectEqualStrings("The template emits `<think>\\n\\n</think>\\n\\n`, else `<think>\\n`. So it is a variable.\n", s.reasoning);
++        try std.testing.expectEqualStrings("It is correct.", s.answer);
++    }
++    // a fenced quote whose closer starts a line
++    const fenced = "Template:\n```\n<think>\n\n</think>\n```\nDone.\n</think>\n\nAnswer.";
++    const f = try splitThinking(x, fenced, true, think_markers);
++    try std.testing.expectEqualStrings("Answer.", f.answer);
++    // the usual reply, and one whose closer is mid-line: unchanged when finished, held as reasoning while streaming
++    const plain = try splitThinking(x, "Simple.\n</think>\n\n391", true, think_markers);
++    try std.testing.expectEqualStrings("Simple.\n", plain.reasoning);
++    try std.testing.expectEqualStrings("391", plain.answer);
++    const inline_end = try splitThinking(x, "Simple.</think>\n\n391", true, think_markers);
++    try std.testing.expectEqualStrings("391", inline_end.answer);
++    const inline_streaming = try splitThinking(x, "Simple.</think>\n\n391", false, think_markers);
++    try std.testing.expectEqualStrings("", inline_streaming.answer);
++    // an empty block, as thinking-off prompts and short replies give
++    const empty = try splitThinking(x, "</think>\n\nHi", false, think_markers);
++    try std.testing.expectEqualStrings("Hi", empty.answer);
++    // a call quoted in the reasoning is not the answer
++    const call = try splitThinking(x, "I could emit `<tool_call>` here. `</think>` too.\n</think>\n\nNo call needed.", true, think_markers);
++    try std.testing.expectEqualStrings("No call needed.", call.answer);
++}
++
+ /// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
+ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
+     var text = full;
+@@ -73,7 +133,7 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
+     } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
+         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
+     }
+-    if (find(text, m.close)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
++    if (thinkClose(text, m.close, finished)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
+     var call: ?usize = null;
+     for (calls) |c| if (find(text, c[0])) |at| {
+         if (call == null or at < call.?) call = at;
