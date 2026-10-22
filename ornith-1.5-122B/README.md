@@ -179,8 +179,10 @@ Each extra verified token routes to ~6-7 more experts per layer (~4.8 ms a round
 not improve with a wider draft: drafting the trained 16 positions and verifying the first 6 accepts 3.66 tokens a round,
 drafting 6 accepts 3.64 (per-round accept lengths logged from a `DF_BLOCK=16` run, 849 rounds). At ~65 ms (the floor
 above plus the draft) and ~3.6 accepted tokens, the ceiling for code at one stream is ~55 tok/s with this checkpoint
-and chain verification; 85 tok/s is not reachable on this path. The TensorFold port (`../ornith-1.5-122b-tensorfold`,
-MLX 4-bit, tree verification, ~4.7 tokens a round) measures 71.8 tok/s code at one stream and 97.6 total at 4.
+and chain verification; 85 tok/s is not reachable on this path. A TensorFold 1.1.1 port (tree verification, ~4.7 tokens
+a round) reached 71.8 tok/s code at one stream and 97.6 total at 4, but TensorFold reads this model only as the MLX
+affine 4-bit export (attention/GDN projections and GDN gates at 4-bit instead of FP8/bf16, no calibration), whose output
+quality was clearly worse; it was removed (2026-10-22).
 
 Block size, re-measured with `bench.py seq` (8 code prompts one after another, greedy) and `decode 4`:
 
