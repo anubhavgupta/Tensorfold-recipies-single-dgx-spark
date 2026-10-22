@@ -50,7 +50,7 @@ curl -s localhost:8890/v1/chat/completions -H 'content-type: application/json' \
 Change settings with environment variables or a `.env` file in this folder (see below), then `./start.sh restart`.
 Stop with `./stop.sh`. Only one large server fits in memory: stop other recipes first.
 
-Re-run the benchmarks against a running server (`bench/`, copied from `27B-2/bench`):
+Re-run the benchmarks against a running server (`bench/`, copied from the former `27B-2/bench`, now `27B-3/bench`):
 
 ```bash
 cd bench

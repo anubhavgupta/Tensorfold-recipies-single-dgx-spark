@@ -70,7 +70,7 @@ LOOPS=2 KV_MODE=last_loop ./start.sh restart   # default quality, less KV memory
 echo "LOOPS=1" >> .env && ./start.sh restart   # keep a setting across restarts
 ```
 
-Re-run the benchmarks against a running server (`bench/`, copied from `27B-2/bench`):
+Re-run the benchmarks against a running server (`bench/`, copied from the former `27B-2/bench`, now `27B-3/bench`):
 
 ```bash
 cd bench

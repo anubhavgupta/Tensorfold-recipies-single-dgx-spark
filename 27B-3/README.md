@@ -1,6 +1,7 @@
 # Qwen3.8-27B EXL3 4.00bpw (standard) + z-lab DFlash2 drafter on TensorFold 0.6.6 (one DGX Spark)
 
-A copy of [27B-2](../27B-2/README.md) (same 11 patches, scripts and defaults) for the other 4.00 bpw quant:
+A copy of the former 27B-2 recipe ([its README](docs/27B-2.md); removed 2026-10-22) with the same 11 patches, scripts and
+defaults, for the other 4.00 bpw quant:
 
 | | 27B-3 (this) | 27B-2 |
 |---|---|---|
@@ -12,7 +13,6 @@ A copy of [27B-2](../27B-2/README.md) (same 11 patches, scripts and defaults) fo
 | Container / port | `tf-27b-3` / 8888 | `tf-27b-2` / 8888 |
 
 - Drafter: `z-lab/Qwen3.8-27B-DFlash2` (bf16; 27B-2 uses igor255's EXL3 quant of it). `DRAFT_REPO=igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` switches back (patch 0005 loads it).
-- Only one of 27B-2 / 27B-3 can run at a time (same port, and each takes most of the memory).
 
 ```bash
 ./27B-3/build_model_dir.sh  # once: copies the 4.00bpw pack from the HF cache (downloads it if missing) + the chat template

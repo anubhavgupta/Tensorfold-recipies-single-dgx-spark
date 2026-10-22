@@ -5,7 +5,7 @@ description: "Port, serve, patch, benchmark and optimise an LLM (target + specul
 
 # Porting a model to TensorFold on one DGX Spark
 
-Workspace: `~/projects/tensorfold` (git repo; recipes are sibling dirs: `flash-3/`, `qwen38-27b/`, `27B-2/`, `glm5.3/` ...).
+Workspace: `~/projects/tensorfold` (git repo; recipes are sibling dirs: `flash-3/`, `qwen38-27b/`, `27B-3/`, `glm5.3/` ...).
 `./tensorfold.sh [--tf-* opts] serve ...` runs TensorFold in Docker; `--tf-patches DIR` builds a derived image
 (`tensorfold:vX-<hash>-p<hash>`) that applies `DIR/*.patch` in name order with `patch -p0` and rebuilds automatically
 when the patches change. Never commit `dashboard/cost.json` or other files that are not yours (check `git status`).
@@ -47,7 +47,7 @@ Helper scripts (in `scripts/` beside this file):
   output: double quantization (EXL3 -> bf16 -> affine 4-bit) measured the same acceptance as bf16 (6.06 vs 6.00 tok/round).
 - **EXL3 vision tower inside the shards** (quantized, TensorFold cannot load it): prefer the same model's bf16 tower from
   an MLX/bf16 checkpoint (same `vision_tower.*` names; TensorFold accepts bf16 and permutes MLX's channels-last patch
-  embed), saved as `vision_bf16.safetensors` in a self-contained model folder (`27B-2/build_model_dir.sh`), mounted with
+  embed), saved as `vision_bf16.safetensors` in a self-contained model folder (`27B-3/docs/27B-2.md`, the removed 27B-2 recipe's `build_model_dir.sh`), mounted with
   `--tf-docker-arg=--volume=HOST:/models/NAME:ro`; else extract `model.visual.*` and run
   `python -m tensorfold.vision.exl3_convert`. Point `TENSORFOLD_VISION_WEIGHTS` at the container path.
 - **Vision/video prefix cache**: stock never caches image prompts (placeholder ids are identical across images). Key the
@@ -82,8 +82,8 @@ Helper scripts (in `scripts/` beside this file):
 - State the method in every table: prompts (same vs distinct), temperature (greedy accepts far more drafts than T=1),
   reply length, thinking on/off, PARALLEL, warm or cold cache. The repo README's 27B table uses the same prompt for
   every client, greedy, thinking off, 200-token replies; a distinct-prompt T=1 test gives much lower numbers.
-- Tools used: `27B-2/bench/bench.py` (decode, `prefill N...` with unique prompts, `conc N TOKENS NEW`),
-  `27B-2/bench/tput.py [--code] N...` (aggregate tok/s, distinct prompts, T=1), `27B-2/bench/same.py N...`
+- Tools used: `27B-3/bench/bench.py` (decode, `prefill N...` with unique prompts, `conc N TOKENS NEW`),
+  `27B-3/bench/tput.py [--code] N...` (aggregate tok/s, distinct prompts, T=1), `27B-3/bench/same.py N...`
   (README method). `prompt_of` undercounts: report the server's `prompt_tokens`.
 - Noise is ~5-10% between runs; GPU temperature moves the 1-row verify 64->72 ms. Do A/B back to back, warm up first,
   and repeat. Do not claim a gain inside the noise.
