@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next EXL3 + DFlash2 // TensorFold 0.6.6 // one DGX Spark
 
-A copy of `flash-2` (turboderp's EXL3 pack `turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6`, 9 streams, 262,144-token
+A copy of the former `flash-2` recipe (removed 2026-10-22; turboderp's EXL3 pack `turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6`, 9 streams, 262,144-token
 window, vision, tool-call fixes), moved to TensorFold **0.6.6** and drafting with the DFlash2 model
 [`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) instead of the
 checkpoint's MTP head. OpenAI-compatible API on port 8888, model id `Qwen3.8-Flash-Next`.
@@ -48,7 +48,7 @@ cd flash-3 && docker run --rm --network none --entrypoint bash -v "$PWD:/recipe:
    PYTHONDONTWRITEBYTECODE=1 python3 /recipe/tools/test_tool_calls.py'
 ```
 
-See `../flash-2/overlay/README.md` for how the tool-call defects were found and what the parser fix does. That
+See `docs/flash-2-overlays.md` for how the tool-call defects were found and what the parser fix does. That
 covers the intentional streaming change (a tool event carries its complete arguments), opt-in tracing (`TOOL_TRACE=1`,
 sensitive) and the remaining model-generation limits.
 
@@ -85,7 +85,7 @@ Exactness checks on the GB10 (all greedy):
 The same method as flash-2's README entry, back to back on the same day: `bench/suite.py content TAG 1,4,9 256`. It
 sends chat prompts per content class (4 prompts a class, a distinct variant per client), 256-token replies, thinking
 off, greedy, and reports the second of two rounds. The figure is steady-state aggregate decode tok/s (`aggregate_steady`).
-flash-2 is `../flash-2/start.sh` (TensorFold 0.6.5, MTP 6 drafts / 0.60). flash-3 has the defaults above. Both use
+flash-2 was the removed `flash-2/start.sh` (TensorFold 0.6.5, MTP 6 drafts / 0.60, the same patches as overlays). flash-3 has the defaults above. Both use
 `PARALLEL=9`, int8 KV and the 262,144-token window.
 
 | Content | Clients | flash-2 (MTP) | flash-3 (DFlash2) | Change |

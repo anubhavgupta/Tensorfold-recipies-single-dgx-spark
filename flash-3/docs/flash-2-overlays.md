@@ -1,4 +1,9 @@
-# EXL3 prompt-speed overlay for TensorFold 0.6.5
+# flash-2 overlays: tool-call fix, EXL3 prompt kernels, image prefix cache, limits, n-gram (history)
+
+Kept from the removed `flash-2` recipe (TensorFold 0.6.5, whole-file overlays). flash-3 carries the same changes as
+`patches/0001`-`0005`; paths below (`overlay/...`, `flash-2/start.sh`, `OVERLAY`, `PATCHES=0`) refer to flash-2's
+layout, and its measurements were taken on flash-2.
+
 
 ## Tool-call parser fix (enabled by default)
 

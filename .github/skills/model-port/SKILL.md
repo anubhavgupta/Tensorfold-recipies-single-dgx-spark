@@ -5,7 +5,7 @@ description: "Port, serve, patch, benchmark and optimise an LLM (target + specul
 
 # Porting a model to TensorFold on one DGX Spark
 
-Workspace: `~/projects/tensorfold` (git repo; recipes are sibling dirs: `flash-2/`, `qwen38-27b/`, `27B-2/`, `glm5.3/` ...).
+Workspace: `~/projects/tensorfold` (git repo; recipes are sibling dirs: `flash-3/`, `qwen38-27b/`, `27B-2/`, `glm5.3/` ...).
 `./tensorfold.sh [--tf-* opts] serve ...` runs TensorFold in Docker; `--tf-patches DIR` builds a derived image
 (`tensorfold:vX-<hash>-p<hash>`) that applies `DIR/*.patch` in name order with `patch -p0` and rebuilds automatically
 when the patches change. Never commit `dashboard/cost.json` or other files that are not yours (check `git status`).
@@ -211,8 +211,8 @@ one call in the first assistant turn alone is not proof of omission.
   disabled; keep logs/captures out of commits. Document fixes, intentional behavior changes and remaining limitations.
 
 Prior art (inspect before reusing; these integrations target TensorFold 0.6.5):
-`flash-2/tools/tool_calls.py`, `flash-2/patches/0001-tool-parser.patch`,
-`flash-2/tools/test_tool_calls.py`, `flash-2/tools/repro_tool_calls.py`,
-`flash-2/tools/diagnose_generation.py`, `flash-2/tools/tool_trace.py`, and
-`flash-2/overlay/README.md`. The generation diagnostic's sequential replay uses a retained private synthetic fixture;
+`flash-3/tools/tool_calls.py`, `flash-3/patches/0001-tool-parser.patch`,
+`flash-3/tools/test_tool_calls.py`, `flash-3/tools/repro_tool_calls.py`,
+`flash-3/tools/diagnose_generation.py`, `flash-3/tools/tool_trace.py`, and
+`flash-3/docs/flash-2-overlays.md`. The generation diagnostic's sequential replay uses a retained private synthetic fixture;
 for a fresh recipe, build a self-contained conversation fixture rather than depending on another session's captures.

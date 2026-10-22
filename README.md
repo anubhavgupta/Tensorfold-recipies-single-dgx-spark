@@ -9,15 +9,13 @@ client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 a
 | Qwen3.8-27B | 49.0 / 85.2 tok/s | 236.6 / 334.2 tok/s |
 | Ternary-Bonsai-2-27B | 44.2 / 87.6 tok/s | 195.8 / 308.9 tok/s |
 | Qwen3.8-Flash-Next | 46.8 / 63.7 tok/s | 186.4 / 260.3 tok/s |
-| Qwen3.8-Flash-Next EXL3 (`flash-2`)* | 54 / 93 tok/s | 158 / 254 tok/s |
 | Qwen3.8-Flash-Next EXL3 + DFlash2 (`flash-3`)*** | 57 / 111 tok/s | 167 / 262 tok/s |
 | Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b`)** | 52 / 52 tok/s | 511 / 515 tok/s |
 | GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2`)** | 31 / 32 tok/s | 40 / 45 tok/s |
 | Ornith-1.5-122B NVFP4 + DFlash2 (`ornith-1.5-122B`)**** | 40 / 49 tok/s | 61 / 93 tok/s |
 
-\* Different method: 256-token chat replies, 9 clients (see its section).
 \** TensorFold 1.0.12 native (Zig) engine with this repo's patches; peak at 16 (Dory) and 4 (GLM) clients.
-\*** flash-2 moved to TensorFold 0.6.6 (the last Python engine) with the DFlash2 drafter instead of MTP; flash-2's method.
+\*** TensorFold 0.6.6 (the last Python engine) with the DFlash2 drafter; 256-token chat replies, 9 clients (see its section).
 \**** Served with SGLang, not TensorFold; distinct prompts, 512-token replies, greedy, 4 clients each holding a full
 262K context (see its section).
 
@@ -79,23 +77,26 @@ MTP accept rate on code: 73.9%. With stock TensorFold defaults (MTP confidence 0
 workspace), prose was 45.9 / 65.4 / 112.5 / 114.4 / 165.8 tok/s at 1-5 clients; the preset's three settings close that
 gap. Concurrent full-context streams were not measured for Flash Next.
 
-### Qwen3.8-Flash-Next EXL3 (`flash-2/start.sh`)
+### Qwen3.8-Flash-Next EXL3 + DFlash2 (`flash-3/start.sh`)
 
-`turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6` on TensorFold v0.6.5 with the `flash-2/overlay` patches (faster EXL3
-prompt kernels, image prefix cache, elastic kept states, bigger media limits, n-gram table left unpinned), MTP drafts,
-`--parallel 9`, 262,144-token context. A different method from the tables above: chat prompts per content class,
-greedy, 256-token replies, thinking off, aggregate decode tok/s (`flash-3/bench/suite.py`).
+`turboderp/Qwen3.8-Flash-Next-exl3 @ 4.05bpw_h6_ng6` on TensorFold 0.6.6 (faster EXL3 prompt kernels, image prefix
+cache, elastic kept states, bigger media limits, n-gram table left unpinned, tool-call parser fix), drafting with `incoai/Qwen3.8-Flash-Next-DFlash2` instead of
+the MTP head (`flash-3/patches/0006`: target taps, a batched drafter, exact verification). TensorFold 1.0 and later are
+native binaries without EXL3 or DFlash for Flash Next, so 0.6.6 is the latest engine this pack runs on. Same method as
+the former `flash-2` recipe (greedy, 256 tokens, thinking off, steady aggregate tok/s), back to back with flash-2 (the same
+pack and patches on TensorFold 0.6.5 with MTP drafts; removed 2026-10-22 as flash-3 is faster):
 
-| Content | 1 client | 4 clients | 9 clients |
+| Content | 1 client: flash-2 / flash-3 | 4 clients | 9 clients |
 |---|---:|---:|---:|
-| Code | 93 | 177 | 254 |
-| Prose | 54 | 106 | 158 |
-| DevOps | 98 | 172 | 254 |
-| JSON | 97 | 188 | 274 |
+| Code | 95 / 111 | 178 / 190 | 254 / 262 |
+| Prose | 55 / 57 | 104 / 114 | 157 / 167 |
+| DevOps | 101 / 89 | 167 / 180 | 249 / 261 |
+| JSON | 99 / 105 | 186 / 211 | 294 / 284 |
 
-These were measured before the prompt-kernel overlay; with it decode was unchanged (code 66 / 176 / 249 steady and prose
-151 at 9 clients in a rerun). A single short request alone decodes at about 47 tok/s. For comparison, TabbyAPI + the
-patched exllamav3 fork on the same pack: code 76 / 131 / 133, prose 50 / 91 / 117 at 1 / 4 / 9 clients.
+Sampled at T=0.7, 4 clients: +9% to +15%; 9 clients: −2% to +6%. Greedy replies equal `"draft": false`.
+Details, sweeps and limits: `flash-3/README.md`.
+
+Measured on flash-2 (TensorFold 0.6.5 with the same patches as overlays; `flash-3/docs/flash-2-overlays.md`):
 
 Prefill, one cold stream (tok/s):
 
@@ -113,25 +114,6 @@ Prefill, one cold stream (tok/s):
 | Elastic kept states (`TENSORFOLD_KEEP_MAX`) | 9 parallel ~15K-token chats: all 9 follow-ups warm (~1 s each); stock re-prefilled 5 of 9 (71 s) |
 | Image prefix cache | a repeated image prompt resumed 1,767 cached tokens; greedy output identical cached or not |
 | `TENSORFOLD_PREFILL_ROWS` 4096 / 8192 | +3% / +4% prefill at 32K, but one fewer full-window stream; the default 2048 stays |
-
-Details and diffs: `flash-2/overlay/README.md`; raw results: `instructions.md` (rounds 2-4).
-
-### Qwen3.8-Flash-Next EXL3 + DFlash2 (`flash-3/start.sh`)
-
-flash-2 on TensorFold 0.6.6 with its overlays as patches, drafting with `incoai/Qwen3.8-Flash-Next-DFlash2` instead of
-the MTP head (`flash-3/patches/0006`: target taps, a batched drafter, exact verification). TensorFold 1.0 and later are
-native binaries without EXL3 or DFlash for Flash Next, so 0.6.6 is the latest engine this pack runs on. Same method as
-flash-2 above (greedy, 256 tokens, thinking off, steady aggregate tok/s), back to back with flash-2:
-
-| Content | 1 client: flash-2 / flash-3 | 4 clients | 9 clients |
-|---|---:|---:|---:|
-| Code | 95 / 111 | 178 / 190 | 254 / 262 |
-| Prose | 55 / 57 | 104 / 114 | 157 / 167 |
-| DevOps | 101 / 89 | 167 / 180 | 249 / 261 |
-| JSON | 99 / 105 | 186 / 211 | 294 / 284 |
-
-Sampled at T=0.7, 4 clients: +9% to +15%; 9 clients: −2% to +6%. Greedy replies equal `"draft": false`.
-Details, sweeps and limits: `flash-3/README.md`.
 
 ### Ternary-Bonsai-2-27B (`bonsai-27b/start.sh`)
 
