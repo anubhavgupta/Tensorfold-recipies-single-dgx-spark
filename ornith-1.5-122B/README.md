@@ -9,7 +9,7 @@ Serves [ornith-ai/Ornith-1.5-122B-NVFP4](https://huggingface.co/ornith-ai/Ornith
 ```bash
 hf download ornith-ai/Ornith-1.5-122B-NVFP4      # 77.6 GB
 hf download incoai/Ornith-1.5-122B-DFlash2       # 1.9 GB
-./ornith-1.5-122B/start.sh                       # ~9-10 min to ready (weights load ~7 min)
+./ornith-1.5-122B/start.sh                       # ~70 s to ready (weights ~33 s, patches/0001)
 python3 ornith-1.5-122B/bench/tools_check.py     # functional tool-call check
 ./ornith-1.5-122B/end.sh
 ```
@@ -21,10 +21,10 @@ Every knob is an environment variable (or a line in `ornith-1.5-122B/.env`), doc
 
 | Setting | Value | Why |
 |---|---|---|
-| Image | `lmsysorg/sglang:dev-cu13` @ `035f29e9` (main `65f759144`), stock | has `DFlash2DraftModel`, DFLASH for `Qwen3_5MoeForConditionalGeneration`, quantized `lm_head` |
+| Image | `lmsysorg/sglang:dev-cu13` @ `035f29e9` (main `65f759144`) + `patches/0001` (fast weight load) | has `DFlash2DraftModel`, DFLASH for `Qwen3_5MoeForConditionalGeneration`, quantized `lm_head` |
 | Speculation | DFLASH, `DF_BLOCK=6` verified tokens per round | measured optimum on GB10, see below (the drafter trained at 16) |
-| Streams | `PARALLEL=4` x `CONTEXT=262144` | every stream can hold a full 262K context at once (verified, below) |
-| KV cache | fp8 e4m3; target 12 KiB/token + draft 12 KiB/token | 1,048,600 tokens = 24 GiB |
+| Streams | `PARALLEL=4` x `CONTEXT=262144` | every stream can hold a full 262K context at once with `FAST_LOAD=0` (verified, below); ~252K each with the fast load (see Boot) |
+| KV cache | fp8 e4m3; target 12 KiB/token + draft 12 KiB/token | 1,048,600 tokens = 24 GiB (1.00-1.01M with the fast load) |
 | GDN state | bf16 SSM, `extra_buffer_lazy`, 90 slots (16 for running requests, the rest are the hybrid prefix cache) | 74.5 MiB per slot |
 | `MEM_FRACTION` | 0.91 | leaves ~8 GB `MemAvailable` at idle, >= 3.9 GB under 4 x 245K prompts |
 | MoE kernels | `flashinfer_cutlass` | `marlin` decodes the same and prefills 40% slower |
@@ -113,6 +113,33 @@ All four completed; minimum `MemAvailable` 3.9 GB with interval 16 (8.2 GB with 
 5.3 GB over the session, which also ran a large HF download in parallel; watch it on a busy host.
 Average prefill at this depth is ~800 tok/s.
 
+## Boot
+
+| Phase | Stock | Now | What changed |
+|---|---:|---:|---|
+| target weights (68 GB, 113,047 tensors) | 417-470 s | 32-33 s | `patches/0001` (below) |
+| drafter weights | 12-15 s | ~1 s | same |
+| FlashInfer autotune + kernel JIT | ~100 s | ~2 s | `.cache/sglang-{flashinfer,jit,nv}` persisted (first boot still tunes) |
+| pools, CUDA graphs, warm-up | ~40 s | ~30 s | |
+| **ready** | **~640 s** | **~70 s** | |
+
+Cause of the slow load: on this box (GB10, CUDA 13, driver 580) a host-to-device copy from mmap'd safetensors pages the
+process has not touched runs at ~0.15 GB/s, 10 ms per 1.5 MB expert tensor, even with the file in the page cache; from
+touched or anonymous pages it runs at 37-44 GB/s (`tools/copy_bench.py`). SGLang's loader copies straight from untouched
+mmap views. `patches/0001` makes the loader workers read their shard sequentially and touch its pages, hands large
+tensors out as anonymous copies, and drops the shards' page cache once the model is loaded (this platform sizes the KV
+pool from free memory that does not count cache). SGLang's own `--weight-loader-prefetch-checkpoints` only got to
+371 s (the cache cannot hold the checkpoint beside the weights). Greedy output is byte-identical with and without the
+patch (4 prompts x 300 tokens, `FAST_LOAD=0` vs `1`).
+
+Cost: the scheduler keeps ~1-2 GB more host memory after the fast load, so the KV pool is 1.00-1.01M tokens instead of
+1,048,600: four simultaneous ~252K-token contexts instead of 262K (requests beyond that queue). `FAST_LOAD=0` restores
+the stock load (and the full pool).
+
+The persisted autotune cache fixes the MoE tactic FlashInfer picked on the first boot. Tactics differ in rounding, so
+greedy text (and with it acceptance on a given prompt set, +-5%) depends on that boot; round time does not
+(75.9 vs 76.3 ms at 3.47 vs 3.64 accepted). Delete `.cache/sglang-flashinfer` to retune.
+
 ## Memory
 
 At ready: `MemAvailable` ~8 GB (121.6 GiB total). Pools: target weights 68.1 GB, drafter 1.1 GB, target KV 12 GB,
@@ -136,10 +163,43 @@ For more streams at shorter contexts lower `CONTEXT` (e.g. `PARALLEL=8 CONTEXT=1
   null; `"None"` stays a string because it is a valid value for `["string","null"]`.
 - Vision: an image of a red rectangle and a blue circle is described correctly.
 
+## Why decode is not faster (profile, 2026-10-22)
+
+One stream, code, `DF_BLOCK=6`: a round is ~80 ms = draft 9.8 ms + verify 70.6 ms, for 3.5-4.0 accepted tokens
+(torch profiler, 20 rounds). The verify is close to the memory-bandwidth floor of this checkpoint on GB10:
+
+| Verify part | ms/round | Bytes | Rate |
+|---|---:|---|---|
+| NVFP4 routed experts (cutlass grouped GEMM) | 37.5 | ~40 distinct experts per layer for 6 tokens x 5.3 MB x 48 layers | ~240 GB/s |
+| FP8 GDN/attention projections (cuBLASLt) | ~22 | 4.1 GB | ~230 GB/s; CUTLASS and Triton FP8 measured no faster at M=6 (`tools/gemm_bench.py`) |
+| shared experts + `lm_head` (NVFP4 via Marlin) | ~4-5 | 0.7 GB | ~150-200 GB/s |
+| GDN state update, norms, router, small bf16 GEMMs | ~6 | intermediate GDN states for rollback (12 MB/layer) | small GEMMs run on a side stream; the norm's 45 us is mostly a PDL wait |
+
+Each extra verified token routes to ~6-7 more experts per layer (~4.8 ms a round), and the drafter's acceptance does
+not improve with a wider draft: drafting the trained 16 positions and verifying the first 6 accepts 3.66 tokens a round,
+drafting 6 accepts 3.64 (per-round accept lengths logged from a `DF_BLOCK=16` run, 849 rounds). At ~65 ms (the floor
+above plus the draft) and ~3.6 accepted tokens, the ceiling for code at one stream is ~55 tok/s with this checkpoint
+and chain verification; 85 tok/s is not reachable on this path. The TensorFold port (`../ornith-1.5-122b-tensorfold`,
+MLX 4-bit, tree verification, ~4.7 tokens a round) measures 71.8 tok/s code at one stream and 97.6 total at 4.
+
+Block size, re-measured with `bench.py seq` (8 code prompts one after another, greedy) and `decode 4`:
+
+| `DF_BLOCK` | code 1 stream | accept len | code 4 streams total |
+|---:|---:|---:|---:|
+| 5 | 46.0 | 3.26 | 82.5 |
+| **6** | 45.9-47.7 | 3.47-3.64 | **90.3** |
+| 7 | 49.2 | 3.93 | 81.2 |
+| 8 | 50.9 | 4.31 | 76.6 |
+
+`DF_BLOCK=8` is ~10% faster for a single user writing code and ~15% slower at 4 streams (and slower on prose, see
+"Choosing the block size"); 6 stays the default.
+
 ## Tried and not kept
 
 - `--moe-runner-backend marlin`: same decode speed, prefill 1,600 vs 2,600 tok/s, KV pool shrank to 833K tokens.
-- `--speculative-draft-model-quantization fp8`: ~1.5% faster rounds (noise level), and the draft loads at 1.44 GB.
+- `--speculative-draft-model-quantization fp8`: 49.9 vs 49.1 tok/s (`seq`, noise level), the draft loads at 1.48 GB
+  and the KV pool shrank to 947K tokens.
+- Drafting 16 positions and verifying fewer: no acceptance gain (above).
 - `CHUNKED_PREFILL=16384`: a 32K prefill stalled with `MemAvailable` at 2 GB (killed).
 - SGLang's adaptive speculation (`--speculative-adaptive`) is EAGLE-only; ragged verify is DSpark-only.
 
@@ -149,6 +209,8 @@ For more streams at shorter contexts lower `CONTEXT` (e.g. `PARALLEL=8 CONTEXT=1
 |---|---|
 | `start.sh` | launcher (knobs in its header), sizes pools, waits for readiness |
 | `end.sh` | stops and removes the container, saves its log to `last.log` |
-| `bench/bench.py` | `decode`, `prefill`, `interleave`, `long` benchmarks (stdlib only) |
+| `bench/bench.py` | `decode`, `seq`, `prefill`, `interleave`, `long` benchmarks (stdlib only) |
 | `bench/tools_check.py` | functional tool-call check |
 | `results/final-d6.md` | raw output of the final benchmark run |
+| `patches/0001-weight-load-prefault.patch` | fast weight load (applied in the container at start; `PATCHES`, `EXTRA_PATCHES` dirs) |
+| `tools/copy_bench.py`, `tools/gemm_bench.py` | host-to-device copy speed by memory kind; verify-shape GEMM backends |

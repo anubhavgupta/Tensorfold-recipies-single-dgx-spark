@@ -256,8 +256,8 @@ template, updating, offline use and troubleshooting - is in
 ### Ornith-1.5-122B NVFP4 + DFlash2 on SGLang (`ornith-1.5-122B/start.sh`)
 
 `ornith-ai/Ornith-1.5-122B-NVFP4` (a Qwen3.5-122B-A10B-shaped hybrid GDN MoE, vision on) with the DFlash2 drafter
-`incoai/Ornith-1.5-122B-DFlash2`, served by stock SGLang (`lmsysorg/sglang:dev-cu13`) rather than TensorFold.
-4 streams x 262,144 tokens fit at once (checked with four 245K prompts). Distinct prompts, 512-token replies, greedy,
+`incoai/Ornith-1.5-122B-DFlash2`, served by SGLang (`lmsysorg/sglang:dev-cu13`) rather than TensorFold, with one patch that loads the weights in ~33 s
+(ready in ~70 s instead of ~10 min). 4 streams x ~252K tokens fit at once (262K with `FAST_LOAD=0`). Distinct prompts, 512-token replies, greedy,
 thinking off; 6 verified tokens per round (each verified token pulls in more experts, so the drafter's trained block
 of 16 is slower here):
 
@@ -268,7 +268,9 @@ of 16 is slower here):
 | 4 | 61.4 | 93.3 |
 
 Without speculation: 30 tok/s single stream. Prefill 2,600-3,200 tok/s up to 32K, 1,535 tok/s at 98K, ~800 tok/s
-averaged over a 245K prompt. Details: `ornith-1.5-122B/README.md`.
+averaged over a 245K prompt. A round is near this checkpoint's memory-bandwidth floor (profile in the recipe README),
+so ~55 tok/s is the ceiling for code at one stream on this path; the TensorFold port below is faster. Details:
+`ornith-1.5-122B/README.md`.
 
 The same model on TensorFold 1.1.1's native engine (`ornith-1.5-122b-tensorfold`, MLX 4-bit export, a patch that lets
 the qwen3_5_moe family draft with DFlash2, and unpadded narrow verify windows): decode 46 / 72 tok/s single stream (mixed

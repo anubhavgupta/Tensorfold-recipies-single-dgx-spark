@@ -1,0 +1,128 @@
+Weight load in ~33 s instead of 420-470 s (SGLANG_LOAD_PREFAULT=1, set by start.sh when FAST_LOAD=1, the default).
+
+On the Spark (GB10, CUDA 13, driver 580) a host-to-device copy from mmap'd safetensors pages that the process has not
+touched yet runs at ~0.15 GB/s (10 ms for a 1.5 MB expert tensor), even with the file in the page cache; from touched or
+anonymous pages it runs at 37-44 GB/s (tools/copy_bench.py). Stock SGLang copies straight from untouched mmap views, so
+the 113,047 tensors of the 68 GB target loaded in 420-470 s with the loading thread inside cuMemcpyHtoDAsync.
+
+- weight_utils.py: the loader workers (num_threads=2 in start.sh: two shards in flight beside the one being copied) read
+  their shard sequentially into the page cache (5.6 GB/s instead of ~0.4 GB/s through page faults) and touch its pages;
+  the iterator hands tensors of 64 KiB and more out as anonymous copies (165 s -> 33 s against touched mmap pages).
+- loader.py: after the model is loaded, every shard's page cache is dropped (posix_fadvise DONTNEED) and malloc_trim
+  runs. The per-shard drop during the load frees nothing while live tensors still map the shard, and on this
+  unified-memory box SGLang sizes the KV pool from MemAvailable-like free memory: without it up to 40 GB stayed cached.
+
+Cost: the scheduler keeps ~1-2 GB more host memory than after a stock load, so the KV pool is 1.00-1.01M tokens instead
+of 1,048,600 (four simultaneous ~252K contexts instead of 262K; see README "Boot"). SGLANG_LOAD_PREFAULT=0
+(FAST_LOAD=0) restores stock.
+
+diff -ru a/sglang/srt/model_loader/loader.py b/sglang/srt/model_loader/loader.py
+--- a/sglang/srt/model_loader/loader.py	2026-10-03 06:09:00.000000000 +0530
++++ b/sglang/srt/model_loader/loader.py	2026-10-22 06:42:07.154304857 +0530
+@@ -1004,6 +1004,9 @@
+                 model, self._get_all_weights(model_config, model), target_device
+             )
+ 
++        from sglang.srt.model_loader.weight_utils import drop_loaded_shard_caches
++
++        drop_loaded_shard_caches()
+         self.counter_after_loading_weights = time.perf_counter()
+         return model.eval()
+ 
+diff -ru a/sglang/srt/model_loader/weight_utils.py b/sglang/srt/model_loader/weight_utils.py
+--- a/sglang/srt/model_loader/weight_utils.py	2026-10-03 06:09:00.000000000 +0530
++++ b/sglang/srt/model_loader/weight_utils.py	2026-10-22 06:46:16.488364274 +0530
+@@ -1223,6 +1223,57 @@
+                 _drop_file_cache_after_load(loaded_file)
+ 
+ 
++_SHARDS_TO_DROP: List[str] = []
++
++
++def drop_loaded_shard_caches() -> None:
++    """After a model is loaded: drop the page cache of every shard the prefaulting iterator read. The per-shard drop
++    during the load frees nothing while a shard's pages are still mapped by live tensors, and on this unified-memory
++    box cudaMemGetInfo does not count that cache as free, so ~9-40 GB stayed cached and the KV pool came out smaller."""
++    if not _SHARDS_TO_DROP:
++        return
++    import gc
++
++    gc.collect()
++    for st_file in _SHARDS_TO_DROP:
++        _drop_file_cache_after_load(st_file)
++    _SHARDS_TO_DROP.clear()
++    try:
++        import ctypes
++
++        ctypes.CDLL("libc.so.6").malloc_trim(0)
++    except OSError:
++        pass
++
++
++def _prefault_enabled() -> bool:
++    return os.environ.get("SGLANG_LOAD_PREFAULT", "0") == "1"
++
++
++def _read_into_page_cache(path: str, chunk: int = 64 << 20) -> None:
++    """Sequential read of a shard (the NVMe reads 5.6 GB/s this way; page faults read it at ~0.4 GB/s)."""
++    view = memoryview(bytearray(chunk))
++    with open(path, "rb", buffering=0) as f:
++        try:
++            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
++        except (AttributeError, OSError):
++            pass
++        while f.readinto(view):
++            pass
++
++
++def _prefault(t: torch.Tensor) -> None:
++    """Map every page of an mmap-backed tensor into this process (one byte read per 4 KiB page).
++
++    On a DGX Spark (GB10, CUDA 13, driver 580) cudaMemcpy from mmap'd safetensors pages that this process has not
++    touched yet runs at ~0.15 GB/s (10 ms for a 1.5 MB expert tensor), even with the file in the page cache; once the
++    pages are mapped it runs at ~37 GB/s. The loader workers do this in parallel, ahead of the copies."""
++    if t.numel() == 0:
++        return
++    b = t.reshape(-1).view(torch.uint8)
++    b[::4096].sum()
++
++
+ def buffered_multi_thread_safetensors_weights_iterator(
+     hf_weights_files: List[str],
+     max_workers: int,
+@@ -1251,8 +1302,13 @@
+             with open(st_file, "rb") as f:
+                 result = safetensors.torch.load(f.read())
+         else:
++            if _prefault_enabled():
++                _read_into_page_cache(st_file)
+             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                 result = {k: f.get_tensor(k) for k in f.keys()}
++            if _prefault_enabled():
++                for t in result.values():
++                    _prefault(t)
+         return result
+ 
+     # Sliding window: max_workers loading + 1 prefetched.
+@@ -1283,14 +1339,20 @@
+                 if next_file is not None:
+                     pending.append((next_file, executor.submit(_load_file, next_file)))
+ 
++                stage = _prefault_enabled() and torch.cuda.is_available()
+                 for name in sorted(state_dict.keys()):
+-                    yield name, state_dict[name]
++                    t = state_dict[name]
++                    # staged in anonymous memory: the driver's copy from file-backed (page-cache) pages is slow on
++                    # this platform even when they are mapped; from anonymous pages it runs at ~44 GB/s
++                    yield name, (t.clone() if stage and t.numel() * t.element_size() >= 65536 else t)
+                 del state_dict
+                 if drop_cache_after_load:
+                     # DONTNEED reduces page-cache pressure after copying weights,
+                     # but later mmap-backed tensor access may fault pages again.
+                     _drop_file_cache_after_load(st_file)
+                 pbar.update(1)
++    if _prefault_enabled():
++        _SHARDS_TO_DROP.extend(hf_weights_files)
+     if prefetch_handle is not None:
+         prefetch_handle.stop()
+ 

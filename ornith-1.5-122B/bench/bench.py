@@ -6,6 +6,9 @@
       every request emits exactly --new tokens. Prints total tok/s (all output tokens / wall), mean per-stream decode
       tok/s (after the first token), mean TTFT and the speculative accept length (tokens per verify step, from the
       server's Prometheus counters).
+  bench.py seq [--set code|mixed] [--new 512] [--temp 0] [--think]
+      One stream: every prompt of the set in turn (fixed text, so greedy runs repeat exactly). Prints per-prompt and
+      aggregate decode tok/s (all tokens / all decode time) and accept length; steadier than decode 1 (one prompt).
   bench.py prefill [--new 1] L [L ...]
       One request at a time with a unique ~L-token prompt; prefill tok/s = server prompt_tokens / TTFT.
   bench.py long N TOKENS NEW
@@ -125,6 +128,21 @@ def cmd_decode(a):
         print(f"| {n} | {toks / wall:.1f} | {per:.1f} | {ttft:.2f} | {f'{acc:.2f}' if acc else '-'} |", flush=True)
 
 
+def cmd_seq(a):
+    prompts = CODE if a.set == "code" else MIXED
+    print(f"# seq set={a.set} new={a.new} temp={a.temp} thinking={a.think}: one stream, each prompt in turn, ignore_eos")
+    toks = secs = 0; m0 = metrics(); rows = []
+    for i, q in enumerate(prompts):
+        m = metrics()
+        r = stream([{"role": "user", "content": q}], a.new, a.temp, a.think)
+        n = r["usage"].get("completion_tokens", 1) - 1; dt = max(r["end"] - r["first"], 1e-6)
+        toks += n; secs += dt; acc = spec_delta(m, metrics())
+        rows.append(f"{n / dt:.1f}" + (f"/{acc:.2f}" if acc else ""))
+    acc = spec_delta(m0, metrics())
+    print("per prompt tok/s/accept: " + " ".join(rows))
+    print(f"aggregate: {toks / secs:.1f} tok/s, accept len {acc:.2f}" if acc else f"aggregate: {toks / secs:.1f} tok/s")
+
+
 WORDS = ("time year people way day man thing woman life child world school state family student group country "
          "problem hand part place case week company system program question work government number night point home "
          "water room mother area money story fact month lot right study book eye job word business issue side kind "
@@ -186,11 +204,13 @@ def main():
     d = sp.add_parser("decode"); d.add_argument("N", type=int, nargs="+"); d.add_argument("--set", default="code")
     d.add_argument("--new", type=int, default=512); d.add_argument("--temp", type=float, default=0.0)
     d.add_argument("--think", action="store_true")
+    q = sp.add_parser("seq"); q.add_argument("--set", default="code"); q.add_argument("--new", type=int, default=512)
+    q.add_argument("--temp", type=float, default=0.0); q.add_argument("--think", action="store_true")
     f = sp.add_parser("prefill"); f.add_argument("L", type=int, nargs="+"); f.add_argument("--new", type=int, default=1)
     l = sp.add_parser("long"); l.add_argument("N", type=int); l.add_argument("TOKENS", type=int); l.add_argument("NEW", type=int)
     i = sp.add_parser("interleave"); i.add_argument("TOKENS", type=int); i.add_argument("NEW", type=int)
     a = p.parse_args()
-    {"decode": cmd_decode, "prefill": cmd_prefill, "long": cmd_long, "interleave": cmd_interleave}[a.cmd](a)
+    {"decode": cmd_decode, "seq": cmd_seq, "prefill": cmd_prefill, "long": cmd_long, "interleave": cmd_interleave}[a.cmd](a)
 
 
 if __name__ == "__main__":

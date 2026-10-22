@@ -18,7 +18,9 @@
 #   CUDA_GRAPH_BS (auto: largest decode batch with a CUDA graph)
 #   VISION (1; 0 = text only, skips the vision tower)   THINKING (1; per request: chat_template_kwargs.enable_thinking)
 #   TEMPERATURE/TOP_P/TOP_K/MIN_P (0.6/0.95/20/0.0: the card's coding profile, used when a request omits them)
-#   IMAGE (lmsysorg/sglang:dev-cu13 pinned by digest; stock, no patches needed)
+#   IMAGE (lmsysorg/sglang:dev-cu13 pinned by digest)   PATCHES (./patches: *.patch applied to SGLang in the container)
+#   EXTRA_PATCHES (another dir of patches, e.g. debugging)   FAST_LOAD (1: patches/0001 loads the weights in ~33 s;
+#     0 = stock loader, ~7 min, and a ~4% larger KV pool)
 #   PORT (8888) HOST (0.0.0.0) NAME (sglang-ornith-122b) SERVED_NAME (Ornith-1.5-122B) FOREGROUND (0) DROP_CACHES (1)
 # Logs: docker logs -f sglang-ornith-122b      Stop: ./ornith-1.5-122B/end.sh
 set -euo pipefail
@@ -58,6 +60,9 @@ TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 MIN_P="${MIN_P:-0.0}"
 DROP_CACHES="${DROP_CACHES:-1}"
+FAST_LOAD="${FAST_LOAD:-1}"
+PATCHES="${PATCHES:-$SCRIPT_DIR/patches}"
+EXTRA_PATCHES="${EXTRA_PATCHES:-}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 NAME="${NAME:-sglang-ornith-122b}"
@@ -112,7 +117,7 @@ if [[ "$SPEC" == dflash ]]; then
   DRAFT_SNAP="$(snapshot "$DRAFTER")"
   [[ -n "$DRAFT_SNAP" && -f "$DRAFT_SNAP/model.safetensors" ]] || die "$DRAFTER not cached; run: hf download $DRAFTER"
 fi
-mkdir -p "$CACHE_DIR"/{triton,flashinfer,inductor}
+mkdir -p "$CACHE_DIR"/{triton,flashinfer,inductor,sglang-flashinfer,sglang-jit,sglang-nv}
 
 # Server default sampling: SGLang takes defaults from generation_config.json (--sampling-defaults model); mount a
 # patched copy over the snapshot's inside the container (the host cache is untouched). Request values always win.
@@ -136,6 +141,11 @@ ARGS=(
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder --sampling-defaults model
   --enable-metrics --enable-cache-report --sleep-on-idle
 )
+# Weight load (patches/0001): the loader workers read and touch their shard before its tensors are copied to the GPU
+# (a copy from untouched mmap pages runs at ~0.15 GB/s on this driver; stock took 420-470 s, this ~33 s), two
+# shards ahead of the copy, and each shard's page cache is dropped once copied.
+[[ "$FAST_LOAD" == 1 ]] && ARGS+=(--weight-loader-drop-cache-after-load
+                               --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 2}')
 [[ "$THINKING" == 1 ]] && ARGS+=(--default-chat-template-kwargs '{"preserve_thinking": true}') \
                        || ARGS+=(--default-chat-template-kwargs '{"enable_thinking": false}')
 [[ "$VISION" == 1 ]] || ARGS+=(--language-only)
@@ -162,16 +172,21 @@ echo "sampling  temperature=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P 
 
 ENV_ARGS=()
 for e in ${DOCKER_ENV:-}; do ENV_ARGS+=(-e "$e"); done   # DOCKER_ENV="K=V K2=V2": extra container env
-PRE=""
-[[ "$DROP_CACHES" == 1 ]] && PRE='sync; echo 3 > /proc/sys/vm/drop_caches || true; '
+# patches/*.patch (then $EXTRA_PATCHES/*.patch) are applied to SGLang's python tree in the fresh container, in name order
+PRE='cd /sgl-workspace/sglang/python && for p in /patches/*.patch /patches-extra/*.patch; do [ -f "$p" ] || continue; echo "applying $p"; patch -p1 -s --forward < "$p" || exit 1; done; cd /; '
+[[ "$DROP_CACHES" == 1 ]] && PRE+='sync; echo 3 > /proc/sys/vm/drop_caches || true; '
 docker run -d --name "$NAME" --network host --ipc host --privileged --gpus all --shm-size 32g \
   --cpuset-cpus "${CPUSET:-5-9,15-19}" \
   -e HF_HOME=/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
   -e TRITON_CACHE_DIR=/cache/triton -e FLASHINFER_WORKSPACE_BASE=/cache/flashinfer \
   -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor -e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+  -e SGLANG_LOAD_PREFAULT="$FAST_LOAD" \
   "${ENV_ARGS[@]}" \
   -v "$HF_HOME_HOST:/root/.cache/huggingface" -v "$GEN_CFG:$CTR_SNAP/generation_config.json:ro" \
   -v "$CACHE_DIR:/cache" \
+  -v "$CACHE_DIR/sglang-flashinfer:/root/.cache/sglang/flashinfer" -v "$CACHE_DIR/sglang-jit:/root/.cache/sglang/jit" \
+  -v "$CACHE_DIR/sglang-nv:/root/.cache/sglang/nv" \
+  -v "$PATCHES:/patches:ro" ${EXTRA_PATCHES:+-v "$EXTRA_PATCHES:/patches-extra:ro"} \
   --entrypoint bash "$IMAGE" -c "$PRE"'exec python3 -m sglang.launch_server "$@"' bash "${ARGS[@]}" >/dev/null
 
 echo "started $NAME; waiting for the server (first boot compiles kernels and captures CUDA graphs: several minutes)"
