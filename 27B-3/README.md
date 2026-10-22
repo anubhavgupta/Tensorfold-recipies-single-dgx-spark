@@ -12,7 +12,8 @@ defaults, for the other 4.00 bpw quant:
 | Chat template | froggeric v22.5 (upstream kept as `chat_template.upstream.jinja`) | froggeric v22.5 |
 | Container / port | `tf-27b-3` / 8888 | `tf-27b-2` / 8888 |
 
-- Drafter: `z-lab/Qwen3.8-27B-DFlash2` (bf16; 27B-2 uses igor255's EXL3 quant of it). `DRAFT_REPO=igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` switches back (patch 0005 loads it).
+- Drafter: `z-lab/Qwen3.8-27B-DFlash2` (bf16; 27B-2 uses igor255's EXL3 quant of it). `DRAFT_REPO=igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw` switches back (patch 0005 loads it; download it first, it is
+  no longer kept on this box: z-lab's measured the same acceptance and 0-8% faster, below).
 
 ```bash
 ./27B-3/build_model_dir.sh  # once: copies the 4.00bpw pack from the HF cache (downloads it if missing) + the chat template

@@ -20,7 +20,7 @@
 #   MODEL_PATH (/home/gb10/projects/models/Qwen3.8-27B-exl3-4.00bpw: the folder build_model_dir.sh makes;
 #     mounted read-only at /models/<name>)
 #   MODEL_DIR explicit pack dir inside the container (skips MODEL_PATH)
-#   DRAFT_REPO (z-lab/Qwen3.8-27B-DFlash2; igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw also works, via patch 0005)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
+#   DRAFT_REPO (z-lab/Qwen3.8-27B-DFlash2; igor255/Qwen3.8-27B-DFlash2-EXL3-4.00bpw also works via patch 0005, after hf download; measured no better)  DRAFT_DIR explicit drafter dir; DRAFT_REPO= serves without drafts
 #   TF_VERSION (0.6.6)  PATCHES (1; 0: stock image, which needs KV_DTYPE=bf16, no drafter)
 #   PARALLEL (9: about as many full 262K-token streams as fit in memory) CONTEXT (262144) KV_DTYPE (fp8|bf16) KV_POOL_GB (empty/0: caches grow on demand; auto; <n> GiB)
 #   MEMORY_RESERVE_GIB (2) CHECKPOINT_SLOTS (empty: TensorFold's default)
