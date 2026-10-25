@@ -245,9 +245,48 @@ files, `stability/lanes/{sampling,toolcalls}`):
   the three prompts (the loop's acceptance is what makes it fast; the same signature as the
   >1 h runaway reply above). No loop at 0.6 / 0.95 on any measured prompt.
 
-`min_p`, `top_k` and `repetition_penalty` were not measured and are not set. Two scenarios
+`min_p` and `top_k` were not measured and are not set; `repetition_penalty` is now 1.05 (see
+"Repetition loops" below). Two scenarios
 failed under every setting and are model behaviour, not serve configuration: a ~60K-token
 pasted-log prompt (2/12 valid calls) and a request to record a checklist (1/12).
+
+### Repetition loops (local, 2026-10-25)
+
+Reported with the `pi` coding agent: replies "looped". `bench/loop_probe.py` reproduces pi's request
+(streamed, no sampling fields, `chat_template_kwargs` `enable_thinking`/`reasoning_effort`) on three
+long-output prompts (story, single-file todo app, 2000-word essay) and flags LOOP (one sentence
+>= 6 times or < 50 % distinct word 6-grams in the tail) and STUCK (cap reached still thinking).
+6,144-token cap, drafting on unless stated:
+
+| Setting | Result |
+|---|---|
+| thinking on (effort `medium` = 75), 0.6 / 0.95 (old default) | 4/4 STUCK: thinking re-plans the same paragraph until the cap (one sentence up to 18x) |
+| thinking on, temperature 1.0 / 0.95 | 3/3 at the cap (1 reply started after ~4.5K thinking tokens) |
+| thinking on, effort `low` (50) | STUCK (1/1) |
+| thinking on, `repetition_penalty` 1.05 | 1/2 finished; the other never left thinking (no verbatim loop) |
+| thinking on, **no drafting** (`MTP_K=0`) | 3/3 at the cap (todo: one sentence 44x): not caused by DSpark |
+| thinking off, 0.6 / 0.95 | 2/5 runaway replies (a story repeating one sentence 12x; 90 K chars of repeated todo CSS) |
+| **thinking off, `repetition_penalty` 1.05** | **0/9 runaways** (8 ended `stop`; 1 story hit the cap still writing new text) |
+
+Why: at the end of its plan this pack rarely emits `</think>` (logprob after "I'll produce final
+answer.\n": `Need` -0.36, `</think>` -2.11), so thinking restarts the plan. That is the 1.62 bpw
+pack's behaviour, not sampling or drafting. vLLM's `thinking_token_budget` does not help here:
+with DSpark verification the forced `</think>` never appears and the reasoning degenerates into
+garbage at the budget (`Mara? Mara? ...`); do not use it on this serve.
+
+Changes:
+
+- `DEFAULT_REPETITION_PENALTY=1.05` (`scripts/env.sh`, served through `--override-generation-config`;
+  a client value still wins; empty = none). Tool calls with it: `bench/tool_ab.py` 7/8 clean
+  (earlier 28/31). It also counts prompt tokens, so keep it mild.
+- Use thinking **off** for agent work. For pi, the `dsv41` entry in `~/.pi/agent/models.json` keeps
+  `"reasoning": true` with `"thinkingFormat": "chat-template"` and a constant
+  `"chatTemplateKwargs": {"enable_thinking": false}`, so every thinking level sends thinking off.
+  (`"reasoning": false` makes pi send no `chat_template_kwargs`, and the DSV4.1 tokenizer then
+  defaults to thinking **on**.) With it, pi made `todo.html` in 66 s, wrote a long story to a file
+  in 4.6 K tokens and answered a read-a-file question in 19 s, all with 0 reasoning tokens.
+- A/B knobs in `serve_inner.sh`: `MTP_K=0` serves without DSpark drafting; `REJECTION=standard`
+  switches the verification method (`block` is the measured default).
 
 ## Client timeouts and queueing
 

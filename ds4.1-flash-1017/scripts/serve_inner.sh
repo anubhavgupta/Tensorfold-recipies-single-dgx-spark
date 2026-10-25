@@ -23,7 +23,7 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 # See README "Prefix caching".
 # Default output cap for requests without max_tokens (0 = none); see DEFAULT_MAX_TOKENS in env.sh.
 # Default sampling for requests without temperature/top_p (empty = none); see DEFAULT_TEMPERATURE /
-# DEFAULT_TOP_P there. vLLM's get_diff_sampling_param accepts exactly max_new_tokens, temperature,
+# DEFAULT_TOP_P / DEFAULT_REPETITION_PENALTY there. vLLM's get_diff_sampling_param accepts exactly max_new_tokens, temperature,
 # top_k, top_p, min_p and repetition_penalty as --override-generation-config defaults, and a client
 # that sends its own value still wins per request.
 GENCFG=()
@@ -31,7 +31,12 @@ gen_json=""
 [ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && gen_json="${gen_json:+$gen_json,}\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}"
 [ -n "${DEFAULT_TEMPERATURE:-}" ] && gen_json="${gen_json:+$gen_json,}\"temperature\": ${DEFAULT_TEMPERATURE}"
 [ -n "${DEFAULT_TOP_P:-}" ] && gen_json="${gen_json:+$gen_json,}\"top_p\": ${DEFAULT_TOP_P}"
+[ -n "${DEFAULT_REPETITION_PENALTY:-}" ] && gen_json="${gen_json:+$gen_json,}\"repetition_penalty\": ${DEFAULT_REPETITION_PENALTY}"
 [ -n "$gen_json" ] && GENCFG=(--override-generation-config "{$gen_json}")
+# MTP_K=0 serves without DSpark drafting (A/B only; README numbers assume drafting).
+# REJECTION=block (measured) or standard: DSpark verification method.
+SPEC=()
+[ "$MTP_K" != "0" ] && SPEC=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$MTP_K,\"draft_tensor_parallel_size\":1,\"attention_backend\":\"tilelang\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"${REJECTION:-block}\",\"enable_adaptive_verification\":true${ROW_COST:+,\"adaptive_verification_row_cost\":$ROW_COST}}")
 PCF=--enable-prefix-caching
 [ "${PREFIX_CACHING:-1}" = "0" ] && PCF=--no-enable-prefix-caching
 
@@ -62,7 +67,7 @@ exec vllm serve "$MODEL_DIR" \
     --jit-monitor-mode warn \
     --compilation-config "{\"cudagraph_mode\":\"$CG_MODE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[$CAPTURE_SIZES]}" \
     --max-cudagraph-capture-size "${CAPTURE_SIZES##*,}" \
-    --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$MTP_K,\"draft_tensor_parallel_size\":1,\"attention_backend\":\"tilelang\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true${ROW_COST:+,\"adaptive_verification_row_cost\":$ROW_COST}}" \
+    "${SPEC[@]}" \
     --reasoning-parser deepseek_v41 \
     --tool-call-parser deepseek_v41 \
     --enable-auto-tool-choice \

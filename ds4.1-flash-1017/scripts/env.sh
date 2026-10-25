@@ -71,6 +71,11 @@ DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
 # Empty = no default.
 DEFAULT_TEMPERATURE="${DEFAULT_TEMPERATURE:-0.6}"
 DEFAULT_TOP_P="${DEFAULT_TOP_P:-0.95}"
+# Default repetition_penalty for requests that send none (pi and Hermes send none). At 1.0 this
+# 1.62 bpw pack falls into verbatim loops in long replies (thinking off: a story repeating one
+# sentence 12x, a 6K-token todo.html of repeated CSS); 1.05 ended 9/9 probe replies without a
+# runaway (README "Repetition loops"). Empty = no default.
+DEFAULT_REPETITION_PENALTY="${DEFAULT_REPETITION_PENALTY:-1.05}"
 MAXLEN="${MAXLEN:-229376}"      # local default: one ~230K stream (upstream ships 524288, the largest measured clean limit)
 KVB="${KVB:-1073741824}"        # 1 GiB KV pool (upstream default); needs the desktop off (README "This copy")
 MNBT="${MNBT:-2112}"
@@ -97,7 +102,7 @@ export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
 export BASE_HF_REPO BASE_HF_REV BASE_ARCHIVE BASE_ARCHIVE_SHA256 BASE_REDIST_IMAGE BASE_REDIST_LAYER BASE_LABELS_SHA256 BASE_DL_DIR
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export ROW_COST SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
+export ROW_COST SERVED_MODEL_NAME DEFAULT_MAX_TOKENS DEFAULT_TEMPERATURE DEFAULT_TOP_P DEFAULT_REPETITION_PENALTY CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP DSML_PARAM_REPAIR
 export ATS_LAYERS ATS_MTP ATS_EMBED
 
 # ---- privileges (local change: this host has docker-group access but no passwordless sudo) ----

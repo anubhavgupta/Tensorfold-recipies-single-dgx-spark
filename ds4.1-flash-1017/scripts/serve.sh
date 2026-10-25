@@ -58,6 +58,7 @@ if [ "$DRY_RUN" = "1" ]; then
   [ "${DEFAULT_MAX_TOKENS:-32768}" != "0" ] && gen_json="${gen_json:+$gen_json,}\"max_new_tokens\": ${DEFAULT_MAX_TOKENS:-32768}"
   [ -n "${DEFAULT_TEMPERATURE:-}" ] && gen_json="${gen_json:+$gen_json,}\"temperature\": ${DEFAULT_TEMPERATURE}"
   [ -n "${DEFAULT_TOP_P:-}" ] && gen_json="${gen_json:+$gen_json,}\"top_p\": ${DEFAULT_TOP_P}"
+  [ -n "${DEFAULT_REPETITION_PENALTY:-}" ] && gen_json="${gen_json:+$gen_json,}\"repetition_penalty\": ${DEFAULT_REPETITION_PENALTY}"
   if [ -n "$gen_json" ]; then
     echo "  --override-generation-config {$gen_json} \\"
   else
@@ -210,7 +211,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -v "$HERE/serve_inner.sh":/root/serve.sh:ro \
   -p "$API_PORT":8000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
-  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" -e DEFAULT_MAX_TOKENS="$DEFAULT_MAX_TOKENS" -e DEFAULT_TEMPERATURE="$DEFAULT_TEMPERATURE" -e DEFAULT_TOP_P="$DEFAULT_TOP_P" \
+  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" -e DEFAULT_MAX_TOKENS="$DEFAULT_MAX_TOKENS" -e DEFAULT_TEMPERATURE="$DEFAULT_TEMPERATURE" -e DEFAULT_TOP_P="$DEFAULT_TOP_P" -e DEFAULT_REPETITION_PENALTY="$DEFAULT_REPETITION_PENALTY" \
   -e B12X_AUTOTUNE=0 \
   -e B12X_BIND_COMPILE_WORKERS="${B12X_BIND_COMPILE_WORKERS:-2}" \
   -e B12X_STATE_COMPILE_WORKERS="${B12X_STATE_COMPILE_WORKERS:-2}" \
@@ -259,7 +260,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e VLLM_EXL3_MEM_WATERFALL_PATH= \
   -e MAXLEN="$MAXLEN" -e KVB="$KVB" -e MNBT="$MNBT" -e LPT="$LPT" \
   -e PREFIX_CACHING="$PREFIX_CACHING" -e MTP_K="$MTP_K" -e CAPTURE_SIZES="$CAPTURE_SIZES" -e CG_MODE="$CG_MODE" \
-  -e GPU_MEM_UTIL="$GPU_MEM_UTIL" -e ROW_COST="$ROW_COST" \
+  -e GPU_MEM_UTIL="$GPU_MEM_UTIL" -e ROW_COST="$ROW_COST" -e REJECTION="${REJECTION:-block}" \
   --entrypoint /bin/bash \
   "$IMAGE" /root/serve.sh \
   >"$RUN/container_id.txt" 2>&1 || {
