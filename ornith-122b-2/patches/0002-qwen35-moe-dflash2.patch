@@ -1,0 +1,104 @@
+DFlash2 drafting for qwen3_5_moe checkpoints on CUDA (TensorFold 1.1.7).
+
+Stock 1.1.7 drafts qwen3_5_moe only with the checkpoint's MTP layer read from an MLX mtp-4bit.safetensors; the DFlash2
+drafter path (cuda_draft*.zig) exists for the dense qwen3_5 family on the same engine. Re-port of the earlier
+ornith-1.5-122b-tensorfold recipe's patch for 1.1.1:
+  - cuda_native_moe.zig: openDrafter opens a DFlash2 model when --drafter names a directory whose config.json has a
+    dflash_config, and the MTP head otherwise (stock), behind one return type whose calibration step is optional;
+  - native/cuda_drafted.zig: accepts that optional calibration step (null: nothing to calibrate, as for MTP before);
+  - cuda_draft_config.zig: accepts a drafter trained with a block of 16 as well as 8 (incoai/Ornith-1.5-122B-DFlash2
+    is 16; the rounds draft 16 positions either way, and the two-tap convolutions do not depend on the block).
+Exactness is the engine's: drafted rows are verified by the target, so replies equal "draft": false (checked, README).
+
+diff --git a/zig/src/families/qwen3_5/cuda_draft_config.zig b/zig/src/families/qwen3_5/cuda_draft_config.zig
+index 24553d2d..412c8620 100644
+--- a/zig/src/families/qwen3_5/cuda_draft_config.zig
++++ b/zig/src/families/qwen3_5/cuda_draft_config.zig
+@@ -80,8 +80,9 @@ pub const Config = struct {
+             c.taps[i] = @intCast(t.integer);
+         }
+         c.n_taps = taps.array.items.len;
+-        // what the kernels fix: the head width, two-tap convolutions, a block of 8, the selector's top-k within a row
+-        if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or c.block != 8 or c.topk > lp_top or c.mask >= c.vocab) return error.UnsupportedDraftConfig;
++        // what the kernels fix: the head width, two-tap convolutions, a trained block of 8 or 16 (the rounds draft 16
++        // positions either way), the selector's top-k within a row
++        if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or (c.block != 8 and c.block != 16) or c.topk > lp_top or c.mask >= c.vocab) return error.UnsupportedDraftConfig;
+         if (c.hidden != target.hidden or c.vocab != target.vocab or c.hidden % 256 != 0 or c.hidden % c.group != 0 or c.heads % c.kv_heads != 0 or c.layers > 8) return error.UnsupportedDraftConfig;
+         _ = std.math.mul(usize, c.heads, c.head_dim) catch return error.UnsupportedDraftConfig;
+         _ = std.math.mul(usize, c.kv_heads, c.head_dim) catch return error.UnsupportedDraftConfig;
+diff --git a/zig/src/families/qwen3_5/cuda_native_moe.zig b/zig/src/families/qwen3_5/cuda_native_moe.zig
+index 3bc6155b..95c36c34 100644
+--- a/zig/src/families/qwen3_5/cuda_native_moe.zig
++++ b/zig/src/families/qwen3_5/cuda_native_moe.zig
+@@ -1,4 +1,5 @@
+ //! The qwen3_5_moe model type (Qwen3.6-35B-A3B) on the same CUDA engine: routed experts in place of the dense MLP.
++const std = @import("std");
+ const native = @import("cuda_native.zig");
+ 
+ pub const model_type = "qwen3_5_moe";
+@@ -6,7 +7,8 @@ pub const formats = native.formats;
+ pub const default_context = native.default_context;
+ pub const max_segments = native.max_segments;
+ pub const prompt_rows = native.prompt_rows;
+-/// --drafter names the checkpoint's own directory: its MTP layer (mtp-4bit.safetensors) drafts chains.
++/// --drafter names a DFlash2 draft model (a config.json with dflash_config), drafted as the dense family drafts, or the
++/// checkpoint's own directory, whose MTP layer (mtp-4bit.safetensors) drafts chains.
+ pub const takes_drafter = true;
+ pub const Options = native.Options;
+ pub const open = native.open;
+@@ -14,7 +16,36 @@ pub const attach = native.attach;
+ pub const pagedLayout = native.pagedLayout; // TF_QWEN_KV_PAGES: the same pool as the dense models'
+ pub const fits = native.fits;
+ pub const window_rows = native.window_rows;
+-pub const openDrafter = native.openMtp;
++
++const Opened = @typeInfo(@typeInfo(@TypeOf(native.openDrafter)).@"fn".return_type.?).error_union.payload;
++const Prepare = @FieldType(Opened, "prepare");
++
++/// Either drafter behind one type: the DFlash2 one with its window calibration, the MTP head without one.
++pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []const u8, bits: u8) !struct {
++    drafter: @FieldType(Opened, "drafter"),
++    ctx: *anyopaque,
++    close: *const fn (*anyopaque) void,
++    reserve: *const fn (*anyopaque, u32) anyerror!void,
++    prepare: ?Prepare,
++} {
++    if (try isDflash(gpa, io, dir)) {
++        const o = try native.openDrafter(gpa, io, p, dir, bits);
++        return .{ .drafter = o.drafter, .ctx = o.ctx, .close = o.close, .reserve = o.reserve, .prepare = o.prepare };
++    }
++    const o = try native.openMtp(gpa, io, p, dir, bits);
++    return .{ .drafter = o.drafter, .ctx = o.ctx, .close = o.close, .reserve = o.reserve, .prepare = null };
++}
++
++/// Whether `dir` holds a DFlash2 draft model: its config.json names a dflash_config.
++fn isDflash(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return false;
++    defer gpa.free(bytes);
++    const doc = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return false;
++    defer doc.deinit();
++    return doc.value == .object and doc.value.object.get("dflash_config") != null;
++}
+ pub const explain = native.explain;
+ /// The dense family's kept prompt states, its open refusals' words and its image tower: the MLP is the only change.
+ pub const snap_bytes = native.snap_bytes;
+diff --git a/zig/src/native/cuda_drafted.zig b/zig/src/native/cuda_drafted.zig
+index 79d235c0..2ea4a6c8 100644
+--- a/zig/src/native/cuda_drafted.zig
++++ b/zig/src/native/cuda_drafted.zig
+@@ -65,7 +65,12 @@ pub fn wrap(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, loaded:
+     s.facts = h.drafted.facts(loaded.facts);
+     s.stream_bytes = h.drafted.streamBytes(loaded.stream_bytes);
+     s.held = h;
+-    if (@hasField(@TypeOf(opened), "prepare")) s.prepare = .{ .ctx = opened.prepare.ctx, .run = opened.prepare.run, .bytes = if (@hasField(@TypeOf(opened.prepare), "bytes")) opened.prepare.bytes else 0 };
++    if (@hasField(@TypeOf(opened), "prepare")) {
++        // a family that opens more than one kind of drafter may have nothing to calibrate (an optional prepare)
++        const P = @TypeOf(opened.prepare);
++        const maybe: ?(if (@typeInfo(P) == .optional) @typeInfo(P).optional.child else P) = opened.prepare;
++        if (maybe) |pr| s.prepare = .{ .ctx = pr.ctx, .run = pr.run, .bytes = if (@hasField(@TypeOf(pr), "bytes")) pr.bytes else 0 };
++    }
+     return s;
+ }
+ 

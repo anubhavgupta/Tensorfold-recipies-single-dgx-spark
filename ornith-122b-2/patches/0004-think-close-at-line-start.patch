@@ -1,0 +1,162 @@
+A reply's reasoning ends at the first </think> token that starts a line outside a ``` fence (server/reply_text.zig).
+
+In this tokenizer <think>/</think> are ordinary tokens (248068/248069, special false), the same ids whether the model
+quotes the tag or closes its reasoning with it. Stock 1.1.7 ends the reasoning at the first close token, so a
+reasoning about a chat template or a parser that quotes the tag inline (seen with pi: "outputs `<think>\n\n</think>`")
+sent the rest of its reasoning to `content`, and the tool-call parser read it, so a call the reasoning only mentioned
+could become a real one. Qwen 3.5 models close with "\n</think>\n\n", so the close is the first close token at a line
+start outside a fence. A finished reply without one falls back to its first close token (stock); while streaming, an
+inline one stays reasoning. Re-port of the ornith-1.5-122b-tensorfold recipe's 0005 onto 1.1.7's token-based split.
+TENSORFOLD_THINK_LINE_CLOSE=0 restores the stock split.
+A fence counts only where it opens a line (a reasoning that names a ```python block inline opens none), and a
+streaming reply's search resumes past the close tokens it already rejected (no re-decoding of its prefix).
+Verified: zig test -lc zig/src/server/reply_text.zig (the new cases and the stock ones); bench/think_check.py.
+
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index ce8aefe4..e9605743 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -74,15 +74,74 @@ pub const Close = union(enum) {
+ 
+ /// Where the reply's reasoning ends, from its tokens: the close token's bytes, the text's spelling, or all of it.
+ pub fn closeWhere(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, close_id: ?u32) !Close {
++    return closeWhereAt(a, decode, ctx, tokens, close_id, true);
++}
++
++/// TENSORFOLD_THINK_LINE_CLOSE=0: the reasoning ends at the first close token anywhere (stock).
++fn lineClose() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TENSORFOLD_THINK_LINE_CLOSE")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
++    return S.v.?;
++}
++
++/// As `closeWhere`. Where the close token is an ordinary one (Qwen 3.5's ``</think>``, the same id whether a reasoning
++/// quotes it or closes with it), the reasoning ends at the first one that starts a line outside a ``` fence: Qwen's
++/// models close with "\n</think>\n\n", and a reasoning about a chat template or parser quotes the tag inline. A
++/// finished reply without such a close ends at its first close token (stock); while streaming, an inline one is held.
++pub fn closeWhereAt(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, close_id: ?u32, finished: bool) !Close {
++    var from: usize = 0;
++    return closeWhereFrom(a, decode, ctx, tokens, close_id, finished, &from);
++}
++
++/// As `closeWhereAt`, searching from token `from.*` and leaving it past every close token found not to be the close:
++/// a streaming reply's later calls do not decode its rejected ones again.
++pub fn closeWhereFrom(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, close_id: ?u32, finished: bool, from_: *usize) !Close {
+     const id = close_id orelse return .spelled;
+-    const at = std.mem.indexOfScalar(u32, tokens, id) orelse return .pending;
+-    if (at == 0) return .{ .token = 0 };
++    var from = from_.*;
++    defer from_.* = from;
++    var first: ?usize = if (from > 0) try firstClose(a, decode, ctx, tokens, id, finished) else null;
++    while (std.mem.indexOfScalarPos(u32, tokens, from, id)) |at| {
++        const off = try closeByte(a, decode, ctx, tokens, at);
++        if (first == null) first = off.at;
++        defer a.free(off.text);
++        if (!lineClose() or lineStart(off.text, off.at)) return .{ .token = off.at };
++        from = at + 1;
++    }
++    if (first) |f| if (finished) return .{ .token = f };
++    return .pending;
++}
++
++/// The text through close token `at` and the byte its marker begins at.
++fn closeByte(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, at: usize) !struct { text: []u8, at: usize } {
+     const through = try decode(ctx, a, tokens[0 .. at + 1]);
+-    defer a.free(through);
++    errdefer a.free(through);
+     const marker = try decode(ctx, a, tokens[at .. at + 1]);
+     defer a.free(marker);
+     // Include separators the decoder inserts before the selected token, without searching for a quoted spelling.
+-    return .{ .token = through.len -| marker.len };
++    return .{ .text = through, .at = through.len -| marker.len };
++}
++
++/// A finished reply's fallback when the search began past its first close token: that token's byte.
++fn firstClose(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, id: u32, finished: bool) !?usize {
++    if (!finished) return null;
++    const at = std.mem.indexOfScalar(u32, tokens, id) orelse return null;
++    const off = try closeByte(a, decode, ctx, tokens, at);
++    a.free(off.text);
++    return off.at;
++}
++
++/// Whether byte `at` of `text` starts a line outside a ``` fence (a fence's quote of the tag is not a close). Only a
++/// fence that opens a line counts: a reasoning that names one inline ("a ```python block") opens none.
++fn lineStart(text: []const u8, at: usize) bool {
++    if (at > 0 and text[at - 1] != '\n') return false;
++    var fences: usize = 0;
++    var i: usize = 0;
++    while (std.mem.indexOfPos(u8, text[0..at], i, "```")) |f| : (i = f + 3) {
++        if (f == 0 or text[f - 1] == '\n') fences += 1;
++    }
++    return fences % 2 == 0;
+ }
+ 
+ /// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
+@@ -92,7 +151,7 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
+ 
+ /// As `splitThinkingAt`, but the close is found in the reply's tokens: the close token's own bytes end the reasoning.
+ pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []const u8, finished: bool, m: Markers, tokens: []const u32, close_id: ?u32) !Split {
+-    return splitThinkingAt(a, full, finished, m, try closeWhere(a, decode, ctx, tokens, close_id));
++    return splitThinkingAt(a, full, finished, m, try closeWhereAt(a, decode, ctx, tokens, close_id, finished));
+ }
+ 
+ /// As `splitThinking`, but the close marker is the model's own close token: the reasoning ends at that token's bytes.
+@@ -421,11 +480,12 @@ pub const Incremental = struct {
+     prefix: usize = 0,
+     read: usize = 0,
+     close: ?Close = null, // where the reasoning ends, once the close token has arrived
++    close_from: usize = 0, // the close search's next token: the ones before it are not the close
+ 
+     /// Where the reply's reasoning ends: the close token's bytes once it has arrived, or the text's spelling of it.
+     pub fn closeOf(inc: *Incremental, a: Allocator, decode: anytype, ctx: anytype, close_id: ?u32) !Close {
+         if (inc.close) |c| return c;
+-        const c = try closeWhere(a, decode, ctx, inc.tokens.items, close_id);
++        const c = try closeWhereFrom(a, decode, ctx, inc.tokens.items, close_id, false, &inc.close_from);
+         if (c != .pending) inc.close = c; // a pending close is not kept: the token may still arrive
+         return c;
+     }
+@@ -513,3 +573,41 @@ test "an opener the reply names in prose keeps the text after it, streamed and w
+     // a finished reply's unclosed envelope is text, as tool_parse.parse keeps it in the content
+     try std.testing.expectEqualStrings("a <tool_call>{\"name\"", try finishedProse(a, "a <tool_call>{\"name\""));
+ }
++
++test "a quoted </think> token stays reasoning: the close is the first one that starts a line outside a fence" {
++    const a = std.testing.allocator;
++    // a toy vocabulary: id 9 is the close token, the rest one piece of text each
++    const Toy = struct {
++        const pieces = [_][]const u8{ "Plan: emit `", "` then a call.", "\n", "\n\nDone.", "```\n", "\n```\n", "x", "a ```py", "", "</think>" };
++        fn decode(_: void, al: Allocator, ids: []const u32) ![]u8 {
++            var out: std.ArrayList(u8) = .empty;
++            for (ids) |i| try out.appendSlice(al, pieces[i]);
++            return out.toOwnedSlice(al);
++        }
++    };
++    const quoted = [_]u32{ 0, 9, 1, 2, 9, 3 }; // "Plan: emit `</think>` then a call.\n</think>\n\nDone."
++    const text = try Toy.decode({}, a, &quoted);
++    defer a.free(text);
++    for ([_]bool{ true, false }) |fin| {
++        const c = try closeWhereAt(a, Toy.decode, {}, &quoted, 9, fin);
++        const s = try splitThinkingAt(a, text, fin, think_markers, c);
++        try std.testing.expectEqualStrings("Plan: emit `</think>` then a call.\n", s.reasoning);
++        try std.testing.expectEqualStrings("Done.", s.answer);
++    }
++    // a fenced quote whose tag starts a line is not the close either
++    const fenced = [_]u32{ 4, 9, 5, 2, 9, 3 };
++    const ftext = try Toy.decode({}, a, &fenced);
++    defer a.free(ftext);
++    const fc = try closeWhereAt(a, Toy.decode, {}, &fenced, 9, true);
++    try std.testing.expectEqual(@as(usize, std.mem.lastIndexOf(u8, ftext, "</think>").?), fc.token);
++    // only an inline close: held while streaming, the first one once finished (stock)
++    const inline_only = [_]u32{ 6, 9, 3 };
++    try std.testing.expect((try closeWhereAt(a, Toy.decode, {}, &inline_only, 9, false)) == .pending);
++    try std.testing.expectEqual(@as(usize, 1), (try closeWhereAt(a, Toy.decode, {}, &inline_only, 9, true)).token);
++    // a fence named inline opens none: the line-start close still ends the reasoning, streamed and resumed
++    const named = [_]u32{ 7, 2, 9, 3 };
++    var from: usize = 0;
++    try std.testing.expectEqual(@as(usize, 8), (try closeWhereFrom(a, Toy.decode, {}, &named, 9, false, &from)).token);
++    // the usual reply opens straight on the close
++    try std.testing.expectEqual(@as(usize, 0), (try closeWhereAt(a, Toy.decode, {}, &[_]u32{ 9, 3 }, 9, false)).token);
++}

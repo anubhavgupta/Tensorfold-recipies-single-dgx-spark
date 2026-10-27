@@ -1,0 +1,75 @@
+tf-qwen35-cuda nll: one engine's teacher-forced logprobs, for comparing a checkpoint's quality across engines.
+
+The kl mode compares bf16 and fp8 caches with two engines, which a 70 GiB checkpoint cannot hold twice on one GB10.
+`tf-qwen35-cuda <model> nll <ids file> <out.json> <skip> [fp8]` runs ids[0..skip] as prompt chunks and the rest
+through verify windows (the path replies take), and writes each window row's logprob of the next id (float64 log
+softmax of its bf16 logits) as a JSON array, printing the mean NLL. bench/nll.py compares it with SGLang's
+input_token_logprobs on the same ids. Test tool only: the server is unchanged.
+
+diff --git a/zig/tests/qwen35_cuda_main.zig b/zig/tests/qwen35_cuda_main.zig
+index bbbf6795..39dc8fd1 100644
+--- a/zig/tests/qwen35_cuda_main.zig
++++ b/zig/tests/qwen35_cuda_main.zig
+@@ -37,6 +37,13 @@ pub fn main(init: std.process.Init) !u8 {
+         const bound: ?[2]f64 = if (bounded) .{ try std.fmt.parseFloat(f64, args[6]), try std.fmt.parseFloat(f64, args[7]) } else null;
+         return vision(init, a, args[1], args[3], try std.fmt.parseInt(u32, args[4], 10), bound, args[first..]);
+     }
++    if (args.len >= 3 and std.mem.eql(u8, args[2], "nll")) {
++        if (args.len != 6 and args.len != 7) {
++            std.debug.print("{s}", .{usage});
++            return 2;
++        }
++        return nll(init, a, args[1], args[3], args[4], try std.fmt.parseInt(usize, args[5], 10), args.len == 7 and std.mem.eql(u8, args[6], "fp8"));
++    }
+     if (args.len >= 3 and std.mem.eql(u8, args[2], "kl")) {
+         if (args.len != 7 and args.len != 8) {
+             std.debug.print("{s}", .{usage});
+@@ -396,6 +403,48 @@ fn kl(init: std.process.Init, a: std.mem.Allocator, model: []const u8, ids_path:
+     return 0;
+ }
+ 
++/// One engine, the ids teacher-forced: ids[0..skip] as prompt chunks, the rest through verify windows of
++/// window_rows rows; writes each window row's logprob (float64 of its bf16 logits) of the next id, ids[skip + 1..].
++fn nll(init: std.process.Init, a: std.mem.Allocator, model: []const u8, ids_path: []const u8, out: []const u8, skip: usize, kv8: bool) !u8 {
++    const io = init.io;
++    var ids: std.ArrayList(u32) = .empty;
++    var it = std.mem.tokenizeAny(u8, try std.Io.Dir.cwd().readFileAlloc(io, ids_path, a, .limited(64 << 20)), ", \n");
++    while (it.next()) |t| try ids.append(a, try std.fmt.parseInt(u32, t, 10));
++    if (skip < 1 or skip + 2 > ids.items.len) return error.FixtureTooShort;
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    const e = try E.Engine.init(init.gpa, io, &ctx, model, kv8);
++    defer e.deinit();
++    var cache = try E.Cache.init(init.gpa, e, ids.items.len + 64);
++    defer cache.deinit(init.gpa);
++    try fill(e, &cache, ids.items[0..skip], skip);
++    var text: std.ArrayList(u8) = .empty;
++    try text.appendSlice(a, "[");
++    var sum: f64 = 0;
++    var at: usize = skip;
++    while (at + 1 < ids.items.len) {
++        const n = @min(e.window_rows, ids.items.len - 1 - at);
++        try e.forward(&.{.{ .cache = &cache, .rows = n }}, ids.items[at..][0..n], .logits);
++        for (0..n) |r| {
++            const row = e.rowLogits(r);
++            var m: f64 = -std.math.inf(f64);
++            for (row) |x| m = @max(m, bf(x));
++            var z: f64 = 0;
++            for (row) |x| z += @exp(bf(x) - m);
++            const lp = bf(row[ids.items[at + r + 1]]) - m - @log(z);
++            sum -= lp;
++            try text.print(a, "{s}{d:.6}", .{ if (at == skip and r == 0) "" else ",", lp });
++        }
++        at += n;
++    }
++    try text.appendSlice(a, "]\n");
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = text.items });
++    std.debug.print("{d} rows: mean NLL {d:.5}\n", .{ ids.items.len - 1 - skip, sum / @as(f64, @floatFromInt(ids.items.len - 1 - skip)) });
++    return 0;
++}
++
+ /// KL(ref || got) in float64 of two bf16 logit rows, whether their top tokens agree, and each one's loss on `next`.
+ fn divergence(ref: []const u16, got: []const u16, next: u32) struct { kl: f64, same_top: bool, loss: [2]f64 } {
+     var mp: f64 = -std.math.inf(f64);

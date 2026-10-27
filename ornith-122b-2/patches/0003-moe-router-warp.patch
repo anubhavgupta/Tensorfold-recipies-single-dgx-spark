@@ -1,0 +1,126 @@
+Decode-sized MoE routing on a warp an expert (cuda/moe.zig routeWarp, kernels/cuda/moe.cu tf_moe_router_warp).
+
+The router's logits (x . w for 256 experts + the shared gate, 3072 inputs) ran on moe.cu's tile kernel: 16 rows by
+16 experts a block, each thread one fp32 FMA chain over all 3072 inputs from shared memory. For a decode step or a
+verify window that is 17 blocks on 48 SMs and a 3072-long dependent chain a thread: ~63 us a layer, ~3.0 ms of a
+38.5 ms one-row forward on a GB10 (measured by running the kernel twice in the captured graph). The new kernel gives
+each expert a warp (128-thread blocks): lane l sums inputs 8l..8l+7 of every 256-input step in index order from
+16-byte loads, then the warp adds its lanes in one fixed butterfly. A row's bits depend on that row alone at any row
+count, so drafted replies still equal "draft": false.
+qwen3_5_moe uses it for every non-prompt routing (decode, verify windows, prompt pieces of 16 rows or fewer, i.e.
+where the decode experts run); prompt passes keep the tile kernel. TF_QWEN_ROUTER=tile restores the stock kernel.
+Verified on a GB10 with Ornith-1.5-122B-NVFP4: one-row forward 38.8 -> 35.6 ms; tf-qwen35-cuda window (widths 1-64)
+and tree logits equal step's bit for bit; teacher-forced NLL 1.2804 (tile) vs 1.2822 (warp), the same spread as
+bf16 vs fp8 caches (routing flips from fp32 summation order), both under SGLang's 1.2848.
+
+diff --git a/zig/kernels/cuda/moe.cu b/zig/kernels/cuda/moe.cu
+index 89153a56..ced0a983 100644
+--- a/zig/kernels/cuda/moe.cu
++++ b/zig/kernels/cuda/moe.cu
+@@ -40,6 +40,44 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_router(const __nv_bfloa
+     if (row0 + rr < R && e0 + ee < E) OUT[static_cast<int64_t>(row0 + rr) * E + e0 + ee] = acc;
+ }
+ 
++// Decode-sized routing (a verify window, a short prompt piece): OUT[r][e] = fp32 x[r] . w[e], a warp an expert over
++// every row, grid (E / 4) of 128 threads. Lane l sums inputs 8l..8l+7 of each 256-input step in index order, then the
++// warp adds its lanes in one fixed butterfly, so a row's bits depend on that row alone, at any row count (D % 256 == 0,
++// rows 16-byte aligned). Skips rows >= P[2].
++extern "C" __global__ void __launch_bounds__(128) tf_moe_router_warp(const __nv_bfloat16* __restrict__ X, int x_stride,
++                                                                       const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
++                                                                       int R, int D, int E, const int* __restrict__ P) {
++    if (P != nullptr) R = min(R, P[2]);
++    const int lane = threadIdx.x % 32;
++    const int e = blockIdx.x * 4 + threadIdx.x / 32;
++    if (e >= E) return;
++    const __nv_bfloat16* w = W + static_cast<int64_t>(e) * D;
++    constexpr int RG = 4;  // rows a pass over the expert's weights sums
++    for (int r0 = 0; r0 < R; r0 += RG) {
++        float acc[RG] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll 4
++        for (int k = lane * 8; k < D; k += 256) {
++            const uint4 wv = __ldg(reinterpret_cast<const uint4*>(w + k));
++            const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wv);
++#pragma unroll
++            for (int j = 0; j < RG; ++j) {
++                if (r0 + j >= R) break;
++                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(X + static_cast<int64_t>(r0 + j) * x_stride + k));
++                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&xv);
++#pragma unroll
++                for (int i = 0; i < 8; ++i) acc[j] = __fmaf_rn(bf(xh[i]), bf(wh[i]), acc[j]);
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < RG; ++j) {
++            float v = acc[j];
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++            if (lane == 0 && r0 + j < R) OUT[static_cast<int64_t>(r0 + j) * E + e] = v;
++        }
++    }
++}
++
+ namespace {
+ 
+ constexpr int MAXC = 8;  // experts a lane holds: up to 256 routed experts
+diff --git a/zig/src/cuda/moe.zig b/zig/src/cuda/moe.zig
+index 7ecb48b4..1873b629 100644
+--- a/zig/src/cuda/moe.zig
++++ b/zig/src/cuda/moe.zig
+@@ -16,10 +16,26 @@ pub const Fns = struct {
+     router_fn: Function,
+     topk_fn: Function,
+     combine_fn: Function,
++    router_warp_fn: ?Function = null, // decode-sized routing, a warp an expert (moe.cu tf_moe_router_warp)
+ 
+     /// From the loaded moe module (kernels.moe).
+     pub fn resolve(mod: Module) !Fns {
+-        return .{ .router_fn = try mod.function("tf_moe_router"), .topk_fn = try mod.function("tf_moe_topk"), .combine_fn = try mod.function("tf_moe_combine") };
++        return .{ .router_fn = try mod.function("tf_moe_router"), .topk_fn = try mod.function("tf_moe_topk"), .combine_fn = try mod.function("tf_moe_combine"), .router_warp_fn = mod.function("tf_moe_router_warp") catch null };
++    }
++
++    /// `route` for decode-sized calls: a warp an expert, each row summed in one fixed order at any row count (a row's
++    /// bits are its own); `dims` a multiple of 256 and rows 16-byte aligned, else (or without the kernel) `route`.
++    pub fn routeWarp(f: Fns, s: Stream, x: u64, x_stride: usize, rows: usize, w: u64, logits: u64, dims: usize, count: usize, params: u64) !void {
++        const fw = f.router_warp_fn orelse return f.route(s, x, x_stride, rows, w, logits, dims, count, params);
++        if (dims % 256 != 0 or x_stride % 8 != 0 or x % 16 != 0 or w % 16 != 0) return f.route(s, x, x_stride, rows, w, logits, dims, count, params);
++        var a: launch_.Args = .{};
++        a.add(x);
++        a.add(int(x_stride));
++        a.add(w);
++        a.add(logits);
++        for ([_]usize{ rows, dims, count }) |v| a.add(int(v));
++        a.add(params);
++        try launch_.launch(fw, .{ .grid = .{ .x = @intCast((count + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+     }
+ 
+     /// logits[r][e] = fp32 x[r] . w[e], `count` rows of `dims` with the gate last; `params` word 2 (if set) caps rows.
+diff --git a/zig/src/families/qwen3_5/cuda_routed.zig b/zig/src/families/qwen3_5/cuda_routed.zig
+index 80a69097..c7ef5153 100644
+--- a/zig/src/families/qwen3_5/cuda_routed.zig
++++ b/zig/src/families/qwen3_5/cuda_routed.zig
+@@ -1,4 +1,5 @@
+ //! Qwen3.5 MoE's routed experts on CUDA (qwen3_5_moe): the router's top-k, the grouped plan, the experts and combine.
++const std = @import("std");
+ const cuda = @import("cuda");
+ const E = @import("cuda_engine.zig");
+ 
+@@ -45,7 +46,7 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     const items = cuda.grouped.maxItems(pairs, count, tile);
+     const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+     const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .exl3 = if (e.kit) |k| &k.grouped else null, .nvfp4 = if (e.nv) |*n| n else null };
+-    try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count, params);
++    if (wide or !warpRouter()) try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count, params) else try e.moe.routeWarp(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count, params);
+     try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k, params);
+     try e.plan.routeRows(e.stream, s.picks, pairs, count, tile, plan, if (params == 0) 0 else params + 2 * 4, slots);
+     const rows_in: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
+@@ -59,3 +60,10 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     }
+     try e.moe.combine(e.stream, s.y, !wide, s.wts, out, total, slots, g.hidden, params);
+ }
++
++/// Decode-sized routing on a warp an expert (cuda.moe.routeWarp); TF_QWEN_ROUTER=tile keeps the tile kernel throughout.
++var warp_router: ?bool = null;
++fn warpRouter() bool {
++    if (warp_router == null) warp_router = if (std.c.getenv("TF_QWEN_ROUTER")) |v| !std.mem.eql(u8, std.mem.span(v), "tile") else true;
++    return warp_router.?;
++}

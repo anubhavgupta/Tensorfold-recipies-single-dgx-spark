@@ -1,7 +1,7 @@
 # TensorFold v0.6.5 on DGX Spark
 
 This repo contains recipes for running [TensorFold](https://github.com/ashhart/TensorFold) on a single DGX Spark
-(GB10, 128 GB) for several models (v0.6.5 Python engine, and TensorFold 1.0.12 native for `dory-4b` and `3.5-glm-2`). Key measured decode speeds (200-token replies, thinking off): "per stream" is one
+(GB10, 128 GB) for several models (v0.6.5 Python engine, TensorFold 1.0.12 native for `dory-4b` and `3.5-glm-2`, and 1.1.7 native for `ornith-122b-2`). Key measured decode speeds (200-token replies, thinking off): "per stream" is one
 client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 and 5 clients):
 
 | Model | Per stream (prose / code) | Peak aggregate (prose / code) |
@@ -13,11 +13,13 @@ client; "peak" is the aggregate over the preset's max tested concurrency (8, 8 a
 | Nemotron-Labs Dory1.0-4B NVFP4 (`dory-4b`)** | 52 / 52 tok/s | 511 / 515 tok/s |
 | GLM-5.3-Flash EXL3 2.05bpw (`3.5-glm-2`)** | 31 / 32 tok/s | 40 / 45 tok/s |
 | Ornith-1.5-122B NVFP4 + DFlash2 (`ornith-1.5-122B`)**** | 40 / 49 tok/s | 61 / 93 tok/s |
+| Ornith-1.5-122B NVFP4 + DFlash2 on TensorFold 1.1.7 (`ornith-122b-2`)***** | 50 / 63 tok/s | 69 / 90 tok/s |
 
 \** TensorFold 1.0.12 native (Zig) engine with this repo's patches; peak at 16 (Dory) and 4 (GLM) clients.
 \*** TensorFold 0.6.6 (the last Python engine) with the DFlash2 drafter; 256-token chat replies, 9 clients (see its section).
 \**** Served with SGLang, not TensorFold; distinct prompts, 512-token replies, greedy, 4 clients each holding a full
 262K context (see its section).
+\***** The same NVFP4 checkpoint and drafter on TensorFold 1.1.7 native with this repo's patches; same method as ****.
 
 Full results in [Benchmarks](#benchmarks).
 
@@ -252,6 +254,24 @@ Without speculation: 30 tok/s single stream. Prefill 2,600-3,200 tok/s up to 32K
 averaged over a 245K prompt. A round is near this checkpoint's memory-bandwidth floor (profile in the recipe README),
 so ~55 tok/s is the ceiling for code at one stream on this path. Details:
 `ornith-1.5-122B/README.md`.
+
+### Ornith-1.5-122B NVFP4 + DFlash2 on TensorFold 1.1.7 (`ornith-122b-2/start.sh`)
+
+The same checkpoint and drafter as `ornith-1.5-122B`, served by TensorFold v1.1.7's native engine. Stock 1.1.7 reads
+Qwen3.5-MoE only as MLX or EXL3; `patches/0001` reads this ModelOpt checkpoint's NVFP4 experts as stored (FP8
+attention/GDN and the W4A16 head already load), `0002` opens the DFlash2 drafter for the MoE family, `0003` moves
+decode routing to a warp per expert (-8% a one-row step). Teacher-forced NLL on the same ids is 0.2% under SGLang's;
+drafted replies equal `"draft": false`. 4 streams x 262K fit. Same method as above (distinct prompts, 512 tokens,
+greedy, thinking off):
+
+| Clients | Mixed (prose/code/math) | Code |
+|---:|---:|---:|
+| 1 | 49.8 | 63.4 |
+| 2 | 52.2 | 72.6 |
+| 4 | 68.6 | 90.4 |
+
+Prefill 2,360-2,490 tok/s up to 8K, 2,156 at 31K, 1,443 at 98K; one stream decodes at 51.8 tok/s at a 245K depth
+(SGLang 39.0); four 245K prompts at once finish in 1,138 s. Ready in ~60 s. Details: `ornith-122b-2/README.md`.
 
 ### DeepSeek-V4.1-Flash-1017 SAGE EXL3 1.62bpw on vLLM (`ds4.1-flash-1017/scripts/serve.sh`)
 

@@ -1,0 +1,346 @@
+NVFP4 routed experts for qwen3_5_moe ModelOpt checkpoints on CUDA (TensorFold 1.1.7).
+
+Stock 1.1.7 reads Qwen3.5-MoE (Ornith-1.5-122B) only as MLX affine or EXL3: cuda_geometry.zig refused a ModelOpt
+config for the MoE type ("the routed experts read MLX tables only"), although the dense 27B already serves ModelOpt
+NVFP4/FP8 and the core has NVFP4 grouped experts (cuda.experts.Nvfp4Experts, GLM's and Flash Next's). This patch:
+  - cuda_geometry.zig: admits a qwen3_5_moe config whose quantization_config is quant_method "modelopt" (other
+    formats' experts stay refused, as before);
+  - cuda_modelopt.zig: a MoE layer's kinds skip the dense MLP slots and require its routed experts ("mlp.experts")
+    and shared expert to be NVFP4 (NVFP4 or W4A16_NVFP4); compressed-tensors MoE exports stay refused;
+  - cuda_modelopt_experts.zig (new): each layer's 256 routed experts and the shared one (last), read as stored
+    (e2m1 codes, e4m3 block scales, the fp32 weight_scale_2 per projection, gate and up apart) and packed on the host
+    by Nvfp4Experts.packGateUp/packOne (32 experts at a time over the CPU's cores) straight into the arena; the
+    router rows (mlp.gate, then shared_expert_gate) as stored bf16;
+  - cuda_weights.zig, cuda_engine.zig, cuda_routed.zig: the arena counts them, the engine loads the NVFP4 expert
+    kernels for such a checkpoint, and the routed rows dispatch format .nvfp4 (bf16 rows in, W4A16 arithmetic).
+Attention/GDN projections (FP8, per-tensor scale), in_proj_a/b (bf16) and lm_head (W4A16 NVFP4) already load through
+the dense family's ModelOpt path, with bf16 activations against the stored weights.
+Verified on a GB10 with ornith-ai/Ornith-1.5-122B-NVFP4: loads in ~50 s (model 70.26 GiB); teacher-forced NLL on
+15,853 tokens of four texts 1.2804 vs SGLang's 1.2848 on the same checkpoint and ids (bench/nll.py, README);
+host tests test-qwen35-modelopt-admission-host and test-qwen35-formats-host pass.
+
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 165105ca..0d9b70da 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -90,6 +90,7 @@ pub const Engine = struct {
+     experts: cuda.experts.Affine4Experts,
+     experts3: cuda.experts3.Affine3Experts,
+     mo: ?modelopt.Kernels = null, // a ModelOpt checkpoint's lane, prompt GEMM, packers and bf16 rows
++    nv: ?cuda.experts.Nvfp4Experts = null, // a ModelOpt qwen3_5_moe checkpoint's NVFP4 routed experts
+     plan: cuda.grouped.Router,
+     moe: cuda.moe.Fns,
+     fns: Fns,
+@@ -240,6 +241,8 @@ pub const Engine = struct {
+         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_rows = try e.mods[9].function("tf_q35_attn_rows8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+         e.mo = if (g.kinds.modelopt) try modelopt.Kernels.load(d, @intCast(try ctx.attribute(.compute_capability_major))) else null;
+         errdefer if (e.mo) |*m| m.unload();
++        e.nv = if (g.kinds.modelopt and g.moe()) try cuda.experts.Nvfp4Experts.load(d, sms) else null;
++        errdefer if (e.nv) |*n| n.unload();
+         e.layers = try gpa.alloc(Layer, g.layers);
+         errdefer gpa.free(e.layers);
+         if (g.exl3) {
+@@ -296,6 +299,7 @@ pub const Engine = struct {
+         e.wide.deinit();
+         e.int8.deinit();
+         if (e.mo) |*m| m.unload();
++        if (e.nv) |*n| n.unload();
+         for (&e.mods) |*m| m.unload();
+         e.stream.deinit();
+         e.gpa.destroy(e);
+diff --git a/zig/src/families/qwen3_5/cuda_geometry.zig b/zig/src/families/qwen3_5/cuda_geometry.zig
+index 382bdc3f..8feea365 100644
+--- a/zig/src/families/qwen3_5/cuda_geometry.zig
++++ b/zig/src/families/qwen3_5/cuda_geometry.zig
+@@ -207,10 +207,15 @@ fn expertBits(q: std.json.ObjectMap, layers: usize) !struct { bits: u8, count: u
+ 
+ /// Whether config.json's quantization_config says quant_method "exl3" (Mia-AiLab's HF-layout checkpoints).
+ fn isExl3(root: std.json.ObjectMap) bool {
++    return quantMethod(root, "exl3");
++}
++
++/// Whether config.json's quantization_config names quant_method `want`.
++fn quantMethod(root: std.json.ObjectMap, want: []const u8) bool {
+     const q = root.get("quantization_config") orelse return false;
+     if (q != .object) return false;
+     const m = q.object.get("quant_method") orelse return false;
+-    return m == .string and std.mem.eql(u8, m.string, "exl3");
++    return m == .string and std.mem.eql(u8, m.string, want);
+ }
+ 
+ fn object(v: std.json.Value) !std.json.ObjectMap {
+@@ -298,13 +303,15 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
+     }
+     if (g.layers > max_layers or g.hidden % 256 != 0 or g.hidden > 8192 or g.intermediate % 64 != 0) return error.UnsupportedQwenGeometry;
+     if (moe) {
+-        if (modelopt) return error.UnsupportedQwenQuantization; // the routed experts read MLX tables only
++        // ModelOpt (quant_method "modelopt"): the routed and shared experts NVFP4 (cuda_modelopt_experts.zig), checked
++        // by cuda_modelopt.kinds; other quantization_config formats' experts are not read
++        if (modelopt and !quantMethod(root, "modelopt")) return error.UnsupportedQwenQuantization;
+         g.experts = try integer(t, "num_experts");
+         g.top_k = try integer(t, "num_experts_per_tok");
+         // the shared expert runs in the routed experts' table, so it needs their width
+         if (try integer(t, "shared_expert_intermediate_size") != g.intermediate) return error.UnsupportedQwenGeometry;
+         if (g.experts > 256 or g.top_k > 31 or g.top_k >= g.experts) return error.UnsupportedQwenGeometry;
+-        if (!exl3) {
++        if (!exl3 and !modelopt) {
+             const w = try expertBits(try object(qv.?), g.layers);
+             if (w.count != 0 and w.count != 3 * g.layers) return error.UnsupportedQwenQuantization;
+             g.expert_bits = w.bits;
+diff --git a/zig/src/families/qwen3_5/cuda_modelopt.zig b/zig/src/families/qwen3_5/cuda_modelopt.zig
+index d3cfb922..04e20083 100644
+--- a/zig/src/families/qwen3_5/cuda_modelopt.zig
++++ b/zig/src/families/qwen3_5/cuda_modelopt.zig
+@@ -68,17 +68,29 @@ pub fn kinds(gpa: std.mem.Allocator, config: []const u8, g: Geometry) !Kinds {
+     if (r.of(prefix ++ "embed_tokens") != null) return error.UnsupportedQwenQuantization; // the rows stay bf16
+     var out: Kinds = .{ .modelopt = true, .head = try kindOf(r.of("lm_head")) };
+     var buf: [128]u8 = undefined;
+-    for (0..g.layers) |i| for (std.enums.values(Slot)) |slot| {
+-        const used = switch (slot) {
+-            .gate, .up, .down => true,
+-            .qkv, .z, .a, .b, .out => g.linear[i],
+-            .q, .k, .v, .o => !g.linear[i],
++    for (0..g.layers) |i| {
++        if (g.moe()) for (expert_modules) |mod| {
++            const kind = try kindOf(r.of(try std.fmt.bufPrint(&buf, prefix ++ "layers.{d}.{s}", .{ i, mod })));
++            if (kind != .nvfp4 and kind != .nvfp4_w16) {
++                std.log.err("{s}layers.{d}.{s}: the routed and shared experts read NVFP4 only", .{ prefix, i, mod });
++                return error.UnsupportedQwenQuantization;
++            }
+         };
+-        if (used) out.proj[i][@backingInt(slot)] = try kindOf(r.of(try std.fmt.bufPrint(&buf, prefix ++ "layers.{d}.{s}", .{ i, geometry.slot_modules.get(slot) })));
+-    };
++        for (std.enums.values(Slot)) |slot| {
++            const used = switch (slot) {
++                .gate, .up, .down => !g.moe(),
++                .qkv, .z, .a, .b, .out => g.linear[i],
++                .q, .k, .v, .o => !g.linear[i],
++            };
++            if (used) out.proj[i][@backingInt(slot)] = try kindOf(r.of(try std.fmt.bufPrint(&buf, prefix ++ "layers.{d}.{s}", .{ i, geometry.slot_modules.get(slot) })));
++        }
++    }
+     return out;
+ }
+ 
++/// A MoE layer's expert modules as a MIXED_PRECISION config names them: the routed experts as one, the shared one's.
++const expert_modules = [_][]const u8{ "mlp.experts", "mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj", "mlp.shared_expert.down_proj" };
++
+ /// Whether quantization_config is compressed-tensors' (unsloth's export): its kinds are read from the tensors.
+ fn compressedTensors(gpa: std.mem.Allocator, config: []const u8) !bool {
+     const doc = try std.json.parseFromSlice(std.json.Value, gpa, config, .{});
+@@ -106,6 +118,7 @@ pub fn ctKindsBytes(gpa: std.mem.Allocator, bytes: []const u8, g: Geometry) !Kin
+     const value = doc.value.object.get("weight_map") orelse return error.UnsupportedQwenQuantization;
+     if (value != .object) return error.UnsupportedQwenQuantization;
+     const map = value.object;
++    if (g.moe()) return error.UnsupportedQwenQuantization; // its experts' tensors are ModelOpt's names only
+     const K = struct {
+         fn of(m: std.json.ObjectMap, module: []const u8) !Kind {
+             var b: [192]u8 = undefined;
+@@ -135,15 +148,20 @@ fn single(gpa: std.mem.Allocator, config: []const u8, g: Geometry) !Kinds {
+     if (!ig.has(prefix ++ "embed_tokens")) return error.UnsupportedQwenQuantization;
+     var out: Kinds = .{ .modelopt = true, .head = if (ig.has("lm_head")) .bf16 else .nvfp4 };
+     var buf: [128]u8 = undefined;
+-    for (0..g.layers) |i| for (std.enums.values(Slot)) |slot| {
+-        const used = switch (slot) {
+-            .gate, .up, .down => true,
+-            .qkv, .z, .a, .b, .out => g.linear[i],
+-            .q, .k, .v, .o => !g.linear[i],
++    for (0..g.layers) |i| {
++        if (g.moe()) for (expert_modules) |mod| {
++            if (ig.has(try std.fmt.bufPrint(&buf, prefix ++ "layers.{d}.{s}", .{ i, mod }))) return error.UnsupportedQwenQuantization;
+         };
+-        const name = try std.fmt.bufPrint(&buf, prefix ++ "layers.{d}.{s}", .{ i, geometry.slot_modules.get(slot) });
+-        if (used) out.proj[i][@backingInt(slot)] = if (ig.has(name)) .bf16 else .nvfp4;
+-    };
++        for (std.enums.values(Slot)) |slot| {
++            const used = switch (slot) {
++                .gate, .up, .down => !g.moe(),
++                .qkv, .z, .a, .b, .out => g.linear[i],
++                .q, .k, .v, .o => !g.linear[i],
++            };
++            const name = try std.fmt.bufPrint(&buf, prefix ++ "layers.{d}.{s}", .{ i, geometry.slot_modules.get(slot) });
++            if (used) out.proj[i][@backingInt(slot)] = if (ig.has(name)) .bf16 else .nvfp4;
++        }
++    }
+     return out;
+ }
+ 
+diff --git a/zig/src/families/qwen3_5/cuda_modelopt_experts.zig b/zig/src/families/qwen3_5/cuda_modelopt_experts.zig
+new file mode 100644
+index 00000000..3c8af51e
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_modelopt_experts.zig
+@@ -0,0 +1,130 @@
++//! A ModelOpt checkpoint's routed experts (qwen3_5_moe, e.g. Ornith-1.5-122B-NVFP4): NVFP4 codes, e4m3 block scales
++//! and an fp32 global scale per projection, read as stored and packed for cuda.experts.Nvfp4Experts (bf16 rows in).
++//! The shared expert is packed last in the same tables, as the affine and EXL3 loaders stack it.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const engine = @import("cuda_engine.zig");
++const geometry = @import("cuda_geometry.zig");
++
++const Engine = engine.Engine;
++const X = cuda.experts.Nvfp4Experts;
++const aligned = engine.aligned;
++
++/// Experts packed on the host at once: bounds the host buffers (~85 MiB of packed words an expert pair at 122B).
++const chunk = 32;
++
++/// A layer's device bytes: the gate-up pair table, the down table, their global scales and the router's bf16 rows.
++pub fn bytes(g: geometry.Geometry) usize {
++    const count = g.experts + 1;
++    return aligned(X.bytes(count, g.intermediate, g.hidden, 2)) + aligned(X.bytes(count, g.hidden, g.intermediate, 1)) +
++        aligned(count * 2 * 4) + aligned(count * 4) + aligned(count * g.hidden * 2);
++}
++
++/// One projection as stored: codes [n][k/2] (low nibble first), e4m3 scales [n][k/16], the fp32 global scale.
++const Part = struct { codes: []const u8, scales: []const u8, global: f32 };
++
++fn part(ck: *core.Checkpoint, base: []const u8, n: usize, k: usize) !Part {
++    var buf: [200]u8 = undefined;
++    const codes = try ck.expect(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}), .u8, &.{ n, k / 2 });
++    const scales = try ck.expect(try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{base}), .f8_e4m3, &.{ n, k / 16 });
++    const t = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale_2", .{base}));
++    if (t.dtype != .f32 or t.bytes.len != 4) return error.UnexpectedTensor;
++    const global: f32 = @bitCast(std.mem.readInt(u32, t.bytes[0..4], .little));
++    if (!std.math.isFinite(global) or global <= 0) return error.UnexpectedTensor;
++    return .{ .codes = codes.bytes, .scales = scales.bytes, .global = global };
++}
++
++/// Packs experts [from, to) of a chunk: worker `w` of `n` takes every n-th one.
++const Job = struct {
++    parts: []const [3]Part,
++    up: []u32,
++    down: []u32,
++    up_len: usize,
++    down_len: usize,
++    ni: usize,
++    d: usize,
++
++    fn run(j: *const Job, w: usize, n: usize) void {
++        var i = w;
++        while (i < j.parts.len) : (i += n) {
++            const p = j.parts[i];
++            X.packGateUp(j.up[i * j.up_len ..][0..j.up_len], .{ p[0].codes, p[0].scales }, .{ p[1].codes, p[1].scales }, j.ni, j.d);
++            X.packOne(j.down[i * j.down_len ..][0..j.down_len], p[2].codes, p[2].scales, j.d, j.ni);
++        }
++    }
++};
++
++/// The router as bf16 [experts + 1][hidden]: the gate's rows, then shared_expert_gate's (both stored bf16).
++fn router(e: *Engine, ck: *core.Checkpoint, p: []const u8) !u64 {
++    const g = e.g;
++    var buf: [200]u8 = undefined;
++    const a = try ck.expect(try std.fmt.bufPrint(&buf, "{s}mlp.gate.weight", .{p}), .bf16, &.{ g.experts, g.hidden });
++    const b = try ck.expect(try std.fmt.bufPrint(&buf, "{s}mlp.shared_expert_gate.weight", .{p}), .bf16, &.{ 1, g.hidden });
++    const out = try e.alloc(a.bytes.len + b.bytes.len);
++    try e.arena.upload(out - e.arena.ptr, a.bytes);
++    try e.arena.upload(out - e.arena.ptr + a.bytes.len, b.bytes);
++    return out;
++}
++
++/// Layer `p`'s routed experts (the shared one last) packed into the engine's arena, and its router rows.
++pub fn load(e: *Engine, ck: *core.Checkpoint, p: []const u8) !engine.Mlp {
++    const g = e.g;
++    const gpa = e.gpa;
++    const ni = g.intermediate;
++    const d = g.hidden;
++    const count = g.experts + 1;
++    if (ni % X.cols != 0 or d % X.cols != 0) return error.UnsupportedQwenGeometry;
++    const up_len = X.bytes(1, ni, d, 2) / 4;
++    const down_len = X.bytes(1, d, ni, 1) / 4;
++    const up = try e.alloc(count * up_len * 4);
++    const down = try e.alloc(count * down_len * 4);
++    const up_scale = try e.alloc(count * 2 * 4);
++    const down_scale = try e.alloc(count * 4);
++    const hu = try gpa.alloc(u32, chunk * up_len);
++    defer gpa.free(hu);
++    const hd = try gpa.alloc(u32, chunk * down_len);
++    defer gpa.free(hd);
++    const us = try gpa.alloc(f32, count * 2);
++    defer gpa.free(us);
++    const ds = try gpa.alloc(f32, count);
++    defer gpa.free(ds);
++    var parts: [chunk][3]Part = undefined;
++    const workers = @min(chunk, @max(1, std.Thread.getCpuCount() catch 1));
++    var buf: [200]u8 = undefined;
++    var e0: usize = 0;
++    while (e0 < count) : (e0 += chunk) {
++        const ec = @min(chunk, count - e0);
++        for (0..ec) |j| {
++            const x = e0 + j;
++            for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |mod, m| {
++                const base = if (x < g.experts) try std.fmt.bufPrint(&buf, "{s}mlp.experts.{d}.{s}", .{ p, x, mod }) else try std.fmt.bufPrint(&buf, "{s}mlp.shared_expert.{s}", .{ p, mod });
++                parts[j][m] = try part(ck, base, if (m == 2) d else ni, if (m == 2) ni else d);
++            }
++            us[x * 2] = parts[j][0].global;
++            us[x * 2 + 1] = parts[j][1].global;
++            ds[x] = parts[j][2].global;
++        }
++        const job: Job = .{ .parts = parts[0..ec], .up = hu, .down = hd, .up_len = up_len, .down_len = down_len, .ni = ni, .d = d };
++        const n = @min(workers, ec);
++        var threads: [chunk]?std.Thread = @splat(null);
++        for (1..n) |w| threads[w] = std.Thread.spawn(.{}, Job.run, .{ &job, w, n }) catch null;
++        job.run(0, n);
++        for (1..n) |w| if (threads[w]) |t| t.join() else job.run(w, n); // a worker that did not start: its share here
++        try e.arena.upload(up - e.arena.ptr + e0 * up_len * 4, std.mem.sliceAsBytes(hu[0 .. ec * up_len]));
++        try e.arena.upload(down - e.arena.ptr + e0 * down_len * 4, std.mem.sliceAsBytes(hd[0 .. ec * down_len]));
++    }
++    try e.arena.upload(up_scale - e.arena.ptr, std.mem.sliceAsBytes(us));
++    try e.arena.upload(down_scale - e.arena.ptr, std.mem.sliceAsBytes(ds));
++    const layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = up, .down = down, .up_scale = up_scale, .down_scale = down_scale, .width = ni, .dims = d, .experts = count };
++    return .{ .moe = .{ .router = try router(e, ck, p), .experts = layer } };
++}
++
++test "a layer's bytes hold both tables, their scales and the router's rows" {
++    var g: geometry.Geometry = undefined;
++    g.experts = 2;
++    g.intermediate = 64;
++    g.hidden = 256;
++    const want = aligned(X.bytes(3, 64, 256, 2)) + aligned(X.bytes(3, 256, 64, 1)) + aligned(24) + aligned(12) + aligned(3 * 256 * 2);
++    try std.testing.expectEqual(want, bytes(g));
++}
+diff --git a/zig/src/families/qwen3_5/cuda_routed.zig b/zig/src/families/qwen3_5/cuda_routed.zig
+index 95224a44..80a69097 100644
+--- a/zig/src/families/qwen3_5/cuda_routed.zig
++++ b/zig/src/families/qwen3_5/cuda_routed.zig
+@@ -44,7 +44,7 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     const tile: usize = if (wide) 64 else 16;
+     const items = cuda.grouped.maxItems(pairs, count, tile);
+     const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+-    const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .exl3 = if (e.kit) |k| &k.grouped else null };
++    const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .exl3 = if (e.kit) |k| &k.grouped else null, .nvfp4 = if (e.nv) |*n| n else null };
+     try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count, params);
+     try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k, params);
+     try e.plan.routeRows(e.stream, s.picks, pairs, count, tile, plan, if (params == 0) 0 else params + 2 * 4, slots);
+diff --git a/zig/src/families/qwen3_5/cuda_weights.zig b/zig/src/families/qwen3_5/cuda_weights.zig
+index a31f096b..4d326844 100644
+--- a/zig/src/families/qwen3_5/cuda_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_weights.zig
+@@ -85,7 +85,7 @@ pub fn total(g: Geometry) usize {
+     t += aligned(g.hidden * 2);
+     for (0..g.layers) |i| {
+         t += 2 * aligned(g.hidden * 2);
+-        if (g.moe()) t += routedBytes(g.experts, g.intermediate, g.hidden, g.expert_bits);
++        if (g.moe()) t += if (mo) @import("cuda_modelopt_experts.zig").bytes(g) else routedBytes(g.experts, g.intermediate, g.hidden, g.expert_bits);
+         for (slots(g, i)) |slot| {
+             const nk = shape(g, slot);
+             t += if (mo) modelopt.packedBytes(nk[0], nk[1], g.kinds.of(i, slot)) else packedBytes(nk[0], nk[1], g.bits.of(i, slot));
+@@ -358,7 +358,7 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
+         l.* = .{
+             .input_norm = try normVec(e, ck, mo, "{s}input_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
+             .post_norm = try normVec(e, ck, mo, "{s}post_attention_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
+-            .mlp = if (g.moe()) try routed(e, e, ck, stage, p, g.expert_bits) else .{ .dense = .{ .gate = ps.get(.gate), .up = ps.get(.up), .down = ps.get(.down) } },
++            .mlp = if (g.moe()) (if (mo) try @import("cuda_modelopt_experts.zig").load(e, ck, p) else try routed(e, e, ck, stage, p, g.expert_bits)) else .{ .dense = .{ .gate = ps.get(.gate), .up = ps.get(.up), .down = ps.get(.down) } },
+             .mixer = undefined,
+         };
+         if (g.pocket > 0) try loadPocket(e, ck, p, i);
+@@ -408,6 +408,7 @@ test "a uniform 4-bit checkpoint keeps its sizes; other modules take their own w
+ 
+ test {
+     _ = @import("cuda_expert_pack.zig");
++    _ = @import("cuda_modelopt_experts.zig");
+ }
+ 
+ fn linearWide(e: *Engine, into: anytype, ck: *core.Checkpoint, stage: *DeviceBuffer, prefix: []const u8, name: []const u8, n: usize, k: usize) !Affine4 {
