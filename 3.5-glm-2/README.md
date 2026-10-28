@@ -4,17 +4,22 @@ Serve **GLM-5.3-Flash** from turboderp's EXL3 pack
 ([`turboderp/GLM-5.3-Flash-exl3`](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3), branch `2.05bpw`, 80 GiB) on
 **one** DGX Spark (GB10, 128 GB) with [TensorFold](https://github.com/ashhart/TensorFold)'s native Zig engine at the
 latest release, 1.0.12 (`46a08c1`). OpenAI-compatible API on port 8890, model id `GLM-5.3-Flash`: thinking
-(`reasoning_content`), tool calls, structured output, MTP drafts, 4 concurrent streams with a 131,072-token window each,
+(`reasoning_content`), tool calls, structured output, MTP drafts, 2 concurrent streams with a 262,144-token window each,
 and TensorFold's prompt cache.
 
 ```bash
 ./start.sh                 # builds the image the first time (~5 min), downloads the pack if missing, loads it (~4 min)
 ./start.sh restart         # after changing settings
 ./stop.sh                  # (end.sh is the same script)
-CONTEXT=65536 PARALLEL=8 ./start.sh restart
+CONTEXT=131072 PARALLEL=4 ./start.sh restart   # the earlier default (measured below)
 ```
 
-Settings (environment or `./.env`, defaults in `scripts/config.sh`): `CONTEXT` (131072), `PARALLEL` (4), `DRAFTS` (1: the
+The default is 2 streams x 262,144 tokens: about the same stream memory as the earlier 4 x 131,072 (~2.65 GiB a stream at
+131K, the 11 MLA layers' caches growing with the window, the 34 KDA layers' states fixed), and extra streams add little
+here (distinct sampled streams: 28.7 / 25.3 / 30.3 tok/s aggregate at 1 / 2 / 4). Not yet measured at 262K: memory at a
+full window, retrieval and decode at depth. A full 262K prompt prefills in ~10 min (~450 tok/s).
+
+Settings (environment or `./.env`, defaults in `scripts/config.sh`): `CONTEXT` (262144), `PARALLEL` (2), `DRAFTS` (1: the
 checkpoint's MTP head), `PROMPT_CACHE_GIB` (0: sized by the server from what is left), `THINKING` (1),
 `TEMPERATURE`/`TOP_P` (1.0/0.95), `MAX_TOKENS`, `PORT` (8890), `SERVED_NAME`. Extra arguments go to
 `tensorfold-native serve`; `TENSORFOLD_*` and `TF_GLM_*` variables are passed into the container. Logs:
@@ -96,7 +101,7 @@ The image `tensorfold-glm-exl3:zig-46a08c1` is built by `scripts/prepare.sh` fro
 patches, with Zig 0.17.0 on `nvcr.io/nvidia/pytorch:26.07-py3` (the server, `tf-cuda-test`, and libtfgrammar for
 structured output). The server runs with `TF_GLM_RANK=0 TF_GLM_WORLD=1`.
 
-## Results (GB10, defaults: 4 streams, 131,072-token window, MTP drafts on)
+## Results (GB10, the earlier defaults: 4 streams, 131,072-token window, MTP drafts on)
 
 Memory: 86.4 GiB for the model and the streams' buffers, 2.65 GiB a stream at the full window, a 6.8 GiB prompt cache.
 Load: ~225 s.

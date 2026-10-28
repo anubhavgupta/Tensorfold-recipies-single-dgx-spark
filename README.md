@@ -160,7 +160,7 @@ Prefill 3,000-3,450 tok/s up to 26K tokens, 1,150 tok/s at 249K; an edit-style r
 `turboderp/GLM-5.3-Flash-exl3 @ 2.05bpw` (80 GiB) on one Spark with TensorFold 1.0.12's native engine. Upstream serves
 this model on CUDA only from NVIDIA's 190 GiB NVFP4 checkpoint over several hosts; `3.5-glm-2/patches` add EXL3 to the
 CUDA engine (upstream PR #837, rebased) and load the pack in the GLM family at one rank, with a faster EXL3 prompt-experts
-kernel. MTP drafts on, 4 streams x 131,072-token window, port 8890.
+kernel. MTP drafts on, 2 streams x 262,144-token window by default (measured below at the earlier 4 x 131,072), port 8890.
 
 | Clients | Prose (same prompt, greedy) | Code (same prompt, greedy) | Distinct prompts, T=1 |
 |---:|---:|---:|---:|

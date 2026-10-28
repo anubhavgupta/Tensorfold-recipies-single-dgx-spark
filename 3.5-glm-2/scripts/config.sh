@@ -43,10 +43,11 @@ SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8890}"
 # Prompt plus reply tokens a request may use (the model's window is 1,048,576). A stream's DSA caches and KDA states grow
-# with it (~1.5 GiB a stream at 65,536, ~2.6 GiB at 131,072), and the 80 GiB of weights leave ~16 GiB on a 128 GB Spark.
-CONTEXT="${CONTEXT:-131072}"
+# with it (~1.5 GiB a stream at 65,536, ~2.6 GiB at 131,072, ~5 GiB estimated at 262,144), and the 80 GiB of weights
+# leave ~16 GiB on a 128 GB Spark. Default: 2 streams at 262,144 (about the memory of 4 x 131,072; not yet measured).
+CONTEXT="${CONTEXT:-262144}"
 # Requests decoded together. The weights are read once a round for all of them, but more rows route to more experts.
-PARALLEL="${PARALLEL:-4}"
+PARALLEL="${PARALLEL:-2}"
 # Prompt cache (TensorFold's prefix reuse): GiB of kept prompt states; 0 lets the server size it from what is left.
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"
 # The checkpoint's MTP head drafts (and TensorFold's copies): verify windows of the drafted rows. DRAFTS=0: one row at a time.

@@ -11,7 +11,7 @@
 #   Extra args are appended, so they override the defaults below (e.g. --parallel 4 --context 131072).
 #
 # Settings (environment, or bonsai-27b/.env; the environment wins):
-#   TF_VERSION    TensorFold version (default: latest)      PORT         port (default: 8888)
+#   TF_VERSION    TensorFold version (default: v0.6.5, the release the patches target)   PORT   port (default: 8888)
 #   HOST          bind address (default: 0.0.0.0)           SERVED_NAME  model id clients see
 #   NAME          container name (default: tf-bonsai-27b)   FOREGROUND   1: run attached instead of detached
 #   MODEL_ID      target model (default: prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
@@ -51,6 +51,8 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 NAME="${NAME:-tf-bonsai-27b}"
 FOREGROUND="${FOREGROUND:-0}"
+# pinned: the patches apply to v0.6.5 (TensorFold >= 1.0 has no Python engine to patch)
+TF_VERSION="${TF_VERSION:-v0.6.5}"
 
 PATCHES="${PATCHES:-1}"
 KV_DTYPE="${KV_DTYPE:-fp8}"
@@ -107,7 +109,7 @@ if [[ "$KV_POOL_GB" == auto ]]; then
 fi
 [[ "$KV_POOL_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "KV_POOL_GB: auto or a number of GiB, not '$KV_POOL_GB'"
 
-wrapper=(--tf-name "$NAME" --tf-docker-arg=--ulimit=stack=67108864)
+wrapper=(--tf-version "$TF_VERSION" --tf-name "$NAME" --tf-docker-arg=--ulimit=stack=67108864)
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
 if [[ "$PATCHES" == 1 ]]; then
   wrapper+=(--tf-patches "$SCRIPT_DIR/patches")
