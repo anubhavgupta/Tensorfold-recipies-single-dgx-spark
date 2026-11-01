@@ -4,12 +4,15 @@ request that is still waiting or prefilling (a 60K-token agent prompt takes ~2 m
 token after the client hung up: pressing Esc in pi left the GPU busy and pi's next request queued behind it.
 Now the request's thread polls the socket every TENSORFOLD_CANCEL_POLL_S (0.25 s; 0 = stock) while no tokens come,
 and the scheduler worker drops a gone request from the queue, the memory wait, or between prompt passes (the
-MultiDecoder prefill loop also returns between passes once a filling prompt's client has gone). Prefix states the
-prompt already kept stay cached for a resend. Two-rank (tp 2) decoders keep the stock behaviour.
-Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live long prompt aborted mid-prefill.
+MultiDecoder prefill loop also returns between passes once a filling prompt's client has gone).
+A prompt cancelled mid-prefill first fills one more pass to a kept point (never inside an image), so a resend
+resumes there: pi times out after 300 s and resends, and a prompt longer than that (237K tokens at ~710 tok/s)
+would otherwise start over every time. Prefix states already kept stay cached. Two-rank (tp 2) decoders keep the
+stock behaviour.
+Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and live long prompts aborted mid-prefill.
 
 --- tensorfold/cuda/scheduler.py	2026-10-07 16:55:07.000000000 +0530
-+++ tensorfold/cuda/scheduler.py	2026-11-01 12:01:30.065264408 +0530
++++ tensorfold/cuda/scheduler.py	2026-11-01 13:17:16.505150741 +0530
 @@ -3,15 +3,27 @@
  
  from __future__ import annotations
@@ -132,8 +135,8 @@ Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live lon
              self._yield()
              idle = not self.decoder.live() and self.held is None
              first = self.waiting.get() if idle else None                              # idle: wait for a request
---- tensorfold/cuda/server.py	2026-10-20 00:31:25.000000000 +0530
-+++ tensorfold/cuda/server.py	2026-11-01 12:01:30.066545880 +0530
+--- tensorfold/cuda/server.py	2026-11-01 13:19:51.775652565 +0530
++++ tensorfold/cuda/server.py	2026-11-01 13:17:16.505165253 +0530
 @@ -485,6 +485,8 @@
              options["probabilities"] = probabilities
          if takes_stop_eos:
@@ -144,7 +147,7 @@ Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live lon
          think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
          budget = self._think_budget(prepared, think_end)
 --- tensorfold/cuda/streams.py	2026-10-07 16:55:07.000000000 +0530
-+++ tensorfold/cuda/streams.py	2026-11-01 12:01:30.063696024 +0530
++++ tensorfold/cuda/streams.py	2026-11-01 13:17:16.505182805 +0530
 @@ -18,6 +18,7 @@
      stop_eos: bool = True                         # False: an end token does not end it (ignore_eos)
      vision: Any = None
@@ -162,8 +165,8 @@ Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live lon
                        background=self.background, probabilities=self.probabilities,
                        carry=self.stats(), owed=[*self.out, *self.owed])
  
---- tensorfold/families/qwen4_exp/cuda/engine.py	2026-10-20 00:31:25.000000000 +0530
-+++ tensorfold/families/qwen4_exp/cuda/engine.py	2026-11-01 12:01:30.066389592 +0530
+--- tensorfold/families/qwen4_exp/cuda/engine.py	2026-11-01 13:19:51.785153555 +0530
++++ tensorfold/families/qwen4_exp/cuda/engine.py	2026-11-01 13:17:16.508928465 +0530
 @@ -476,7 +476,8 @@
  
      def generate(self, prompt: list[int], max_tokens: int, sampling,
@@ -184,8 +187,8 @@ Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live lon
          hit = self._resume(prompt) if draft else None
          points = None
          if self.tp == 2:                     # rank 0 decodes exactly what it hands rank 1
---- tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-10-20 00:31:25.000000000 +0530
-+++ tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-11-01 12:01:30.065950504 +0530
+--- tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-11-01 13:19:51.785642161 +0530
++++ tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-11-01 13:17:46.651636262 +0530
 @@ -8,6 +8,7 @@
  
  from tensorfold.cuda.logprobs import capture
@@ -194,11 +197,19 @@ Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live lon
  
  from . import image_rows
  from .decode import _gathered_fits, choose_gathered, entry_end, draft, tp_sample_rows
-@@ -27,11 +28,33 @@
+@@ -18,6 +19,7 @@
+ from .prompt_plan import pass_limit
+ 
+ PASS_MIN = 512
++MIN_GAP = 256           # as cuda/markers.py: a kept point closer than this saves too little
+ FILL_GUARD = 8
+ 
+ 
+@@ -27,11 +29,66 @@
  
          ended: list[Stream] = []
          while self.filling:
-+            if self._left_filling():
++            if self._cancellable():
 +                break                                    # back to the scheduler, which drops it (patches/0007)
              ended += self._pass()
              if any(not x.done and not x.waiting for x in self.streams.values()) or self._waiting_request():
@@ -212,10 +223,43 @@ Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live lon
 +            return []
 +        return [s for s in self.filling if s.left is not None and s.left()]
 +
++    def _park(self, s: Stream) -> int | None:
++        """A kept point one pass ahead of a gone prompt's progress, so its resend resumes there; None: none fits.
++
++        A client that times out mid-prefill (pi: 300 s) resends the same prompt; with only the stock points
++        (the system block's end, the last assistant start) the resend would start over and time out again."""
++
++        e, _, start, _ = self.fills[s.sid]
++        if not s.draft:
++            return None                                  # no kept points without drafting (``_point``)
++        end = entry_end(s.prompt)
++        p = start + max(MIN_GAP, self._pass_rows())
++        v = s.vision
++        spans = [] if v is None else [*getattr(v, "image_spans", ()), *getattr(v, "video_spans", ())]
++        for a, b in spans:                               # never inside an image or video: back to its start
++            if a < p < b:
++                p = a
++        if p - start < MIN_GAP or p >= end - MIN_GAP:
++            return None                                  # too close to resume from, or the prompt end comes first
++        if p not in e.stops:
++            e.stops = sorted([*e.stops, p])
++        return p
++
++    def _cancellable(self) -> list[Stream]:
++        """Gone prompts to drop now: those without a kept point to reach first (parked once, then filled to it)."""
++
++        out = []
++        for s in self._left_filling():
++            if not hasattr(s, "parked_at"):
++                s.parked_at = self._park(s)
++            if s.parked_at is None or (self.fills[s.sid][2] >= s.parked_at and self.fills[s.sid][3] is None):
++                out.append(s)
++        return out
++
 +    def cancel_filling(self) -> list[Stream]:
 +        """Stop prompts whose clients left between passes; finish() frees their slots (kept prefixes stay)."""
 +
-+        gone = self._left_filling()
++        gone = self._cancellable()
 +        for s in gone:
 +            s.filled = self.fills[s.sid][2]
 +            s.error, s.done = RequestCancelled("the client left during the prompt"), True

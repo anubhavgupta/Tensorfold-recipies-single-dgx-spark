@@ -37,7 +37,7 @@ here, so the DFlash2 patch can change the same files.
 | `0004-ngram-unpinned.patch` | flash-2 `overlay/ngram`: n-gram tables stay reclaimable page cache | `TENSORFOLD_NGRAM_LOCK_GIB=stock` |
 | `0005-vision-prefix-cache.patch` | flash-2 `overlay/cache`: prefix cache for image/video prompts, elastic kept states (`TENSORFOLD_KEEP_MAX`) | `VISION_CACHE=0` (needs `DRAFTER=none`) |
 | `0006-dflash2-drafter.patch` | DFlash2 drafting for Flash Next (below) | `DRAFTER=none` |
-| `0007-client-cancel.patch` | A request stops when its client leaves (pi's Esc) while queued, held for memory or prefilling, not only once tokens flow. Stock 0.6.6 prefilled the whole prompt first (~2 min for 60K tokens) and pi's next request waited behind it. The request's thread polls the socket every `TENSORFOLD_CANCEL_POLL_S` (0.25 s) | `CLIENT_CANCEL=0` |
+| `0007-client-cancel.patch` | A request stops when its client leaves (pi's Esc) while queued, held for memory or prefilling, not only once tokens flow. Stock 0.6.6 prefilled the whole prompt first (~2 min for 60K tokens) and pi's next request waited behind it. The request's thread polls the socket every `TENSORFOLD_CANCEL_POLL_S` (0.25 s). A prompt cancelled mid-prefill first fills one more pass to a kept point, so pi's resend after its 300 s timeout resumes there instead of starting over (a 237K-token prompt needs ~330 s at ~710 tok/s) | `CLIENT_CANCEL=0` |
 
 `tools/patches/0001-tool-trace.patch` (opt-in tracing without the parser fix) and the diagnostics in `tools/` are
 flash-2's. Run the CPU tests in the image with all patches applied:
