@@ -22,6 +22,8 @@
 #   VISION_CACHE (1: patches/0005, prefix caching for image requests, elastic kept states)
 #   VISION_LIMITS (1: patches/0003, bigger image/video byte limits)
 #   TENSORFOLD_NGRAM_LOCK_GIB (0: patches/0004, n-gram tables left unpinned; stock: pin them all)
+#   CLIENT_CANCEL (1: patches/0007, a request stops when its client leaves, even queued or prefilling; 0: stock)
+#     TENSORFOLD_CANCEL_POLL_S (0.25: how often a request with no tokens yet checks its client)
 #   PORT (8888) HOST (0.0.0.0) NAME (tf-flash-3-exl3) SERVED_NAME (Qwen3.8-Flash-Next) FOREGROUND (0)
 # The enabled patches are copied to runtime/patches; ../tensorfold.sh builds an image for each distinct set.
 # Not available for EXL3 packs: --ple-on-ssd, --tp 2. Logs: docker logs -f tf-flash-3-exl3   Stop: ./flash-3/end.sh
@@ -136,6 +138,7 @@ if [[ "$DRAFTER" != none ]]; then                          # 0006 builds on 0005
   [[ "${VISION_CACHE:-1}" == 1 ]] || { echo "the DFlash2 patch (0006) needs patches/0005: VISION_CACHE=0 needs DRAFTER=none" >&2; exit 1; }
   _use "$SCRIPT_DIR/patches/0006-dflash2-drafter.patch"
 fi
+[[ "${CLIENT_CANCEL:-1}" != 1 ]] || _use "$SCRIPT_DIR/patches/0007-client-cancel.patch"
 
 wrapper=(--tf-name "$NAME" --tf-version "$TF_VERSION" --tf-docker-arg=--ulimit=stack=67108864 --tf-patches "$RUNTIME_PATCHES")
 _cuda=/usr/local/lib/python3.12/dist-packages/tensorfold/cuda

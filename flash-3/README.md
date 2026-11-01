@@ -37,6 +37,7 @@ here, so the DFlash2 patch can change the same files.
 | `0004-ngram-unpinned.patch` | flash-2 `overlay/ngram`: n-gram tables stay reclaimable page cache | `TENSORFOLD_NGRAM_LOCK_GIB=stock` |
 | `0005-vision-prefix-cache.patch` | flash-2 `overlay/cache`: prefix cache for image/video prompts, elastic kept states (`TENSORFOLD_KEEP_MAX`) | `VISION_CACHE=0` (needs `DRAFTER=none`) |
 | `0006-dflash2-drafter.patch` | DFlash2 drafting for Flash Next (below) | `DRAFTER=none` |
+| `0007-client-cancel.patch` | A request stops when its client leaves (pi's Esc) while queued, held for memory or prefilling, not only once tokens flow. Stock 0.6.6 prefilled the whole prompt first (~2 min for 60K tokens) and pi's next request waited behind it. The request's thread polls the socket every `TENSORFOLD_CANCEL_POLL_S` (0.25 s) | `CLIENT_CANCEL=0` |
 
 `tools/patches/0001-tool-trace.patch` (opt-in tracing without the parser fix) and the diagnostics in `tools/` are
 flash-2's. Run the CPU tests in the image with all patches applied:
@@ -45,7 +46,7 @@ flash-2's. Run the CPU tests in the image with all patches applied:
 cd flash-3 && docker run --rm --network none --entrypoint bash -v "$PWD:/recipe:ro" tensorfold:v0.6.6 -c \
   'cd /usr/local/lib/python3.12/dist-packages && for p in /recipe/patches/*.patch; do patch -p0 -s < $p || exit 1; done &&
    cp /recipe/tools/tool_trace.py /recipe/tools/tool_calls.py tensorfold/cuda/ &&
-   PYTHONDONTWRITEBYTECODE=1 python3 /recipe/tools/test_tool_calls.py'
+   PYTHONDONTWRITEBYTECODE=1 python3 /recipe/tools/test_tool_calls.py && python3 /recipe/tools/test_client_cancel.py'
 ```
 
 See `docs/flash-2-overlays.md` for how the tool-call defects were found and what the parser fix does. That

@@ -1,0 +1,230 @@
+Stop a request as soon as its client leaves, even while it is queued, held for memory or prefilling.
+Stock 0.6.6 CUDA serving notices a closed connection only when the request's thread receives tokens, so a
+request that is still waiting or prefilling (a 60K-token agent prompt takes ~2 minutes here) runs to its first
+token after the client hung up: pressing Esc in pi left the GPU busy and pi's next request queued behind it.
+Now the request's thread polls the socket every TENSORFOLD_CANCEL_POLL_S (0.25 s; 0 = stock) while no tokens come,
+and the scheduler worker drops a gone request from the queue, the memory wait, or between prompt passes (the
+MultiDecoder prefill loop also returns between passes once a filling prompt's client has gone). Prefix states the
+prompt already kept stay cached for a resend. Two-rank (tp 2) decoders keep the stock behaviour.
+Verified: fake-decoder test (flash-3/tools/test_client_cancel.py) and a live long prompt aborted mid-prefill.
+
+--- tensorfold/cuda/scheduler.py	2026-10-07 16:55:07.000000000 +0530
++++ tensorfold/cuda/scheduler.py	2026-11-01 12:01:30.065264408 +0530
+@@ -3,15 +3,27 @@
+ 
+ from __future__ import annotations
+ 
++import heapq
+ import itertools
++import os
+ import queue
+ import threading
+ from typing import Any, Callable
+ 
++from tensorfold.server.cancellation import RequestCancelled
++
+ from .memory_gate import NoRoom
+ from .streams import Stream
+ 
+ 
++# patches/0007: how often a request's thread checks its client while no tokens come (queued, held or prefilling)
++POLL_S = float(os.environ.get("TENSORFOLD_CANCEL_POLL_S", "0.25"))
++
++
++def _left(stream: Stream) -> bool:
++    return stream.left is not None and stream.left()
++
++
+ class Waiting(queue.PriorityQueue):
+     """(stream, box) pairs in arrival order, background streams after every other."""
+ 
+@@ -39,6 +51,17 @@
+ 
+         super().put((2, next(self._order), None))
+ 
++    def take_left(self) -> list:
++        """Remove and return the (stream, box) pairs whose clients have gone."""
++
++        with self.mutex:
++            gone = [e for e in self.queue if e[2] is not None and _left(e[2][0])]
++            if gone:
++                self.queue[:] = [e for e in self.queue if not (e[2] is not None and _left(e[2][0]))]
++                heapq.heapify(self.queue)
++                self.not_full.notify_all()
++        return [e[2] for e in gone]
++
+     def foreground(self) -> bool:
+         """Whether a foreground request waits."""
+ 
+@@ -68,22 +91,35 @@
+ 
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+-               constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+-        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
++               constraint: Any = None, background: bool = False, probabilities: Any = None,
++               cancelled: Callable[[], bool] | None = None) -> dict:
++        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats.
++
++        ``cancelled()`` (patches/0007) is polled while no tokens come: once it holds, the worker drops the request
++        from the queue, the memory wait or its prompt passes (a decoding one stops after its next round)."""
+ 
+         box: queue.Queue = queue.Queue()
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+                         constraint=constraint, background=background, probabilities=probabilities)
+         cancel = [False]
+         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
++        if cancelled is not None and POLL_S > 0:
++            stream.left = lambda: cancel[0]
+         self.waiting.put((stream, box))
+         while True:
+-            kind, value = box.get()
++            try:
++                kind, value = box.get(timeout=POLL_S if stream.left is not None and not cancel[0] else None)
++            except queue.Empty:
++                if cancelled():
++                    cancel[0] = True                 # the worker sees it through stream.left
++                continue
+             if kind == "tokens":
+                 if not cancel[0] and emit(value):
+                     cancel[0] = True                 # the client left: the stream ends after its next round
+             elif kind == "error":
+                 raise value
++            elif cancel[0] and stream.left is not None:
++                raise RequestCancelled("the client left during the reply")
+             else:
+                 return value
+ 
+@@ -126,6 +162,9 @@
+                     stream, box = self.waiting.get_nowait()
+                 except queue.Empty:
+                     break
++            if _left(stream):
++                box.put(("error", RequestCancelled("the client left before the request started")))
++                continue
+             self.boxes[id(stream)] = box
+             try:
+                 self.decoder.admit(stream)
+@@ -163,8 +202,26 @@
+         if box is not None:
+             box.put((kind, value))
+ 
++    def _sweep(self) -> None:
++        """Drop requests whose clients have gone: queued, held for memory, or between prompt passes."""
++
++        for stream, box in self.waiting.take_left():
++            box.put(("error", RequestCancelled("the client left before the request started")))
++        if self.held is not None and _left(self.held[0]):
++            (_, box), self.held = self.held, None
++            box.put(("error", RequestCancelled("the client left before the request started")))
++        cancel = getattr(self.decoder, "cancel_filling", None)
++        gone = cancel() if cancel is not None else []
++        if gone:
++            self.decoder.finish(gone)
++            for s in gone:
++                print(f"[tensorfold] cancelled a prompt at {s.filled}/{len(s.prompt)} tokens: the client left",
++                      flush=True)
++                self._reply(s, "error", s.error)
++
+     def _loop(self) -> None:
+         while True:
++            self._sweep()
+             self._yield()
+             idle = not self.decoder.live() and self.held is None
+             first = self.waiting.get() if idle else None                              # idle: wait for a request
+--- tensorfold/cuda/server.py	2026-10-20 00:31:25.000000000 +0530
++++ tensorfold/cuda/server.py	2026-11-01 12:01:30.066545880 +0530
+@@ -485,6 +485,8 @@
+             options["probabilities"] = probabilities
+         if takes_stop_eos:
+             options["stop_eos"] = not prepared.ignore_eos
++        if cancelled is not None and "cancelled" in inspect.signature(self.engine.generate).parameters:
++            options["cancelled"] = cancelled        # patches/0007: a queued or prefilling request stops too
+         shaped = prepared.grammar is not None or prepared.think_budget > 0
+         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
+         budget = self._think_budget(prepared, think_end)
+--- tensorfold/cuda/streams.py	2026-10-07 16:55:07.000000000 +0530
++++ tensorfold/cuda/streams.py	2026-11-01 12:01:30.063696024 +0530
+@@ -18,6 +18,7 @@
+     stop_eos: bool = True                         # False: an end token does not end it (ignore_eos)
+     vision: Any = None
+     emit: Callable[[list[int]], bool | None] | None = None
++    left: Callable[[], bool] | None = None        # True once the request's client has gone (patches/0007)
+     sid: int = 0
+     st: Any = None                                # the committed model state
+     snap: Any = None                              # the drafter's context
+@@ -80,7 +81,7 @@
+     def continued(self) -> "Stream":
+         """This stream again from its prompt, for later (as the Mac replays): what it sent is owed, not sent again."""
+ 
+-        return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit,
++        return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit, left=self.left,
+                       background=self.background, probabilities=self.probabilities,
+                       carry=self.stats(), owed=[*self.out, *self.owed])
+ 
+--- tensorfold/families/qwen4_exp/cuda/engine.py	2026-10-20 00:31:25.000000000 +0530
++++ tensorfold/families/qwen4_exp/cuda/engine.py	2026-11-01 12:01:30.066389592 +0530
+@@ -476,7 +476,8 @@
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling,
+                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
+-                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None) -> dict[str, Any]:
++                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None,
++                 cancelled=None) -> dict[str, Any]:
+         """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones."""
+ 
+         max_tokens = self._limit(prompt, max_tokens)
+@@ -493,7 +494,8 @@
+             return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
+                                          **grammar, **({"background": True} if background else {}),
+                                          probabilities=probabilities,
+-                                         **({"vision": vision} if vision is not None else {}))
++                                         **({"vision": vision} if vision is not None else {}),
++                                         **({"cancelled": cancelled} if cancelled is not None else {}))
+         hit = self._resume(prompt) if draft else None
+         points = None
+         if self.tp == 2:                     # rank 0 decodes exactly what it hands rank 1
+--- tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-10-20 00:31:25.000000000 +0530
++++ tensorfold/families/qwen4_exp/cuda/multi_fill.py	2026-11-01 12:01:30.065950504 +0530
+@@ -8,6 +8,7 @@
+ 
+ from tensorfold.cuda.logprobs import capture
+ from tensorfold.cuda.streams import Stream
++from tensorfold.server.cancellation import RequestCancelled
+ 
+ from . import image_rows
+ from .decode import _gathered_fits, choose_gathered, entry_end, draft, tp_sample_rows
+@@ -27,11 +28,33 @@
+ 
+         ended: list[Stream] = []
+         while self.filling:
++            if self._left_filling():
++                break                                    # back to the scheduler, which drops it (patches/0007)
+             ended += self._pass()
+             if any(not x.done and not x.waiting for x in self.streams.values()) or self._waiting_request():
+                 break
+         return ended
+ 
++    def _left_filling(self) -> list[Stream]:
++        """Filling prompts whose clients have gone; none on two ranks, whose passes the leader and follower agree."""
++
++        if getattr(self, "link", None) is not None or getattr(self, "follower", None) is not None:
++            return []
++        return [s for s in self.filling if s.left is not None and s.left()]
++
++    def cancel_filling(self) -> list[Stream]:
++        """Stop prompts whose clients left between passes; finish() frees their slots (kept prefixes stay)."""
++
++        gone = self._left_filling()
++        for s in gone:
++            s.filled = self.fills[s.sid][2]
++            s.error, s.done = RequestCancelled("the client left during the prompt"), True
++            self.filling.remove(s)
++            self.fills.pop(s.sid)
++            self.passed.pop(s.sid, None)
++            image_rows.finish(s.st)
++        return gone
++
+     def _pass_rows(self) -> int:
+         """A round's prompt rows: its decode (a round alone) takes ``share`` of the pass's time, by the last rounds."""
+ 
