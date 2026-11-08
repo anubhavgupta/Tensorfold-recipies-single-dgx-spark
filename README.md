@@ -273,12 +273,3 @@ greedy, thinking off):
 Prefill 2,360-2,490 tok/s up to 8K, 2,156 at 31K, 1,443 at 98K; one stream decodes at 51.8 tok/s at a 245K depth
 (SGLang 39.0); four 245K prompts at once finish in 1,138 s. Ready in ~60 s. Details: `ornith-122b-2/README.md`.
 
-### DeepSeek-V4.1-Flash-1017 SAGE EXL3 1.62bpw on vLLM (`ds4.1-flash-1017/scripts/serve.sh`)
-
-A copy of [vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe](https://github.com/vcruz305/DSV4.1-Flash-1017-EXL3-Spark-recipe)
-(vLLM with EXL3 experts, a cold-expert alias side file read from NVMe, DSpark k=5), set up on this Spark for one stream
-at a 229,376-token window: OpenAI API on port 8888, model `dsv41`. Short-prompt decode 41.3 tok/s (128 ms/step,
-4.9 tok/step); a 225K prompt prefills at 725 tok/s and decodes at 28.7 tok/s with the needle found. Local changes
-(base image rebuilt from spark-ds41f, no-sudo helpers, a 0.5 GiB KV pool for this box's memory) are listed at the top
-of `ds4.1-flash-1017/README.md`.
-
