@@ -23,6 +23,10 @@ The vision tower needs the one-time conversion described in `start.sh` (the same
 environment variables or `.env` lines, listed at the top of `start.sh`. The main ones are `DRAFTS` (7),
 `DRAFT_CONFIDENCE` (0.5), `PARALLEL` (9; DFlash2 needs at least 2), `CONTEXT` (262144) and `KV_DTYPE` (int8).
 
+To have the server come up by itself at boot instead of being started by hand, see `docs/autostart.md` (the unit in
+`systemd/tensorfold-flash-3.service`, why `--restart=unless-stopped` cannot work here, and every way to stop or disable
+it again).
+
 ## Patches (TensorFold 0.6.6)
 
 `start.sh` copies the enabled patches into `runtime/patches` (Git-ignored). `../tensorfold.sh --tf-patches` then

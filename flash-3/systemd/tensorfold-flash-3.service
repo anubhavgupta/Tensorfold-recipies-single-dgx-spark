@@ -1,0 +1,62 @@
+# Auto-start the flash-3 EXL3 server (Qwen3.8-Flash-Next) on this machine at boot.
+#
+# Install: ~/projects/tensorfold/flash-3/systemd/install-autostart.sh [--dry-run|--now], or by hand:
+#   sudo cp ~/projects/tensorfold/flash-3/systemd/tensorfold-flash-3.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable tensorfold-flash-3.service        # add --now to start it as well
+# Check:
+#   systemctl status tensorfold-flash-3
+#   journalctl -u tensorfold-flash-3 -f
+#   curl -s localhost:8888/health
+# Stop / disable:
+#   sudo systemctl stop tensorfold-flash-3        # same effect as ./flash-3/end.sh
+#   sudo systemctl disable tensorfold-flash-3
+#
+# All tuning stays in flash-3/.env and flash-3/start.sh; this unit only sets HOME and FOREGROUND.
+# Why each line is there, the no-root alternatives and the troubleshooting table: docs/autostart.md
+
+[Unit]
+Description=TensorFold flash-3 server (Qwen3.8-Flash-Next EXL3) on :8888
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# a permanently broken setup (missing pack, bad .env) must not restart forever
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gb10
+Group=gb10
+WorkingDirectory=/home/gb10/projects/tensorfold/flash-3
+Environment=HOME=/home/gb10
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# keep start.sh in the foreground (it then skips --tf-detach) so systemd owns the container:
+# systemctl stop sends SIGTERM to `docker run`, which stops the container, and its --rm flag removes it
+Environment=FOREGROUND=1
+
+# the daemon and the GPU stack can come up after this unit; wait up to 10 min for both before starting
+# (no shell variables in here on purpose: systemd expands $FOO in ExecStart* lines itself)
+ExecStartPre=/usr/bin/timeout 600 /bin/sh -c 'until docker info >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; do sleep 5; done'
+# start.sh refuses to start while the container still exists, so clear any leftover first
+ExecStartPre=-/home/gb10/projects/tensorfold/flash-3/end.sh
+ExecStart=/home/gb10/projects/tensorfold/flash-3/start.sh
+
+# a changed patch set rebuilds a 24.6 GB image, and a 262K-context load takes minutes
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=60
+# stopping the container by hand (./flash-3/end.sh or docker stop) makes `docker run` exit 143 (SIGTERM);
+# count that as a clean exit so Restart=on-failure does not bring the server back 60 s later
+SuccessExitStatus=143
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tensorfold-flash-3
+
+# Optional: only report "started" once the API answers, so a failed load counts as a failure
+# (then drop TimeoutStartSec to something like 3600).
+# ExecStartPost=/usr/bin/timeout 3600 /bin/sh -c 'until curl -sf --max-time 5 localhost:8888/health >/dev/null; do sleep 5; done'
+
+[Install]
+WantedBy=multi-user.target
