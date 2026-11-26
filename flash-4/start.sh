@@ -8,7 +8,7 @@
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit
 #   FOREGROUND=1 ./start.sh            # run the container in the foreground (what the systemd unit does)
 # Settings (environment or ./.env, defaults in scripts/config.sh):
-#   serving  CONTEXT (262144), PARALLEL (4; at most 5 whole windows fit), KV_PAGES (256; 0 = whole windows: streams beside the first share one pool of
+#   serving  CONTEXT (262144), PARALLEL (8; 8 whole windows fit, 9 with VISION_IMAGE_TOKENS 16384), KV_PAGES (256; 0 = whole windows: streams beside the first share one pool of
 #            pages of this many rows, e.g. 256, so more streams than whole windows are admitted while memory lasts), DRAFTER
 #            (dflash|mtp|none; default dflash), VISION (1), VISION_MAX_IMAGES (50), VISION_IMAGE_TOKENS (65536), THINKING (1), MAX_TOKENS,
 #            TEMPERATURE/TOP_P/TOP_K, PROMPT_CACHE_GIB (0: the memory left), TENSORFOLD_MEMORY_RESERVE_GIB (2), PORT, SERVED_NAME

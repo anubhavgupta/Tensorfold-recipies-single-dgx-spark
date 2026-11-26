@@ -45,7 +45,7 @@ SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 CONTEXT="${CONTEXT:-262144}"
-PARALLEL="${PARALLEL:-4}"                       # full-window streams; 5 fit (7.9 GiB each); KV_PAGES shares the memory of more
+PARALLEL="${PARALLEL:-8}"                       # 8 full 262K windows fit beside the model (4.9-5.1 GiB each, fp8 KV); 9 only with VISION_IMAGE_TOKENS<=16384
 KV_PAGES="${KV_PAGES:-256}"                     # >0: streams beside the first take pages of this many rows from one pool (TF_FLASHNEXT_KV_PAGES)
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"       # 0: what is left after the streams
 VISION="${VISION:-1}"
