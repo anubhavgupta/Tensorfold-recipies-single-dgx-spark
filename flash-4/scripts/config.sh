@@ -46,11 +46,11 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 CONTEXT="${CONTEXT:-262144}"
 PARALLEL="${PARALLEL:-4}"                       # full-window streams; 5 fit (7.9 GiB each); KV_PAGES shares the memory of more
-KV_PAGES="${KV_PAGES:-0}"                       # >0: streams beside the first take pages of this many rows from one pool (TF_FLASHNEXT_KV_PAGES)
+KV_PAGES="${KV_PAGES:-256}"                     # >0: streams beside the first take pages of this many rows from one pool (TF_FLASHNEXT_KV_PAGES)
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"       # 0: what is left after the streams
 VISION="${VISION:-1}"
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"
-VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-36100}"   # shared by a request's images, each 722 tokens at 50 (fixed share keeps the prefix cache)
+VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-65536}"   # shared by a request's images, each 722 tokens at 50 up to the 65,536 maximum (fixed share keeps the prefix cache)
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 THINKING="${THINKING:-1}"
 if [[ "$THINKING" == 1 ]]; then _t=1.0; _p=0.95; else _t=0.7; _p=0.80; fi
