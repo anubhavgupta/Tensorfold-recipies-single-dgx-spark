@@ -1,0 +1,1383 @@
+Flash Next EXL3 packs (turboderp's) on the native CUDA engine: dense projections (stitched DeltaNet and attention inputs, the head, the MTP head's fc layers) on the EXL3 linear, routed experts with the shared expert as expert 512 on the grouped EXL3 kernels, the f16 tensors the pack leaves unquantized as bf16 (hyper-connections, router, in_proj_a/b, n-gram key/value projections), the consolidated n-gram table (one int16 trellis, ExLlamaV3's ngram_dequant row codec, decoded on the host), the MTP head with its draft vocabulary decoded through the EXL3 head. New files cuda_exl3_*.zig beside the family's loader; config.json quant_method exl3 is admitted; format "exl3". Verified: greedy replies with and without MTP drafts hash the same.
+
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index b54464a..52681a1 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -16,6 +16,8 @@ const batch_lanes = @import("cuda_batch_lanes.zig");
+ const tiles = @import("cuda_tiles.zig");
+ const tk = @import("cuda_tile_kernels.zig");
+ const moe_native = @import("cuda_moe_native.zig");
++const exl3_lane = @import("cuda_exl3_lane.zig");
++const exl3_moe = @import("cuda_exl3_moe.zig");
+ const zs = @import("cuda_zero_slice.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const split_lane = @import("cuda_split_lane.zig");
+@@ -128,6 +130,10 @@ pub fn Pass(comptime Tri: type) type {
+ 
+         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
+         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
++            if (w.exl3) |g| {
++                if (part == self.s.part and sk > 1) self.s.part_zero = false;
++                return exl3_lane.run(self, g, x, out, part, m, sk);
++            }
+             if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk)) |one| return one;
+             return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
+         }
+@@ -450,6 +456,7 @@ pub fn Pass(comptime Tri: type) type {
+             const e = experts_n + 1;
+             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+             if (lw.native_experts) |*native| return moe_native.run(self, native, n, pairs, plan);
++            if (lw.exl3_experts) |*x| return exl3_moe.run(self, self.k.exl3 orelse return error.FormatNotLoaded, x, n, plan);
+             if (n >= 64) {
+                 // prompt rows on 64-pair factored tiles, expert_rows' bits
+                 try self.k.router.route(self.stream, s.picks, pairs, e, tk.fexp_tile, plan);
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 2d8ff01..6733345 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -59,6 +59,8 @@ pub const Forms = struct {
+ 
+ pub const Kernels = struct {
+     forms: Forms = .{},
++    /// An EXL3 checkpoint's kernels (cuda_exl3_kit.zig), owned by the engine; null for the other formats.
++    exl3: ?*@import("cuda_exl3_kit.zig").Kit = null,
+     qmm: cuda.Module,
+     experts: cuda.Module,
+     rows: cuda.Module,
+@@ -101,6 +103,7 @@ pub const Kernels = struct {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         const tile_mode = try cuda.experts_tile.mode(if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE")) |v| std.mem.span(v) else null);
+         var k: Kernels = undefined;
++        k.exl3 = null;
+         k.forms = Forms.resolve();
+         k.expert_tile = null;
+         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 49b3522..d94e883 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -237,6 +237,11 @@ pub const Sizes = sizes.Sizes;
+ const hcPartRows = sizes.hcPartRows;
+ const partRows = sizes.partRows;
+ 
++fn exl3_tmp_bytes(cap: usize) usize {
++    const lane = @import("cuda_exl3_group.zig");
++    return @min(cap, lane.block_rows) * lane.widest * 2;
++}
++
+ /// Device scratch for chunks of up to `cap` rows.
+ pub const Scratch = struct {
+     cap: usize,
+@@ -255,6 +260,8 @@ pub const Scratch = struct {
+     hc_part: u64 = 0,
+     hc_up: u64 = 0,
+     native_part: u64 = 0,
++    /// An EXL3 stitched projection's temporary: one part's block of rows (cuda_exl3_lane.zig); 0: none.
++    exl3_tmp: u64 = 0,
+     act: u64 = 0,
+     xs_act: u64 = 0,
+     inj: u64 = 0,
+@@ -401,6 +408,7 @@ pub const Scratch = struct {
+         n += cap * wide * 2 * 2 + cap * streams * 4 + vocab * 2 + head_rows * vocab + half * 4 + 4096;
+         n += (cap + 1) * dims * 4 + cap * pocket_stride * 4;
+         n += cap * out_k * 4 + cap * dims * 6;
++        if (z.exl3) n += exl3_tmp_bytes(cap);
+         return n;
+     }
+ 
+@@ -426,6 +434,7 @@ pub const Scratch = struct {
+         s.hc_part = try s.add(gpa, d, s.hc_part_bytes);
+         s.hc_up = try s.add(gpa, d, cap * wide * 2);
+         if (z.lane_reduce) s.native_part = try s.add(gpa, d, 8 * cap * dims * 4);
++        if (z.exl3) s.exl3_tmp = try s.add(gpa, d, exl3_tmp_bytes(cap));
+         s.act = try s.add(gpa, d, cap * low * 2);
+         s.xs_act = try s.add(gpa, d, cap * (low / 32) * 4);
+         s.inj = try s.add(gpa, d, cap * streams * 2);
+diff --git a/zig/src/families/flashnext/cuda_config.zig b/zig/src/families/flashnext/cuda_config.zig
+index 732af96..7ea476c 100644
+--- a/zig/src/families/flashnext/cuda_config.zig
++++ b/zig/src/families/flashnext/cuda_config.zig
+@@ -118,7 +118,13 @@ fn geometry(text: std.json.ObjectMap) ?[]const u8 {
+     return semantics(text);
+ }
+ 
+-pub const Mode = enum { affine, modelopt };
++pub const Mode = enum { affine, modelopt, exl3 };
++
++/// turboderp's EXL3 pack: quantization_config.quant_method is "exl3", beside the shapes every Flash Next shares.
++fn exl3Mismatch(text: std.json.ObjectMap, quant: std.json.ObjectMap) ?[]const u8 {
++    if (!holds(quant.get("quant_method") orelse return "quantization_config.quant_method", .{ .word = "exl3" })) return "quantization_config.quant_method";
++    return geometry(text);
++}
+ 
+ fn projection(q: std.json.ObjectMap, name: []const u8, algo: []const u8, group: i64) bool {
+     const p = object(q, name) orelse return false;
+@@ -223,8 +229,10 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Checked {
+     const root = parsed.value.object;
+     const text = textOf(root);
+     const quant = if (root.get("quantization")) |v| (if (v == .object) v.object else null) else null;
+-    const selected: Mode = if (quant != null) .affine else .modelopt;
+-    var field = if (selected == .affine) mismatch(text, quant) else if (object(root, "quantization_config")) |q| modeloptMismatch(text, q) else "quantization";
++    const qc = object(root, "quantization_config");
++    const is_exl3 = if (qc) |q| holds(q.get("quant_method") orelse .null, .{ .word = "exl3" }) else false;
++    const selected: Mode = if (quant != null) .affine else if (is_exl3) .exl3 else .modelopt;
++    var field = if (selected == .affine) mismatch(text, quant) else if (qc) |q| (if (selected == .exl3) exl3Mismatch(text, q) else modeloptMismatch(text, q)) else "quantization";
+     if (field == null) if (given(root, "tie_word_embeddings")) |v| if (!holds(v, .{ .flag = false })) {
+         field = "tie_word_embeddings";
+     };
+diff --git a/zig/src/families/flashnext/cuda_exl3_group.zig b/zig/src/families/flashnext/cuda_exl3_group.zig
+new file mode 100644
+index 0000000..0eb1d6d
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_group.zig
+@@ -0,0 +1,66 @@
++//! An EXL3 checkpoint's projection as the engine holds it: one or more parts side by side in the output columns
++//! (a stitched DeltaNet or attention input is EXL3 trellises for the big parts and a plain bf16 matrix for the rest).
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const max_parts = 4;
++/// Rows a stitched projection's parts go through at once: the temporary holds one part's block of rows.
++pub const block_rows: usize = 1024;
++/// The widest part of any stitched projection (the attention q|gate).
++pub const widest: usize = 12288;
++
++/// One output block of a projection: an EXL3 trellis weight, or a small plain bf16 matrix on the lane.
++pub const Part = struct {
++    kind: enum { trellis, plain },
++    w: cuda.exl3.Weight = undefined,
++    plain: cuda.qmmf.Weight = undefined,
++    /// The first output column this part writes, and how many columns it has.
++    col: usize,
++    n: usize,
++};
++
++/// The device buffers of a group (the trellises, scales and plain matrices), freed together with it.
++pub const Group = struct {
++    gpa: std.mem.Allocator,
++    parts: [max_parts]Part = undefined,
++    count: usize = 0,
++    n: usize,
++    k: usize,
++    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++
++    pub fn create(gpa: std.mem.Allocator, n: usize, k: usize) !*Group {
++        const g = try gpa.create(Group);
++        g.* = .{ .gpa = gpa, .n = n, .k = k };
++        return g;
++    }
++
++    pub fn destroy(g: *Group) void {
++        for (g.bufs.items) |*b| b.free();
++        g.bufs.deinit(g.gpa);
++        g.gpa.destroy(g);
++    }
++
++    /// `bytes` on the device, owned by the group.
++    pub fn put(g: *Group, d: *const cuda.Driver, bytes: []const u8) !u64 {
++        try g.bufs.ensureUnusedCapacity(g.gpa, 1);
++        const b = try cuda.DeviceBuffer.fromHost(d, bytes);
++        g.bufs.appendAssumeCapacity(b);
++        return b.ptr;
++    }
++
++    pub fn add(g: *Group, part: Part) !void {
++        if (g.count == max_parts) return error.UnexpectedTensor;
++        g.parts[g.count] = part;
++        g.count += 1;
++    }
++
++    /// Every output column is covered once, in order.
++    pub fn check(g: *const Group) !void {
++        var at: usize = 0;
++        for (g.parts[0..g.count]) |p| {
++            if (p.col != at) return error.UnexpectedTensor;
++            at += p.n;
++        }
++        if (at != g.n) return error.UnexpectedTensor;
++    }
++};
+diff --git a/zig/src/families/flashnext/cuda_exl3_kit.zig b/zig/src/families/flashnext/cuda_exl3_kit.zig
+new file mode 100644
+index 0000000..471ec1b
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_kit.zig
+@@ -0,0 +1,38 @@
++//! The EXL3 kernels beside the engine's own: dense rows, the grouped experts, and their shared scratch.
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const Kit = struct {
++    gpa: std.mem.Allocator,
++    dense: cuda.exl3.Dense,
++    experts: cuda.exl3_experts.Experts,
++    grouped: cuda.exl3_grouped.Grouped,
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver) !*Kit {
++        const k = try gpa.create(Kit);
++        errdefer gpa.destroy(k);
++        k.gpa = gpa;
++        k.dense = try cuda.exl3.Dense.load(d);
++        errdefer k.dense.unload();
++        k.experts = try cuda.exl3_experts.Experts.load(d);
++        errdefer k.experts.unload();
++        k.grouped = .{ .d = d, .kernels = &k.experts };
++        return k;
++    }
++
++    pub fn deinit(k: *Kit) void {
++        k.grouped.deinit();
++        k.experts.unload();
++        k.dense.unload();
++        k.gpa.destroy(k);
++    }
++
++    /// The grouped experts' scratch for `bytes`, allocated now: a graph capture later allocates nothing.
++    pub fn reserveExperts(k: *Kit, d: *const cuda.Driver, bytes: usize) !void {
++        if (k.grouped.storage) |*b| {
++            if (b.len >= bytes) return;
++            b.free();
++        }
++        k.grouped.storage = try cuda.DeviceBuffer.alloc(d, bytes);
++    }
++};
+diff --git a/zig/src/families/flashnext/cuda_exl3_lane.zig b/zig/src/families/flashnext/cuda_exl3_lane.zig
+new file mode 100644
+index 0000000..4a34c0b
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_lane.zig
+@@ -0,0 +1,46 @@
++//! Rows through an EXL3 projection into `out` (bf16) or `part` (fp32), each part of a stitched one into its columns.
++const std = @import("std");
++const cuda = @import("cuda");
++const grp = @import("cuda_exl3_group.zig");
++const ops = @import("cuda_batch_ops.zig");
++
++const block_rows = grp.block_rows;
++
++/// Rows from which the dense weights take the prompt path (the same bits as the decode path's).
++const prompt_rows: usize = 64;
++
++fn decodeRows(kit: anytype, stream: cuda.Stream, w: cuda.exl3.Weight, x: u64, m: usize, y: u64, dtype: cuda.exl3.DType) !void {
++    if (m >= prompt_rows) return kit.dense.prompt(stream, w, x, .bf16, m, y, dtype);
++    return kit.dense.decode(stream, w, x, .bf16, m, y, dtype);
++}
++
++/// The slices written to `part` (always 1: an EXL3 projection sums its own K), or the one bf16 block in `out`.
++pub fn run(self: anytype, g: *const grp.Group, x: u64, out: u64, part: u64, m: usize, sk: usize) !usize {
++    const kit = self.k.exl3 orelse return error.FormatNotLoaded;
++    const stream = self.stream;
++    if (g.count == 1 and g.parts[0].kind == .trellis) {
++        const w = g.parts[0].w;
++        if (sk == 1) {
++            try decodeRows(kit, stream, w, x, m, out, .bf16);
++        } else {
++            try decodeRows(kit, stream, w, x, m, part, .f32);
++        }
++        return 1;
++    }
++    if (sk != 1 or out == 0) return error.UnexpectedTensor;
++    const tmp = self.s.exl3_tmp;
++    if (tmp == 0) return error.UnexpectedTensor;
++    var r0: usize = 0;
++    while (r0 < m) : (r0 += block_rows) {
++        const rows = @min(block_rows, m - r0);
++        const xr = x + r0 * g.k * 2;
++        for (g.parts[0..g.count]) |p| {
++            switch (p.kind) {
++                .trellis => try decodeRows(kit, stream, p.w, xr, rows, tmp, .bf16),
++                .plain => try self.k.nativeMatmul(stream, xr, g.k, rows, p.plain, tmp, self.s.native_part, .bf16),
++            }
++            try ops.copyCols(self.k, stream, tmp, p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++        }
++    }
++    return 1;
++}
+diff --git a/zig/src/families/flashnext/cuda_exl3_load.zig b/zig/src/families/flashnext/cuda_exl3_load.zig
+new file mode 100644
+index 0000000..02c5d1d
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_load.zig
+@@ -0,0 +1,300 @@
++//! Loading an EXL3 pack (turboderp's Flash Next quantization): its trellis projections, the grouped experts with the
++//! shared expert as expert 512, and the plain f16 tensors the pack leaves unquantized, as the engine's types.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const wt = @import("cuda_prompt_wt.zig");
++const grp = @import("cuda_exl3_group.zig");
++const kit_mod = @import("cuda_exl3_kit.zig");
++const moe = @import("cuda_exl3_moe.zig");
++const projection = @import("cuda_projection.zig");
++
++const Tensor = core.safetensors.Tensor;
++const Store = wt.Store;
++const mul1_magic: u32 = 0x83DCD12D;
++const mcg_magic: u32 = 0xCBAC1FED;
++
++const dims = wt.dims;
++const experts_n = wt.experts_n;
++const moe_w = wt.moe_w;
++
++/// Whether the pack under `store` is EXL3: layer 0's input projection has a trellis.
++pub fn isExl3(store: *const Store) bool {
++    return store.has("language_model.model.layers.0.linear_attn.in_proj_qkv.trellis");
++}
++
++/// One EXL3 group's tensors, held mapped until the store releases them.
++const Info = struct { trellis: Tensor, suh: Tensor, svh: Tensor, halves: u32, codebook: cuda.exl3.Codebook, n: usize, k: usize };
++
++fn info(store: *Store, base: []const u8) !Info {
++    var buf: [256]u8 = undefined;
++    const t = try store.holdAhead(try std.fmt.bufPrint(&buf, "{s}.trellis", .{base}));
++    if (t.dtype != .i16 or t.rank != 3 or t.dim(2) % 8 != 0) return error.UnexpectedTensor;
++    const halves = t.dim(2) / 8;
++    if (halves < 2 or halves > 16) return error.UnsupportedQuantization;
++    const k = t.dim(0) * 16;
++    const n = t.dim(1) * 16;
++    if (k % 128 != 0 or n % 128 != 0 or t.bytes.len != t.numel() * 2) return error.UnexpectedTensor;
++    var codebook: cuda.exl3.Codebook = .inst3;
++    const mul1 = store.has(try std.fmt.bufPrint(&buf, "{s}.mul1", .{base}));
++    var mbuf: [256]u8 = undefined;
++    const mcg = store.has(try std.fmt.bufPrint(&mbuf, "{s}.mcg", .{base}));
++    if (mul1 == mcg) return error.UnsupportedQuantization;
++    const marker = try store.hold(try std.fmt.bufPrint(&buf, "{s}.{s}", .{ base, if (mul1) "mul1" else "mcg" }));
++    if (marker.bytes.len != 4 or std.mem.readInt(u32, marker.bytes[0..4], .little) != (if (mul1) mul1_magic else mcg_magic)) return error.UnsupportedQuantization;
++    codebook = if (mul1) .mul1 else .mcg;
++    if (codebook == .mcg and halves % 2 != 0) return error.UnsupportedQuantization;
++    const suh = try store.hold(try std.fmt.bufPrint(&buf, "{s}.suh", .{base}));
++    const svh = try store.hold(try std.fmt.bufPrint(&buf, "{s}.svh", .{base}));
++    if (!suh.is(.f16, &.{k}) or !svh.is(.f16, &.{n})) return error.UnexpectedTensor;
++    return .{ .trellis = t, .suh = suh, .svh = svh, .halves = @intCast(halves), .codebook = codebook, .n = n, .k = k };
++}
++
++/// The trellis part `base` of a group, uploaded as stored (the Dense kernels read the stored tile layout).
++fn trellisPart(d: *const cuda.Driver, g: *grp.Group, kit: *kit_mod.Kit, stream: cuda.Stream, store: *Store, base: []const u8, col: usize) !void {
++    const i = try info(store, base);
++    const st = cuda.exl3.strides(i.k, i.n, i.halves, false);
++    const w: cuda.exl3.Weight = .{
++        .trellis = try g.put(d, i.trellis.bytes),
++        .suh = try g.put(d, i.suh.bytes),
++        .svh = try g.put(d, i.svh.bytes),
++        .k = @intCast(i.k),
++        .n = @intCast(i.n),
++        .halves = i.halves,
++        .codebook = i.codebook,
++        .stride_k = st.k,
++        .stride_nb = st.nb,
++    };
++    if (cuda.exl3.variantIndex(w.halves, w.codebook, cuda.exl3.planOf(w).wk) == null) return error.UnsupportedQuantization;
++    try kit.dense.reserve(stream, w);
++    try g.add(.{ .kind = .trellis, .w = w, .col = col, .n = i.n });
++}
++
++/// bf16 rows of a bf16 or f16 tensor.
++pub fn bf16Rows(gpa: std.mem.Allocator, t: Tensor) ![]u16 {
++    const out = try gpa.alloc(u16, t.bytes.len / 2);
++    errdefer gpa.free(out);
++    switch (t.dtype) {
++        .bf16 => for (out, 0..) |*o, i| {
++            o.* = std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little);
++        },
++        .f16 => for (out, 0..) |*o, i| {
++            const h: f16 = @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little));
++            o.* = core.bf16_round.bits(@floatCast(h));
++        },
++        else => return error.UnexpectedTensor,
++    }
++    return out;
++}
++
++/// The plain matrices `bases` (f16 or bf16 [n_i, k] each) stacked into one bf16 part on the lane.
++fn plainPart(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *grp.Group, store: *Store, bases: []const []const u8, k: usize, col: usize) !void {
++    var rows: usize = 0;
++    var data: std.ArrayList(u16) = .empty;
++    defer data.deinit(gpa);
++    var buf: [256]u8 = undefined;
++    for (bases) |base| {
++        const t = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
++        if (t.rank != 2 or t.dim(1) != k or t.bytes.len != t.dim(0) * k * 2) return error.UnexpectedTensor;
++        const r = try bf16Rows(gpa, t);
++        defer gpa.free(r);
++        try data.appendSlice(gpa, r);
++        rows += t.dim(0);
++    }
++    var p = try projection.dense(gpa, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ rows, k, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(data.items) });
++    errdefer p.free();
++    try g.bufs.ensureUnusedCapacity(g.gpa, 1);
++    g.bufs.appendAssumeCapacity(p.w);
++    try g.add(.{ .kind = .plain, .plain = p.native.?, .col = col, .n = rows });
++}
++
++/// A projection made of parts side by side: `prefix` joined with each name; n columns in all, k inputs. A name with a
++/// trellis is an EXL3 part; the others (f16 or bf16 matrices) are stacked into one plain part after them.
++pub fn stitched(gpa: std.mem.Allocator, d: *const cuda.Driver, store: *Store, kit: *kit_mod.Kit, stream: cuda.Stream, prefix: []const u8, names: []const []const u8, n: usize, k: usize) !wt.Q4 {
++    const g = try grp.Group.create(gpa, n, k);
++    var q = wt.Q4.empty(d);
++    q.n = n;
++    q.k = k;
++    q.exl3 = g;
++    errdefer q.free();
++    var col: usize = 0;
++    var bases: [grp.max_parts][160]u8 = undefined;
++    var plain: [grp.max_parts][]const u8 = undefined;
++    var plain_n: usize = 0;
++    var plain_col: usize = 0;
++    var buf: [256]u8 = undefined;
++    for (names, 0..) |name, i| {
++        const base = try std.fmt.bufPrint(&bases[i], "{s}{s}", .{ prefix, name });
++        if (store.has(try std.fmt.bufPrint(&buf, "{s}.trellis", .{base}))) {
++            if (plain_n != 0) return error.UnexpectedTensor;
++            try trellisPart(d, g, kit, stream, store, base, col);
++            col += g.parts[g.count - 1].n;
++        } else {
++            const t = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
++            if (plain_n == 0) plain_col = col;
++            plain[plain_n] = base;
++            plain_n += 1;
++            col += t.dim(0);
++        }
++    }
++    if (plain_n != 0) try plainPart(gpa, d, g, store, plain[0..plain_n], k, plain_col);
++    try g.check();
++    return q;
++}
++
++/// A single trellis projection `base` (n outputs, k inputs).
++pub fn single(gpa: std.mem.Allocator, d: *const cuda.Driver, store: *Store, kit: *kit_mod.Kit, stream: cuda.Stream, base: []const u8, n: usize, k: usize) !wt.Q4 {
++    const g = try grp.Group.create(gpa, n, k);
++    var q = wt.Q4.empty(d);
++    q.n = n;
++    q.k = k;
++    q.exl3 = g;
++    errdefer q.free();
++    try trellisPart(d, g, kit, stream, store, base, 0);
++    if (g.parts[0].n != n or g.parts[0].w.k != k) return error.UnexpectedTensor;
++    try g.check();
++    return q;
++}
++
++/// The router as bf16 [experts + 1][dims]: the gate's rows, then the shared expert's gate row (both stored f16).
++pub fn router(gpa: std.mem.Allocator, store: *Store, mlp: []const u8) ![]u16 {
++    var buf: [256]u8 = undefined;
++    const rows = try gpa.alloc(u16, (experts_n + 1) * dims);
++    errdefer gpa.free(rows);
++    const gate = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.gate.weight", .{mlp}));
++    if (gate.rank != 2 or gate.dim(0) != experts_n or gate.dim(1) != dims) return error.UnexpectedTensor;
++    const a = try bf16Rows(gpa, gate);
++    defer gpa.free(a);
++    @memcpy(rows[0 .. experts_n * dims], a);
++    const sg = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.shared_expert_gate.weight", .{mlp}));
++    if (sg.rank != 2 or sg.dim(0) != 1 or sg.dim(1) != dims) return error.UnexpectedTensor;
++    const b = try bf16Rows(gpa, sg);
++    defer gpa.free(b);
++    @memcpy(rows[experts_n * dims ..], b);
++    return rows;
++}
++
++/// A layer's routed experts and its shared expert as expert 512, on the grouped EXL3 kernels.
++pub fn experts(gpa: std.mem.Allocator, d: *const cuda.Driver, store: *Store, mlp: []const u8) !moe.Experts {
++    const count = experts_n + 1;
++    var out: moe.Experts = .{ .layer = undefined, .gpa = gpa };
++    errdefer out.free();
++    const mods = [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
++    var ptrs: [3]u64 = undefined;
++    var k2: [3]u64 = undefined;
++    var suh: [3]u64 = undefined;
++    var svh: [3]u64 = undefined;
++    var codebook: ?cuda.exl3.Codebook = null;
++    var buf: [256]u8 = undefined;
++    for (mods, 0..) |mod, m| {
++        const k = if (m == 2) moe_w else dims;
++        const n = if (m == 2) dims else moe_w;
++        const infos = try gpa.alloc(Info, count);
++        defer gpa.free(infos);
++        var total: usize = 0;
++        for (infos, 0..) |*slot, e| {
++            const base = if (e < experts_n)
++                try std.fmt.bufPrint(&buf, "{s}.experts.{d}.{s}", .{ mlp, e, mod })
++            else
++                try std.fmt.bufPrint(&buf, "{s}.shared_expert.{s}", .{ mlp, mod });
++            slot.* = try info(store, base);
++            if (slot.n != n or slot.k != k) return error.UnexpectedTensor;
++            if (codebook) |c| {
++                if (c != slot.codebook) return error.UnsupportedQuantization;
++            } else codebook = slot.codebook;
++            total += std.mem.alignForward(usize, slot.trellis.bytes.len, 16);
++        }
++        var tb = try cuda.DeviceBuffer.alloc(d, total);
++        try out.bufs.append(gpa, tb);
++        const table = try gpa.alloc(u64, count);
++        defer gpa.free(table);
++        const widths = try gpa.alloc(i32, count);
++        defer gpa.free(widths);
++        const su = try gpa.alloc(u8, count * k * 2);
++        defer gpa.free(su);
++        const sv = try gpa.alloc(u8, count * n * 2);
++        defer gpa.free(sv);
++        var at: usize = 0;
++        for (infos, 0..) |i, e| {
++            try tb.upload(at, i.trellis.bytes);
++            table[e] = tb.ptr + at;
++            widths[e] = @intCast(i.halves);
++            at += std.mem.alignForward(usize, i.trellis.bytes.len, 16);
++            @memcpy(su[e * k * 2 ..][0 .. k * 2], i.suh.bytes);
++            @memcpy(sv[e * n * 2 ..][0 .. n * 2], i.svh.bytes);
++        }
++        ptrs[m] = try put(&out, d, std.mem.sliceAsBytes(table));
++        k2[m] = try put(&out, d, std.mem.sliceAsBytes(widths));
++        suh[m] = try put(&out, d, su);
++        svh[m] = try put(&out, d, sv);
++    }
++    out.layer = .{
++        .format = .exl3,
++        .exl3 = .{
++            .gate = ptrs[0],
++            .up = ptrs[1],
++            .down = ptrs[2],
++            .gate_k2 = k2[0],
++            .up_k2 = k2[1],
++            .down_k2 = k2[2],
++            .suh_g = suh[0],
++            .suh_u = suh[1],
++            .svh_g = svh[0],
++            .svh_u = svh[1],
++            .suh_d = suh[2],
++            .svh_d = svh[2],
++            .experts = count,
++            .dims = dims,
++            .width = moe_w,
++            .codebook = codebook orelse return error.UnsupportedQuantization,
++            .limit = 0,
++            .act_mode = 1,
++        },
++        .up = 0,
++        .down = 0,
++        .width = moe_w,
++        .dims = dims,
++        .experts = count,
++        .swiglu = true,
++    };
++    return out;
++}
++
++fn put(out: *moe.Experts, d: *const cuda.Driver, bytes: []const u8) !u64 {
++    try out.bufs.ensureUnusedCapacity(out.gpa, 1);
++    const b = try cuda.DeviceBuffer.fromHost(d, bytes);
++    out.bufs.appendAssumeCapacity(b);
++    return b.ptr;
++}
++
++/// The head's rows at `ids` as bf16 [ids.len][k], decoded through the EXL3 linear: the unit vectors' products are the
++/// weight's rows, in blocks of 128 (the dense kernels' row block).
++pub fn headRows(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream, kit: *kit_mod.Kit, w: cuda.exl3.Weight, ids: []const u32) ![]u8 {
++    const k: usize = w.k;
++    const n: usize = w.n;
++    const block = 128;
++    const bytes = try gpa.alloc(u8, ids.len * k * 2);
++    errdefer gpa.free(bytes);
++    const out: []u16 = @alignCast(std.mem.bytesAsSlice(u16, bytes));
++    const unit = try gpa.alloc(u16, block * k);
++    defer gpa.free(unit);
++    const rows = try gpa.alloc(u16, block * n);
++    defer gpa.free(rows);
++    var x = try cuda.DeviceBuffer.alloc(d, block * k * 2);
++    defer x.free();
++    var y = try cuda.DeviceBuffer.alloc(d, block * n * 2);
++    defer y.free();
++    var k0: usize = 0;
++    while (k0 < k) : (k0 += block) {
++        @memset(unit, 0);
++        for (0..block) |r| unit[r * k + k0 + r] = 0x3f80; // bf16 1.0
++        try x.upload(0, std.mem.sliceAsBytes(unit));
++        try kit.dense.prompt(stream, w, x.ptr, .bf16, block, y.ptr, .bf16);
++        try stream.synchronize();
++        try y.download(0, std.mem.sliceAsBytes(rows));
++        for (ids, 0..) |id, j| for (0..block) |r| {
++            out[j * k + k0 + r] = rows[r * n + id];
++        };
++    }
++    return bytes;
++}
+diff --git a/zig/src/families/flashnext/cuda_exl3_moe.zig b/zig/src/families/flashnext/cuda_exl3_moe.zig
+new file mode 100644
+index 0000000..ba3d9fd
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_moe.zig
+@@ -0,0 +1,63 @@
++//! An EXL3 layer's routed experts and its shared expert (expert 512 of the same tables) on the grouped kernels.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const kit_mod = @import("cuda_exl3_kit.zig");
++
++const dims = wt.dims;
++const experts_n = wt.experts_n;
++const moe_w = wt.moe_w;
++
++/// Rows a grouped call takes: each call reads every picked expert's weights, so a prompt pass wants few of them,
++/// and the scratch grows with the pairs (the Python engine's 1,024-row windows).
++pub const window_rows: usize = 1024;
++
++/// Rows from which a call takes the 64-pair prompt items (below: the 16-pair decode items), as the NVFP4 path does.
++const prompt_rows: usize = 64;
++
++pub const Experts = struct {
++    layer: cuda.experts.Layer,
++    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    gpa: std.mem.Allocator,
++
++    pub fn free(self: *Experts) void {
++        for (self.bufs.items) |*b| b.free();
++        self.bufs.deinit(self.gpa);
++    }
++};
++
++/// Routed experts' and the shared one's picks for `n` rows (slots a row, the shared one last) through the grouped kernels:
++/// the routed and shared slot rows go to y [pairs, dims] fp32, the up activations to moe_act.
++pub fn run(self: anytype, kit: *kit_mod.Kit, x: *const Experts, n: usize, plan: cuda.grouped.Plan) !void {
++    const s = self.s;
++    const e = experts_n + 1;
++    var at: usize = 0;
++    while (at < n) : (at += window_rows) {
++        const rows = @min(window_rows, n - at);
++        const pairs = rows * s.slots;
++        const tile: usize = if (rows >= prompt_rows) 64 else 16;
++        const picks = s.picks + at * s.slots * 4;
++        try self.k.router.route(self.stream, picks, pairs, e, tile, plan);
++        const items = cuda.grouped.maxItems(pairs, e, tile);
++        const grp: cuda.experts.Grouped = .{ .exl3 = &kit.grouped };
++        const act = s.moe_act + at * s.slots * moe_w * 2;
++        const y = s.y + at * s.slots * dims * 4;
++        const mixed = s.mixed + at * dims * 2;
++        if (tile == 64) {
++            try grp.prompt(self.stream, .up, .{ .x = mixed, .stride = dims, .slots = s.slots }, x.layer, plan, act, items, pairs, tile, -1);
++            try grp.prompt(self.stream, .down_f32, .{ .x = act, .stride = moe_w }, x.layer, plan, y, items, pairs, tile, -1);
++        } else {
++            try grp.decode(self.stream, .up, .{ .x = mixed, .stride = dims, .slots = s.slots }, x.layer, plan, act, items, pairs, tile, -1);
++            try grp.decode(self.stream, .down_f32, .{ .x = act, .stride = moe_w }, x.layer, plan, y, items, pairs, tile, -1);
++        }
++    }
++}
++
++/// The scratch `Grouped` keeps for a call of `rows` rows: its largest of the up and down projections.
++pub fn storageBytes(rows: usize, slots: usize) !usize {
++    const pairs = @min(rows, window_rows) * slots;
++    const tile: usize = 64;
++    const up = try cuda.exl3_grouped.Grouped.bytes(dims, moe_w, pairs, tile, try cuda.exl3_experts.plan(dims, moe_w, true), 2);
++    const down = try cuda.exl3_grouped.Grouped.bytes(moe_w, dims, pairs, tile, try cuda.exl3_experts.plan(moe_w, dims, false), 1);
++    return @max(up, down);
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 412e8b7..339a906 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -25,7 +25,7 @@ pub const captured_head_entries = [_][]const u8{ "_rmsnorm", "_add_streams" };
+ pub fn Namespace(comptime Tri: type) type {
+     return struct {
+         pub const model_type = "qwen4_exp";
+-        pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
++        pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed", "exl3" };
+         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
+         pub const default_context: i64 = @intCast(prompt.max_tokens);
+         // a prompt runs on the batched pass in chunks of this many rows, one a prefill_step: no staggered segments
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 5cc043d..e879a85 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -90,7 +90,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     _ = try own.engine.reserve(@max(@min(o.context, own.engine.chunk), if (o.slide) @as(usize, @import("cuda_train.zig").pack_rows) else 0));
+     // the MTP head unless --no-drafts (TF_FLASHNEXT_DRAFTS and _CONFIDENCE: the chain's rule, 6 and -0.4)
+     if (o.drafts and (o.tp == 1 or o.rank == 0)) {
+-        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir, e.widths);
++        own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir, e.widths, e.exl3);
+         const drafts = try @import("sys").environment.read(usize, "TF_FLASHNEXT_DRAFTS", mtp.default_depth);
+         own.depth = @max(1, @min(mtp.max_chain, drafts));
+         const greedy = try @import("sys").environment.read(usize, "TF_FLASHNEXT_DRAFTS_GREEDY", mtp.default_depth_greedy);
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index 62e51e5..008369c 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -276,6 +276,7 @@ pub const Head = struct {
+         stream: *cuda.Stream,
+         dir: []const u8,
+         main: engine_widths.Widths,
++        exl3: ?*@import("cuda_exl3_kit.zig").Kit,
+     ) !*Head {
+         const batch_on = try @import("cuda_draw_batch.zig").enabled();
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -284,6 +285,7 @@ pub const Head = struct {
+         h.gpa = gpa;
+         var store = try wt.Store.open(gpa, io, dir);
+         defer store.deinit();
++        store.exl3 = exl3;
+         try store.detectNorms();
+         var buf: [120]u8 = undefined;
+         const ne = try store.normScale(gpa, try store.tensor("language_model.mtp.pre_fc_norm_embedding.weight"));
+@@ -295,9 +297,9 @@ pub const Head = struct {
+         errdefer h.norm_e.free();
+         h.norm_h = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(nh));
+         errdefer h.norm_h.free();
+-        h.fc_e = try fc(gpa, driver, &store, &buf, "language_model.mtp.fc_embedding");
++        h.fc_e = try fc(gpa, driver, stream.*, &store, &buf, "language_model.mtp.fc_embedding");
+         errdefer h.fc_e.free();
+-        h.fc_h = try fc(gpa, driver, &store, &buf, "language_model.mtp.fc_hidden");
++        h.fc_h = try fc(gpa, driver, stream.*, &store, &buf, "language_model.mtp.fc_hidden");
+         errdefer h.fc_h.free();
+         h.mixer = try wt.loadHc(gpa, driver, &store, "language_model.mtp.hyper_connection_mixer", false);
+         errdefer h.mixer.free();
+@@ -318,12 +320,13 @@ pub const Head = struct {
+         defer gpa.free(ids);
+         const head_load = @import("cuda_mtp_load.zig");
+         const role = try head_load.mode();
+-        const dtype = (try store.tensor("language_model.lm_head.weight")).dtype;
++        // an EXL3 head has no weight tensor: its rows are decoded to bf16 for the draft vocabulary (cuda_mtp_load.zig)
++        const dtype: core.safetensors.DType = if (exl3 != null) .bf16 else (try store.tensor("language_model.lm_head.weight")).dtype;
+         h.artifact = try proposal.legacy.artifact(gpa, ids, .{ .vocab = vocab, .hidden = dims, .format = if (dtype == .bf16) "bf16" else "affine4", .group = if (dtype == .bf16) 0 else 32, .scale_recipe = if (dtype == .bf16) @tagName(role) else "stored affine4 group32" });
+         errdefer h.artifact.deinit();
+         h.ids = h.artifact.ids();
+         h.service = try lanes.proposal_head.Service.legacy(gpa, &h.artifact);
+-        h.draft = try head_load.draft(gpa, driver, &store, &h.artifact, role);
++        h.draft = try head_load.draft(gpa, driver, stream.*, &store, &h.artifact, role);
+         errdefer h.draft.free();
+         h.module = try cuda.Module.load(driver, cuda.kernels.flashnext_mtp);
+         errdefer h.module.unload();
+@@ -339,8 +342,9 @@ pub const Head = struct {
+         return h;
+     }
+ 
+-    fn fc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *wt.Store, buf: []u8, name: []const u8) !Q4 {
++    fn fc(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, store: *wt.Store, buf: []u8, name: []const u8) !Q4 {
+         _ = buf;
++        if (store.exl3) |kit| return @import("cuda_exl3_load.zig").single(gpa, driver, store, kit, stream, name, dims, dims);
+         return @import("cuda_projection_load.zig").load(gpa, driver, store, name, dims, dims);
+     }
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_check.zig b/zig/src/families/flashnext/cuda_mtp_check.zig
+index 3f9b720..3fe0511 100644
+--- a/zig/src/families/flashnext/cuda_mtp_check.zig
++++ b/zig/src/families/flashnext/cuda_mtp_check.zig
+@@ -99,7 +99,7 @@ fn envF64(name: [:0]const u8, default: f64) f64 {
+ pub fn check(comptime Tri: type, gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, tri: Tri, model_dir: []const u8, prompts: []const []const u32, count: usize) !bool {
+     var e = try prompt.Engine.init(gpa, io, driver, stream, model_dir);
+     defer e.deinit();
+-    const h = try Head.init(gpa, io, driver, stream, model_dir, e.widths);
++    const h = try Head.init(gpa, io, driver, stream, model_dir, e.widths, e.exl3);
+     defer h.deinit();
+     const o: Ops(Tri) = .{ .e = e, .tri = tri, .h = h };
+     const depth = try @import("sys").environment.read(usize, "TF_FLASHNEXT_DRAFTS", mtp.default_depth);
+diff --git a/zig/src/families/flashnext/cuda_mtp_load.zig b/zig/src/families/flashnext/cuda_mtp_load.zig
+index eb91126..7382220 100644
+--- a/zig/src/families/flashnext/cuda_mtp_load.zig
++++ b/zig/src/families/flashnext/cuda_mtp_load.zig
+@@ -23,9 +23,19 @@ pub fn mode() !Mode {
+     return @fromBackingInt(@intCast(try environment.read(u1, name, @backingInt(default_mode))));
+ }
+ 
+-pub fn draft(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, artifact: *const core.proposal_vocab.Artifact, role: Mode) !wt.Q4 {
++pub fn draft(a: std.mem.Allocator, d: *cuda.Driver, stream: cuda.Stream, store: *wt.Store, artifact: *const core.proposal_vocab.Artifact, role: Mode) !wt.Q4 {
+     const ids = artifact.ids();
+     const affine = role == .affine4;
++    if (store.exl3) |kit| {
++        // an EXL3 head: its rows for the draft vocabulary decoded through the EXL3 linear, then held as the role says
++        const loader = @import("cuda_exl3_load.zig");
++        var head = try loader.single(a, d, store, kit, stream, "language_model.lm_head", wt.vocab, wt.dims);
++        defer head.free();
++        const rows = try loader.headRows(a, d, stream, kit, head.exl3.?.parts[0].w, ids);
++        defer a.free(rows);
++        if (affine) return quantized(a, d, rows, ids.len);
++        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ ids.len, wt.dims, 1, 1, 1 }, .bytes = rows });
++    }
+     const tensor = try store.tensor("language_model.lm_head.weight");
+     if (tensor.dtype == .bf16) {
+         if (!tensor.is(.bf16, &.{ wt.vocab, wt.dims })) return error.UnexpectedTensor;
+diff --git a/zig/src/families/flashnext/cuda_ple.zig b/zig/src/families/flashnext/cuda_ple.zig
+index ba795b7..c3674d2 100644
+--- a/zig/src/families/flashnext/cuda_ple.zig
++++ b/zig/src/families/flashnext/cuda_ple.zig
+@@ -332,7 +332,48 @@ pub fn eosOf(gpa: std.mem.Allocator, io: std.Io, model_dir: []const u8) !i64 {
+ }
+ 
+ /// A table's row format: MLX affine words, NVFP4 codes with E4M3 group scales, or FP8 rows with one table scale.
+-pub const Format = enum { mlx, nvfp4, fp8 };
++pub const Format = enum { mlx, nvfp4, fp8, exl3 };
++
++
++const k_inv: f32 = @floatCast(@as(f16, @bitCast(@as(u16, 0x1EEE))));
++const k_bias: f32 = @floatCast(@as(f16, @bitCast(@as(u16, 0xC931))));
++pub const exl3_default_file = "ngram_embedding.safetensors";
++fn exl3Present(io: std.Io, dir: []const u8) bool {
++    var buf: [1024]u8 = undefined;
++    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, exl3_default_file }) catch return false;
++    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
++    return true;
++}
++pub const exl3_name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.trellis";
++
++/// One EXL3 n-gram row (ExLlamaV3's ngram_dequant): an fp16 scale word, then out.len values of `bits` bits in a
++/// tail-biting mul1 trellis; value i is fp16(mul1(state_i)) * scale + bias[i] rounded once to bf16.
++pub fn decodeExl3Row(bits: usize, row: []const u8, bias: []const f16, out: []u16) void {
++    const dh = out.len;
++    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, row[0..2], .little))));
++    var v: [256]u16 = undefined;
++    for (0..dh) |j| {
++        var x: u16 = 0;
++        for (0..bits) |b| {
++            const s = j * bits + b;
++            const word = std.mem.readInt(u16, row[2 + 2 * (s >> 4) ..][0..2], .little);
++            x |= ((word >> @intCast(s & 15)) & 1) << @intCast(b);
++        }
++        v[j] = x;
++    }
++    for (0..dh) |i| {
++        var state: u32 = 0;
++        for (0..16) |m| {
++            const back = m / bits;
++            const pos = if (i >= back) i - back else i + dh - back;
++            state |= @as(u32, (v[pos] >> @intCast(m % bits)) & 1) << @intCast(m);
++        }
++        const prod = state *% 0x83DCD12D;
++        const hs: u32 = (prod & 255) + ((prod >> 8) & 255) + ((prod >> 16) & 255) + (prod >> 24);
++        const cb: f32 = @floatCast(@as(f16, @floatCast(@mulAdd(f32, @floatFromInt(1024 + hs), k_inv, k_bias))));
++        out[i] = toBf16(@mulAdd(f32, cb, scale, @floatCast(bias[i])));
++    }
++}
+ 
+ /// The n-gram table held open for an engine's life: the hash, the scale, and each shard's slices of its mapped file.
+ pub const Ngram = struct {
+@@ -344,6 +385,10 @@ pub const Ngram = struct {
+     s: [max_shards][]const u8 = undefined,
+     b: [max_shards][]const u8 = undefined,
+     format: Format = .mlx,
++    /// EXL3 table (one int16 [rows, words] trellis, a row an fp16 scale and dh tail-biting mul1 values): its rows and biases.
++    exl3_rows: []const u8 = &.{},
++    exl3_bits: usize = 0,
++    exl3_bias: [max_heads * 256]f16 = undefined,
+     tables: [max_shards]core.nvfp4_rows.Table = undefined,
+     tables8: [max_shards]ple_fp8.Table = undefined,
+     readers: [max_shards]ple_reader.Reader = undefined,
+@@ -374,6 +419,13 @@ pub const Ngram = struct {
+         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+         defer parsed.deinit();
+         const wm = try core.safetensors.index.weightMap(parsed.value);
++        // an EXL3 pack keeps its n-gram table in a file the index does not list
++        const exl3_file: ?[]const u8 = if (wm.get(exl3_name)) |f| f.string else if (exl3Present(io, model_dir)) exl3_default_file else null;
++        if (exl3_file) |file_name| {
++            try g.openExl3(gpa, io, model_dir, file_name);
++            g.pool = try ple_pool.Pool.create(gpa, io);
++            return g;
++        }
+         const first = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight";
+         const modelopt = wm.contains(first);
+         g.format = if (modelopt) try ple_fp8.format(gpa, io, model_dir, wm, first) else .mlx;
+@@ -383,6 +435,7 @@ pub const Ngram = struct {
+             .mlx => try tableScale(gpa, io, model_dir, wm),
+             .nvfp4 => try readScale(gpa, io, model_dir, wm, "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale_2", true),
+             .fp8 => try readScale(gpa, io, model_dir, wm, "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale", true),
++            .exl3 => 1,
+         };
+         const dh = g.hash.dh;
+         var key: [180]u8 = undefined;
+@@ -407,6 +460,7 @@ pub const Ngram = struct {
+                 .mlx => .u32,
+                 .nvfp4 => .u8,
+                 .fp8 => .f8_e4m3,
++                .exl3 => unreachable,
+             };
+             const w = try file.tensor(try partNameFor(&key, shard, nested, "weight", modelopt), dtype);
+             const expected_rows: usize = @intCast(g.hash.starts[shard + 1] - g.hash.starts[shard]);
+@@ -427,6 +481,29 @@ pub const Ngram = struct {
+         return g;
+     }
+ 
++    fn openExl3(g: *Ngram, gpa: std.mem.Allocator, io: std.Io, model_dir: []const u8, file_name: []const u8) !void {
++        const path = try std.fs.path.join(gpa, &.{ model_dir, file_name });
++        defer gpa.free(path);
++        var o = try Open.load(gpa, io, path);
++        errdefer o.close(gpa);
++        if (@import("builtin").os.tag != .windows) std.posix.madvise(o.file.map.memory.ptr, o.file.map.memory.len, std.posix.MADV.RANDOM) catch {};
++        const dh = g.hash.dh;
++        const heads = g.hash.heads;
++        if (dh > 256 or heads * 256 > g.exl3_bias.len) return error.UnexpectedTensor;
++        const t = try o.tensor(exl3_name, .i16);
++        const total: usize = @intCast(g.hash.starts[g.hash.shards]);
++        if (t.rank != 2 or t.dim(0) != total or t.bytes.len != total * t.dim(1) * 2) return error.UnexpectedTensor;
++        const bits = (t.dim(1) - 1) * 16 / dh;
++        if (bits < 2 or bits > 8 or 1 + dh * bits / 16 != t.dim(1)) return error.UnexpectedTensor;
++        const hb = try o.tensor("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.head_bias", .f16);
++        if (hb.rank != 2 or hb.dim(0) != heads or hb.dim(1) != dh) return error.UnexpectedTensor;
++        for (0..heads * dh) |i| g.exl3_bias[i] = @bitCast(std.mem.readInt(u16, hb.bytes[2 * i ..][0..2], .little));
++        g.format = .exl3;
++        g.exl3_rows = t.bytes;
++        g.exl3_bits = bits;
++        try g.files.append(gpa, o);
++    }
++
+     pub fn deinit(g: *Ngram) void {
+         g.waitWarm();
+         if (g.pool) |p| p.destroy();
+@@ -459,6 +536,7 @@ pub const Ngram = struct {
+             .nvfp4 => bytes += advise(g.tables[shard].codes) + advise(g.tables[shard].scales),
+             .mlx => bytes += advise(g.w[shard]) + advise(g.s[shard]) + advise(g.b[shard]),
+             .fp8 => bytes += advise(g.tables8[shard].codes),
++            .exl3 => bytes += if (shard == 0) advise(g.exl3_rows) else 0,
+         };
+         std.debug.print("n-gram table: {d:.1} GiB read ahead into the page cache\n", .{@as(f64, @floatFromInt(bytes)) / (1 << 30)});
+     }
+@@ -479,10 +557,18 @@ pub const Ngram = struct {
+     pub fn fill(g: *const Ngram, ids: []const i64, out: []u16, lo: usize, hi: usize) !void {
+         const dh = g.hash.dh;
+         for (lo..hi) |i| {
++            if (g.format == .exl3) {
++                const words = 1 + dh * g.exl3_bits / 16;
++                if (ids[i] < 0 or @as(usize, @intCast(ids[i])) * words * 2 >= g.exl3_rows.len) return error.UnexpectedTensor;
++                const head = i % g.hash.heads;
++                decodeExl3Row(g.exl3_bits, g.exl3_rows[@as(usize, @intCast(ids[i])) * words * 2 ..][0 .. words * 2], g.exl3_bias[head * dh ..][0..dh], out[i * dh ..][0..dh]);
++                continue;
++            }
+             const loc = try g.hash.locate(ids[i]);
+             const row = out[i * dh ..][0..dh];
+             switch (g.format) {
+                 .mlx => try embed.dequant(g.w[loc.shard], g.s[loc.shard], g.b[loc.shard], dh, loc.local, row),
++                .exl3 => unreachable,
+                 .nvfp4, .fp8 => if (g.read_mode == .pread)
+                     try g.readers[loc.shard].read(g.gpa, loc.local, row)
+                 else if (g.format == .fp8)
+@@ -525,7 +611,7 @@ pub const Ngram = struct {
+             hist[history.len - 1] = token;
+         }
+         const n_threads = @min(ple_pool.max_parts, items / 4);
+-        if (g.format != .mlx and items > 1) {
++        if (g.format != .mlx and g.format != .exl3 and items > 1) {
+             try @import("cuda_ple_gather.zig").run(g, ids, out);
+         } else if (n_threads <= 1 or g.pool == null) {
+             try g.fill(ids, out, 0, items);
+@@ -547,6 +633,20 @@ pub const Ngram = struct {
+     }
+ };
+ 
++test "an EXL3 n-gram row decodes as ExLlamaV3's ngram_dequant does (row 2,927,653, head 0 of turboderp's 4.05 bpw pack)" {
++const fixture_row = [_]u16{ 0x241e, 0x5073, 0x7f33, 0xca75, 0x7159, 0x1d3c, 0xc7b5, 0xbb7b, 0x1de2, 0x4100, 0x4b29, 0xfb62, 0x7382, 0x98d2, 0xc72b, 0x1c65, 0xa7c9, 0x3ac8, 0x41f6, 0x3c43, 0x19e2, 0x4b66, 0x4dce, 0x44bc, 0x32f7, 0xaf02, 0x54d0, 0xfb47, 0x9b9f, 0xe2fe, 0x477e, 0xb4b4, 0xcf7b, 0x498c, 0x2dc2, 0xd7fa, 0x3554, 0xcd44, 0x3d3c, 0x8929, 0xb940, 0xc2b3, 0xde0b, 0x3110, 0xda6d, 0x3548, 0xc60a, 0x74f0, 0xf1df, 0xb921, 0x66be, 0x57c2, 0x168d, 0xf84b, 0xe300, 0xccfe, 0xc71b, 0xe054, 0x6cbe, 0x9be9, 0xec28 };
++const fixture_bias = [_]u16{ 0x14ca, 0x68a, 0xe58, 0x8c98, 0x9287, 0x1859, 0x91fb, 0x11e3, 0x10a4, 0x1416, 0xa60, 0x8f02, 0x1395, 0x8f58, 0x8015, 0x89d3, 0x137c, 0x1134, 0x9683, 0x8087, 0x33a, 0x8823, 0x1304, 0xbdb, 0x1576, 0x104f, 0x9f9, 0x8ae3, 0x1053, 0x10dd, 0x162f, 0xb84, 0x108e, 0x8d52, 0x94e3, 0x8fa9, 0x9604, 0x979c, 0x89c5, 0x9636, 0x14f2, 0x92cc, 0xeaa, 0x9362, 0x9478, 0x1415, 0x8991, 0x944f, 0x912e, 0x1880, 0x83f8, 0x95b1, 0x42a, 0x9244, 0x9346, 0x104e, 0x50, 0x98d7, 0x165e, 0x92a9, 0x90ae, 0x1a0, 0x8ac6, 0x6f9, 0x17f7, 0x10d4, 0x88b0, 0x9545, 0x1186, 0x904d, 0x9486, 0x104f, 0x888a, 0x81b8, 0x195, 0x18eb, 0x9499, 0x11d3, 0x8bf2, 0x91f8, 0xad9, 0x97b8, 0x8e26, 0x1695, 0x9056, 0x960e, 0x891f, 0x8c13, 0x1870, 0x1493, 0x931a, 0x91e6, 0x8822, 0x8cef, 0x910d, 0x9468, 0x8cd6, 0x9826, 0x88e5, 0x1520, 0xfd7, 0x933a, 0xe83, 0x89ab, 0x96aa, 0x944a, 0xe1d, 0x8863, 0x8a97, 0x9479, 0x2ff, 0x956c, 0x93a6, 0x158b, 0x1848, 0x85a7, 0x92cb, 0x8c16, 0xa59, 0xb00, 0x1734, 0x1217, 0x9114, 0x832d, 0x1091, 0x8e19, 0x955d, 0x613, 0x8a5b, 0x9807, 0xbad, 0x1412, 0x1575, 0x8d2b, 0x137a, 0x16b4, 0x9369, 0x8dd8, 0x806c, 0xf3c, 0x843b, 0x92cb, 0x19bd, 0x8822, 0x16be, 0x8a58, 0x8f6e, 0x10bb, 0x8dd2, 0xb18, 0xc0a, 0x8af1, 0x9854, 0x95ca, 0x916c, 0x16e, 0x146e, 0x889, 0x15a0, 0x8b42 };
++const fixture_out = [_]u16{ 0x3c45, 0x3c1a, 0xbc82, 0xbced, 0xbd3f, 0x3b09, 0xbd11, 0xbb9c, 0x3cb3, 0xbcca, 0x3c21, 0xba31, 0x3c06, 0xbc88, 0x3afd, 0x39ea, 0x3c44, 0x3d2b, 0xbc49, 0x3c2c, 0xbca3, 0xbcb7, 0x3ccb, 0x3c24, 0xbc19, 0xbc3a, 0xbade, 0x3cbd, 0xbbd7, 0xbc04, 0x3bc3, 0xbb17, 0x3ba0, 0x3ab6, 0x3c47, 0xbc7e, 0x3cc4, 0x3c13, 0x3c4b, 0xbc28, 0xbc65, 0xbc0d, 0x3a72, 0xbade, 0x39d3, 0x3ca1, 0xbc6b, 0x3c6b, 0xbba8, 0x3c2b, 0x3978, 0x3c29, 0xbc9e, 0x3bbf, 0xbca1, 0xbbf0, 0x3b91, 0xbc19, 0x3c3f, 0x3abd, 0xbbd8, 0xbb24, 0xbb81, 0x3cd5, 0xbc0f, 0xbcf4, 0xbb28, 0xbc34, 0x3c42, 0xbbe1, 0xbc11, 0x3aa5, 0x3c5e, 0xbbbb, 0x3c19, 0x3c10, 0x3ca3, 0x3c53, 0x3cc5, 0x3cf9, 0x3bca, 0xbc86, 0x3d25, 0xbd18, 0xbc5d, 0x3b9d, 0x3c89, 0xbb82, 0x3d05, 0x3bcb, 0x3bb9, 0x3a4b, 0x3b8a, 0xbcd4, 0x3b73, 0xbb9a, 0x3bab, 0xbc93, 0x3a35, 0x3c89, 0xbc42, 0x3b91, 0x3c0f, 0xbcb8, 0xbc3c, 0x3aad, 0xbca2, 0xbb86, 0xbc08, 0x3cef, 0xbbc4, 0xbc6c, 0xbcc0, 0xbbd9, 0xba49, 0x3c0f, 0xbad4, 0x3b12, 0xbca5, 0x3b95, 0xbbb6, 0xb98b, 0x3c42, 0x3c06, 0x3c26, 0xbaa7, 0xb983, 0xbb6e, 0xb9e7, 0x3afc, 0x3c16, 0xbb3a, 0x3bd9, 0xbbde, 0xbbab, 0xbb81, 0x3a1b, 0x3c1a, 0xbc1f, 0xbc53, 0xbca3, 0xbc81, 0xbc59, 0x3b04, 0x3954, 0xbc21, 0xbcad, 0x3b7a, 0xbccb, 0xbcbd, 0x3bd6, 0xbc8f, 0xbc9e, 0xbcaf, 0xbc7e, 0x3c82, 0x3c82, 0x3caa, 0x3c8d, 0x3c95 };
++    var row: [61 * 2]u8 = undefined;
++    for (fixture_row, 0..) |w, i| std.mem.writeInt(u16, row[2 * i ..][0..2], w, .little);
++    var bias: [160]f16 = undefined;
++    for (fixture_bias, 0..) |b, i| bias[i] = @bitCast(b);
++    var out: [160]u16 = undefined;
++    decodeExl3Row(6, &row, &bias, &out);
++    // the fixture was computed with separate multiply and add; the kernel's fused one may round a value to its neighbour
++    for (out, fixture_out) |got, want| try std.testing.expect(@abs(@as(i32, got) - @as(i32, want)) <= 1);
++}
++
+ test "a fresh window hashes token 7 into sixteen rows" {
+     const h = try Hash.init(.{
+         .vocab = 248320,
+diff --git a/zig/src/families/flashnext/cuda_ple_gather_lanes.zig b/zig/src/families/flashnext/cuda_ple_gather_lanes.zig
+index da641c2..43edf93 100644
+--- a/zig/src/families/flashnext/cuda_ple_gather_lanes.zig
++++ b/zig/src/families/flashnext/cuda_ple_gather_lanes.zig
+@@ -76,7 +76,7 @@ pub fn rowsMany(g: *const ple.Ngram, parts: []const Part) !void {
+     var out = parts[0].out;
+     out.len = total * w;
+     const n_threads = @min(ple_pool.max_parts, items / 4);
+-    if (g.format != .mlx and items > 1) {
++    if (g.format != .mlx and g.format != .exl3 and items > 1) {
+         try @import("cuda_ple_gather.zig").run(g, ids, out);
+     } else if (n_threads <= 1 or g.pool == null) {
+         try g.fill(ids, out, 0, items);
+diff --git a/zig/src/families/flashnext/cuda_projection.zig b/zig/src/families/flashnext/cuda_projection.zig
+index c0b96ad..5b762e4 100644
+--- a/zig/src/families/flashnext/cuda_projection.zig
++++ b/zig/src/families/flashnext/cuda_projection.zig
+@@ -10,11 +10,15 @@ pub const Projection = struct {
+     n: usize,
+     k: usize,
+     native: ?cuda.qmmf.Weight = null,
++    /// An EXL3 checkpoint's projection: its parts and their device buffers (w, s and b stay empty).
++    exl3: ?*@import("cuda_exl3_group.zig").Group = null,
+ 
+     pub fn free(self: *Projection) void {
+         self.w.free();
+         self.s.free();
+         self.b.free();
++        if (self.exl3) |g| g.destroy();
++        self.exl3 = null;
+     }
+ 
+     pub fn empty(d: *const cuda.Driver) Projection {
+diff --git a/zig/src/families/flashnext/cuda_projection_load.zig b/zig/src/families/flashnext/cuda_projection_load.zig
+index 90336a2..4d8c165 100644
+--- a/zig/src/families/flashnext/cuda_projection_load.zig
++++ b/zig/src/families/flashnext/cuda_projection_load.zig
+@@ -78,6 +78,12 @@ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []c
+             if (!t.is(.bf16, &.{ n, k })) return error.UnexpectedTensor;
+             return projection.dense(a, d, t);
+         },
++        .f16 => {
++            if (!t.is(.f16, &.{ n, k })) return error.UnexpectedTensor;
++            const bits = try wt.bf16Bits(a, t);
++            defer a.free(bits);
++            return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(bits) });
++        },
+         .f8_e4m3 => {
+             var value = try readMicro(a, store, prefix);
+             defer value.deinit(a);
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index d31ab0e..7b48bd4 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -112,6 +112,8 @@ pub const Engine = struct {
+     layers: [layers_n]Layer,
+     n_layers: usize,
+     batch_k: batch.Kernels,
++    /// An EXL3 pack's kernels (cuda_exl3_kit.zig); null for the other formats.
++    exl3: ?*@import("cuda_exl3_kit.zig").Kit = null,
+     /// The n-gram table, open for the engine's life (the batched pass gathers its rows from it).
+     ngram: ple.Ngram,
+     /// The pass's scratch, grown to the widest chunk run.
+@@ -162,6 +164,12 @@ pub const Engine = struct {
+         e.store = try Store.open(gpa, io, e.model_dir);
+         errdefer e.store.deinit();
+         e.widths = try @import("cuda_config.zig").widthsIn(gpa, io, e.model_dir);
++        e.exl3 = null;
++        errdefer if (e.exl3) |k| k.deinit();
++        if (@import("cuda_exl3_load.zig").isExl3(&e.store)) {
++            e.exl3 = try @import("cuda_exl3_kit.zig").Kit.init(gpa, driver);
++            e.store.exl3 = e.exl3;
++        }
+         try e.store.detectNorms();
+         const weight = try e.store.tensor(embed.weight_name);
+         if (weight.dtype == .bf16) {
+@@ -175,19 +183,24 @@ pub const Engine = struct {
+         e.eos = try ple.eosOf(gpa, io, e.model_dir);
+         e.mixer = try loadHc(gpa, driver, &e.store, "language_model.model.hyper_connection_mixer", false);
+         errdefer e.mixer.free();
+-        const head_tensor = try e.store.tensor("language_model.lm_head.weight");
+-        if (head_tensor.dtype == .bf16) {
+-            if (!head_tensor.is(.bf16, &.{ vocab, dims })) return error.UnexpectedTensor;
+-            e.head_q = try @import("cuda_projection.zig").dense(gpa, driver, if (try @import("cuda_head.zig").enabled()) try @import("cuda_head.zig").shard(head_tensor, world, rank) else head_tensor);
+-        } else {
++        if (e.exl3) |kit| {
+             if (try @import("cuda_head.zig").enabled()) return error.BadHeadSharding;
+-            var buf: [80]u8 = undefined;
+-            const head_w = try join3(gpa, &e.store, &buf, "language_model.lm_head", "");
+-            defer gpa.free(head_w.w);
+-            defer gpa.free(head_w.s);
+-            defer gpa.free(head_w.b);
+-            if (head_w.w.len != vocab * (dims / 8) * 4) return error.UnexpectedTensor;
+-            e.head_q = try uploadQ4(gpa, driver, head_w.w, head_w.s, head_w.b, vocab, dims / 8);
++            e.head_q = try @import("cuda_exl3_load.zig").single(gpa, driver, &e.store, kit, stream.*, "language_model.lm_head", vocab, dims);
++        } else {
++            const head_tensor = try e.store.tensor("language_model.lm_head.weight");
++            if (head_tensor.dtype == .bf16) {
++                if (!head_tensor.is(.bf16, &.{ vocab, dims })) return error.UnexpectedTensor;
++                e.head_q = try @import("cuda_projection.zig").dense(gpa, driver, if (try @import("cuda_head.zig").enabled()) try @import("cuda_head.zig").shard(head_tensor, world, rank) else head_tensor);
++            } else {
++                if (try @import("cuda_head.zig").enabled()) return error.BadHeadSharding;
++                var buf: [80]u8 = undefined;
++                const head_w = try join3(gpa, &e.store, &buf, "language_model.lm_head", "");
++                defer gpa.free(head_w.w);
++                defer gpa.free(head_w.s);
++                defer gpa.free(head_w.b);
++                if (head_w.w.len != vocab * (dims / 8) * 4) return error.UnexpectedTensor;
++                e.head_q = try uploadQ4(gpa, driver, head_w.w, head_w.s, head_w.b, vocab, dims / 8);
++            }
+         }
+         errdefer e.head_q.free();
+         var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
+@@ -220,6 +233,7 @@ pub const Engine = struct {
+         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
+         errdefer e.ngram.deinit();
+         e.batch_k = try batch.Kernels.load(driver);
++        e.batch_k.exl3 = e.exl3;
+         e.batch_k.native_lane.fuse_split_n = fuse_split_n;
+         e.batch_s = null;
+         e.scores = null;
+@@ -236,6 +250,7 @@ pub const Engine = struct {
+         if (e.scores) |*b| b.free();
+         e.batch_k.deinit();
+         e.ngram.deinit();
++        if (e.exl3) |k| k.deinit();
+         for (e.layers[0..e.n_layers]) |*l| l.free(e.gpa);
+         e.head_q.free();
+         e.mixer.free();
+@@ -386,7 +401,8 @@ pub const Engine = struct {
+         }
+         // head_local: the draft head's lanes on one GPU, a pass's rows split; native_part only where the lane reduces
+         const parts = @import("cuda_batch_state.zig");
+-        const z: parts.Sizes = .{ .head_rows = if (e.collective != null) @max(rows, parts.head_rows_one) else parts.head_rows_one, .lane_reduce = !e.batch_k.native_lane.clusters, .slots = e.widths.slots(), .shared = e.widths.shared };
++        const z: parts.Sizes = .{ .head_rows = if (e.collective != null) @max(rows, parts.head_rows_one) else parts.head_rows_one, .lane_reduce = !e.batch_k.native_lane.clusters, .slots = e.widths.slots(), .shared = e.widths.shared, .exl3 = e.exl3 != null };
++        if (e.exl3) |kit| try kit.reserveExperts(e.driver, try @import("cuda_exl3_moe.zig").storageBytes(rows, z.slots));
+         e.batch_s = try batch.Scratch.alloc(e.gpa, e.driver, e.stream.*, rows, z);
+         return &e.batch_s.?;
+     }
+diff --git a/zig/src/families/flashnext/cuda_prompt_load.zig b/zig/src/families/flashnext/cuda_prompt_load.zig
+index 56158bd..b9e7783 100644
+--- a/zig/src/families/flashnext/cuda_prompt_load.zig
++++ b/zig/src/families/flashnext/cuda_prompt_load.zig
+@@ -11,6 +11,7 @@ const dense_split = @import("cuda_dense_split.zig");
+ const Cut = @import("cuda_modelopt_experts.zig").Cut;
+ const Heads = @import("cuda_heads.zig").Heads;
+ const heads_cut = @import("heads_cut.zig");
++const exl3_load = @import("cuda_exl3_load.zig");
+ 
+ const layers_n = wt.layers_n;
+ const dims = wt.dims;
+@@ -84,6 +85,8 @@ pub const Layer = struct {
+     experts_up: cuda.DeviceBuffer,
+     experts_down: cuda.DeviceBuffer,
+     native_experts: ?mixed.Owned = null,
++    /// An EXL3 checkpoint's routed experts with the shared expert as expert 512 (cuda_exl3_moe.zig).
++    exl3_experts: ?@import("cuda_exl3_moe.zig").Experts = null,
+     /// The input columns of `out` this rank keeps under the dense split (null: the whole projection).
+     dense_cut: ?Cut = null,
+     /// The heads this rank computes of the layer: the whole layer unless the head split cuts it.
+@@ -111,6 +114,7 @@ pub const Layer = struct {
+         self.nc.free();
+         self.ple_cw.free();
+         if (self.native_experts) |*e| e.free();
++        if (self.exl3_experts) |*e| e.free();
+         self.experts_up.free();
+         self.experts_down.free();
+     }
+@@ -260,6 +264,27 @@ fn keepDown(gpa: std.mem.Allocator, store: *Store, buf: []u8, prefix: []const u8
+     return .{ .face = .{ .w = w, .s = s, .b = b, .n = dims, .k = moe_w, .routed = false }, .w = w, .s = s, .b = b };
+ }
+ 
++/// The MLX and ModelOpt checkpoints' router: the gate's bf16 rows, then the shared expert gate's row.
++fn routerOf(gpa: std.mem.Allocator, store: *Store, buf: []u8, mlp_root: []const u8) ![]u16 {
++    const gate = try store.tensor(try std.fmt.bufPrint(buf, "{s}.gate.weight", .{mlp_root}));
++    if (!gate.is(.bf16, &.{ experts_n, dims })) return error.UnexpectedTensor;
++    const router = try gpa.alloc(u16, (experts_n + 1) * dims);
++    errdefer gpa.free(router);
++    @memcpy(std.mem.sliceAsBytes(router[0 .. experts_n * dims]), gate.bytes);
++    const sg_tensor = try store.tensor(try std.fmt.bufPrint(buf, "{s}.shared_expert_gate.weight", .{mlp_root}));
++    if (sg_tensor.dtype == .bf16) {
++        if (!sg_tensor.is(.bf16, &.{ 1, dims }) or sg_tensor.bytes.len != dims * 2) return error.UnexpectedTensor;
++        @memcpy(std.mem.sliceAsBytes(router[experts_n * dims ..]), sg_tensor.bytes);
++    } else {
++        const sg = try join3(gpa, store, buf, mlp_root, ".shared_expert_gate");
++        defer gpa.free(sg.w);
++        defer gpa.free(sg.s);
++        defer gpa.free(sg.b);
++        try embed.dequant(sg.w, sg.s, sg.b, dims, 0, router[experts_n * dims ..][0..dims]);
++    }
++    return router;
++}
++
+ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize) !Layer {
+     return loadLayerRank(gpa, driver, stream, store, pack_fn, layer, 1, 0, null);
+ }
+@@ -293,25 +318,8 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+     var mlp_buf: [96]u8 = undefined;
+     @memcpy(mlp_buf[0..mlp.len], mlp);
+     const mlp_root = mlp_buf[0..mlp.len];
+-    const gate = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.gate.weight", .{mlp_root}));
+-    if (!gate.is(.bf16, &.{ experts_n, dims })) return error.UnexpectedTensor;
+-    const gate_copy = try gpa.alloc(u8, gate.bytes.len);
+-    defer gpa.free(gate_copy);
+-    @memcpy(gate_copy, gate.bytes);
+-    const router = try gpa.alloc(u16, (experts_n + 1) * dims);
++    const router = if (store.exl3 != null) try exl3_load.router(gpa, store, mlp_root) else try routerOf(gpa, store, &buf, mlp_root);
+     defer gpa.free(router);
+-    @memcpy(std.mem.sliceAsBytes(router[0 .. experts_n * dims]), gate_copy);
+-    const sg_tensor = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.shared_expert_gate.weight", .{mlp_root}));
+-    if (sg_tensor.dtype == .bf16) {
+-        if (!sg_tensor.is(.bf16, &.{ 1, dims }) or sg_tensor.bytes.len != dims * 2) return error.UnexpectedTensor;
+-        @memcpy(std.mem.sliceAsBytes(router[experts_n * dims ..]), sg_tensor.bytes);
+-    } else {
+-        const sg = try join3(gpa, store, &buf, mlp_root, ".shared_expert_gate");
+-        defer gpa.free(sg.w);
+-        defer gpa.free(sg.s);
+-        defer gpa.free(sg.b);
+-        try embed.dequant(sg.w, sg.s, sg.b, dims, 0, router[experts_n * dims ..][0..dims]);
+-    }
+     var router_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(router));
+     errdefer router_b.free();
+ 
+@@ -352,12 +360,17 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+         var pre_buf: [120]u8 = undefined;
+         @memcpy(pre_buf[0..pre.len], pre);
+         const lp = pre_buf[0..pre.len];
+-        if (cut != null) {
+-            const st = try heads_cut.delta(heads, at);
+-            proj_q = try projections.loadStitchedCut(gpa, driver, store, lp, &heads_cut.delta_parts, &st.ranges, st.n, dims, st.sk);
+-        } else proj_q = try projections.loadStitched(gpa, driver, store, lp, &heads_cut.delta_parts, gdn.proj_width, dims);
+         const out_name = try std.fmt.bufPrint(&buf, "{s}.out_proj", .{lp});
+-        out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, gdn.value_dim, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, gdn.value_dim);
++        if (store.exl3) |kit| {
++            proj_q = try exl3_load.stitched(gpa, driver, store, kit, stream.*, lp, &heads_cut.delta_parts, gdn.proj_width, dims);
++            out_q = try exl3_load.single(gpa, driver, store, kit, stream.*, out_name, dims, gdn.value_dim);
++        } else {
++            if (cut != null) {
++                const st = try heads_cut.delta(heads, at);
++                proj_q = try projections.loadStitchedCut(gpa, driver, store, lp, &heads_cut.delta_parts, &st.ranges, st.n, dims, st.sk);
++            } else proj_q = try projections.loadStitched(gpa, driver, store, lp, &heads_cut.delta_parts, gdn.proj_width, dims);
++            out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, gdn.value_dim, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, gdn.value_dim);
++        }
+         const conv = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.conv1d.weight", .{lp}));
+         if (conv.bytes.len != gdn.conv_dim * gdn.taps * 2) return error.UnexpectedTensor;
+         if (cut != null) {
+@@ -380,12 +393,17 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+         var pre_buf: [120]u8 = undefined;
+         @memcpy(pre_buf[0..pre.len], pre);
+         const ap = pre_buf[0..pre.len];
+-        if (cut != null) {
+-            const st = try heads_cut.attention(heads, at);
+-            proj_q = try projections.loadStitchedCut(gpa, driver, store, ap, &heads_cut.attention_parts, &st.ranges, st.n, dims, st.sk);
+-        } else proj_q = try projections.loadStitched(gpa, driver, store, ap, &heads_cut.attention_parts, proj_n, dims);
+         const out_name = try std.fmt.bufPrint(&buf, "{s}.o_proj", .{ap});
+-        out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, out_k, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, out_k);
++        if (store.exl3) |kit| {
++            proj_q = try exl3_load.stitched(gpa, driver, store, kit, stream.*, ap, &heads_cut.attention_parts, proj_n, dims);
++            out_q = try exl3_load.single(gpa, driver, store, kit, stream.*, out_name, dims, out_k);
++        } else {
++            if (cut != null) {
++                const st = try heads_cut.attention(heads, at);
++                proj_q = try projections.loadStitchedCut(gpa, driver, store, ap, &heads_cut.attention_parts, &st.ranges, st.n, dims, st.sk);
++            } else proj_q = try projections.loadStitched(gpa, driver, store, ap, &heads_cut.attention_parts, proj_n, dims);
++            out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, out_k, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, out_k);
++        }
+         const qn = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.q_norm.weight", .{ap})));
+         defer gpa.free(qn);
+         const kn = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.k_norm.weight", .{ap})));
+@@ -419,16 +437,24 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+         nc_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(nc));
+         const conv = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.conv1d.weight", .{pp}));
+         if (conv.bytes.len != wide * 4 * 2) return error.UnexpectedTensor;
+-        pcw_b = try cuda.DeviceBuffer.fromHost(driver, conv.bytes);
++        if (conv.dtype == .f16) {
++            const bits = try wt.bf16Bits(gpa, conv);
++            defer gpa.free(bits);
++            pcw_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(bits));
++        } else pcw_b = try cuda.DeviceBuffer.fromHost(driver, conv.bytes);
+     }
+ 
+     var native_experts: ?mixed.Owned = null;
+     errdefer if (native_experts) |*e| e.free();
++    var exl3_experts: ?@import("cuda_exl3_moe.zig").Experts = null;
++    errdefer if (exl3_experts) |*e| e.free();
+     var experts_up = deadBuf(driver);
+     errdefer experts_up.free();
+     var experts_down = deadBuf(driver);
+     errdefer experts_down.free();
+-    if (store.has(try std.fmt.bufPrint(&buf, "{s}.experts.0.gate_proj.weight", .{mlp_root}))) {
++    if (store.exl3 != null) {
++        exl3_experts = try exl3_load.experts(gpa, driver, store, mlp_root);
++    } else if (store.has(try std.fmt.bufPrint(&buf, "{s}.experts.0.gate_proj.weight", .{mlp_root}))) {
+         native_experts = try mixed.load(gpa, driver, store, mlp_root, world, rank, cut != null);
+     } else {
+         if (world != 1 or rank != 0) return error.UnsupportedQuantization;
+@@ -491,6 +517,7 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+         .experts_up = experts_up,
+         .experts_down = experts_down,
+         .native_experts = native_experts,
++        .exl3_experts = exl3_experts,
+         .dense_cut = cut,
+         .heads = heads,
+     };
+diff --git a/zig/src/families/flashnext/cuda_prompt_wt.zig b/zig/src/families/flashnext/cuda_prompt_wt.zig
+index 4c38a24..6f91b31 100644
+--- a/zig/src/families/flashnext/cuda_prompt_wt.zig
++++ b/zig/src/families/flashnext/cuda_prompt_wt.zig
+@@ -120,6 +120,8 @@ pub const Store = struct {
+     /// Shards a load already opened, kept open until it ends (loaded or deinit): reopening one parses its header again.
+     released: std.ArrayList(Held) = .empty,
+     norm_offset: f32 = 0,
++    /// An EXL3 pack's kernels: set when the pack has trellis tensors, which the layer loaders then read.
++    exl3: ?*@import("cuda_exl3_kit.zig").Kit = null,
+ 
+     pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Store {
+         const index = try std.fs.path.join(gpa, &.{ dir, "model.safetensors.index.json" });
+@@ -440,6 +442,11 @@ pub fn asF32(gpa: std.mem.Allocator, t: Tensor) ![]f32 {
+         for (out, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u32, t.bytes[4 * i ..][0..4], .little));
+     } else if (t.dtype == .bf16 and t.bytes.len == out.len * 2) {
+         for (out, 0..) |*o, i| o.* = promote(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little));
++    } else if (t.dtype == .f16 and t.bytes.len == out.len * 2) {
++        for (out, 0..) |*o, i| {
++            const h: f16 = @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little));
++            o.* = @floatCast(h);
++        }
+     } else return error.UnexpectedTensor;
+     return out;
+ }
+@@ -484,7 +491,7 @@ pub fn loadHc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *Store, prefi
+     var buf: [180]u8 = undefined;
+     const down_name = try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_down.weight", .{prefix});
+     const down_tensor = try store.tensor(down_name);
+-    if (down_tensor.dtype == .bf16) return loadDenseHc(gpa, driver, store, prefix, inject);
++    if (down_tensor.dtype == .bf16 or down_tensor.dtype == .f16) return loadDenseHc(gpa, driver, store, prefix, inject);
+     const down = try join3(gpa, store, &buf, prefix, ".input_mix_weight_down");
+     defer gpa.free(down.w);
+     defer gpa.free(down.s);
+@@ -535,25 +542,47 @@ pub fn loadHc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *Store, prefi
+     return .{ .scale = scale_b, .down = down_q, .up = up_q, .n_down = n, .has_inj = @intFromBool(inject) };
+ }
+ 
++/// The bf16 bits of a bf16 or f16 tensor (f16 values round to nearest even), in a fresh slice.
++pub fn bf16Bits(gpa: std.mem.Allocator, t: Tensor) ![]u16 {
++    if (t.bytes.len % 2 != 0) return error.UnexpectedTensor;
++    const out = try gpa.alloc(u16, t.bytes.len / 2);
++    errdefer gpa.free(out);
++    for (out, 0..) |*o, i| {
++        const bits = std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little);
++        o.* = switch (t.dtype) {
++            .bf16 => bits,
++            .f16 => toBf16(@floatCast(@as(f16, @bitCast(bits)))),
++            else => return error.UnexpectedTensor,
++        };
++    }
++    return out;
++}
++
+ fn loadDenseHc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *Store, prefix: []const u8, inject: bool) !HcW {
+     const projection = @import("cuda_projection.zig");
+     var buf: [200]u8 = undefined;
+     const n = low + if (inject) streams else @as(usize, 0);
+-    const data = try gpa.alloc(u8, n * wide * 2);
++    const data = try gpa.alloc(u16, n * wide);
+     defer gpa.free(data);
+     const down = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_down.weight", .{prefix}));
+-    if (!down.is(.bf16, &.{ low, wide }) or down.bytes.len != low * wide * 2) return error.UnexpectedTensor;
+-    @memcpy(data[0..down.bytes.len], down.bytes);
++    if (down.rank != 2 or down.dim(0) != low or down.dim(1) != wide) return error.UnexpectedTensor;
++    const down_bits = try bf16Bits(gpa, down);
++    defer gpa.free(down_bits);
++    @memcpy(data[0 .. low * wide], down_bits);
+     if (inject) {
+         const inj = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.block_inject_weight.weight", .{prefix}));
+-        if (!inj.is(.bf16, &.{ streams, wide }) or inj.bytes.len != streams * wide * 2) return error.UnexpectedTensor;
+-        @memcpy(data[low * wide * 2 ..], inj.bytes);
++        if (inj.rank != 2 or inj.dim(0) != streams or inj.dim(1) != wide) return error.UnexpectedTensor;
++        const inj_bits = try bf16Bits(gpa, inj);
++        defer gpa.free(inj_bits);
++        @memcpy(data[low * wide ..], inj_bits);
+     }
+-    var dq = try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = data });
++    var dq = try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, wide, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(data) });
+     errdefer dq.free();
+     const up = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
+-    if (!up.is(.bf16, &.{ wide, low })) return error.UnexpectedTensor;
+-    var uq = try projection.dense(gpa, driver, up);
++    if (up.rank != 2 or up.dim(0) != wide or up.dim(1) != low) return error.UnexpectedTensor;
++    const up_bits = try bf16Bits(gpa, up);
++    defer gpa.free(up_bits);
++    var uq = try projection.dense(gpa, driver, .{ .dtype = .bf16, .rank = 2, .shape = .{ wide, low, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(up_bits) });
+     errdefer uq.free();
+     const gamma = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.hc_norm.weight", .{prefix})));
+     defer gpa.free(gamma);
+diff --git a/zig/src/families/flashnext/cuda_scratch_sizes.zig b/zig/src/families/flashnext/cuda_scratch_sizes.zig
+index 9522b7d..3a57f21 100644
+--- a/zig/src/families/flashnext/cuda_scratch_sizes.zig
++++ b/zig/src/families/flashnext/cuda_scratch_sizes.zig
+@@ -11,7 +11,7 @@ const att_rows = @import("cuda_batch_state.zig").att_rows;
+ pub const head_rows_one: usize = 32;
+ 
+ /// head_local's rows, the lane's K-slice reduce, a row's expert slots and the widest shared expert (cuda_widths.zig).
+-pub const Sizes = struct { head_rows: usize = head_rows_one, lane_reduce: bool = true, slots: usize = wt.slots, shared: usize = wt.moe_w };
++pub const Sizes = struct { head_rows: usize = head_rows_one, lane_reduce: bool = true, slots: usize = wt.slots, shared: usize = wt.moe_w, exl3: bool = false };
+ 
+ /// hc_part's rows of (low + 4) floats: hc_sk slices below 64 rows (legacy kernel), <= 8 below 256 (lane), one beyond.
+ pub fn hcPartRows(cap: usize) usize {

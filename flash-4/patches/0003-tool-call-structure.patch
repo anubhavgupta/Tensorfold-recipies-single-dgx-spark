@@ -1,0 +1,131 @@
+Tool calls: an XML call's envelope closer and each parameter's end are found through the call's structure (functions, parameters, the closer), not the first closing tag, so a literal </tool_call> or </parameter> inside a value stays data (the model quoting a tool call in a file it writes). The flash-3 repro matrix: 12 -> 4 mismatches (the rest are token-limit cuts).
+
+diff --git a/zig/src/server/tool_json_close.zig b/zig/src/server/tool_json_close.zig
+index b794a90..130c0e0 100644
+--- a/zig/src/server/tool_json_close.zig
++++ b/zig/src/server/tool_json_close.zig
+@@ -3,9 +3,77 @@ const std = @import("std");
+ 
+ const tag = "</tool_call>";
+ 
++const fn_open = "<function=";
++const fn_close = "</function>";
++const param_open = "<parameter=";
++const param_close = "</parameter>";
++
++fn skipSpace(text: []const u8, from: usize) usize {
++    var i = from;
++    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\r' or text[i] == '\n')) i += 1;
++    return i;
++}
++
++/// Whether `rest` is a proper prefix of `tag` (a tag the feed cut short), compared without case.
++fn cutTag(rest: []const u8, whole: []const u8) bool {
++    return rest.len < whole.len and std.ascii.startsWithIgnoreCase(whole, rest);
++}
++
++/// The end of a ``</parameter>`` that closes the value starting at `from`: the first one followed, past blanks, by the next
++/// ``<parameter=`` or by ``</function>`` (a literal ``</parameter>`` inside the value is data), or by the end of `text` when
++/// `end_closes` (a function body already cut at its ``</function>``). null: not decided yet.
++pub fn paramEnd(text: []const u8, from: usize, end_closes: bool) ?usize {
++    var q = from;
++    while (std.ascii.findIgnoreCasePos(text, q, param_close)) |e| : (q = e + 1) {
++        const k = skipSpace(text, e + param_close.len);
++        if (k >= text.len) return if (end_closes) e else null;
++        const rest = text[k..];
++        if (std.ascii.startsWithIgnoreCase(rest, fn_close) or std.ascii.startsWithIgnoreCase(rest, param_open)) return e;
++        if (cutTag(rest, fn_close) or cutTag(rest, param_open)) return null;
++    }
++    return null;
++}
++
++/// The ``</tool_call>`` closing an XML-led payload that starts at `begin`, found through its structure: functions, their
++/// parameters (values read to ``paramEnd``), then the closer. A closer inside a value is data. null until decided; the
++/// first closer anywhere when the text leaves that structure.
++fn xmlClose(text: []const u8, begin: usize) ?usize {
++    var i = begin;
++    while (true) {
++        i = skipSpace(text, i);
++        if (i >= text.len) return null;
++        const rest = text[i..];
++        if (std.ascii.startsWithIgnoreCase(rest, fn_open)) {
++            const gt = std.mem.indexOfScalarPos(u8, text, i, '>') orelse return null;
++            i = gt + 1;
++            while (true) {
++                i = skipSpace(text, i);
++                if (i >= text.len) return null;
++                const r = text[i..];
++                if (std.ascii.startsWithIgnoreCase(r, param_open)) {
++                    const g = std.mem.indexOfScalarPos(u8, text, i, '>') orelse return null;
++                    const e = paramEnd(text, g + 1, false) orelse return null;
++                    i = e + param_close.len;
++                } else if (std.ascii.startsWithIgnoreCase(r, fn_close)) {
++                    i += fn_close.len;
++                    break;
++                } else if (cutTag(r, fn_close) or cutTag(r, param_open)) {
++                    return null;
++                } else return std.ascii.findIgnoreCasePos(text, begin, tag);
++            }
++        } else if (std.ascii.startsWithIgnoreCase(rest, tag)) {
++            return i;
++        } else if (cutTag(rest, tag) or cutTag(rest, fn_open)) {
++            return null;
++        } else return std.ascii.findIgnoreCasePos(text, begin, tag);
++    }
++}
++
+ pub const Closer = struct {
+     at: usize,
+     json: ?bool = null, // decided by the payload's first non-blank byte, once one has arrived
++    /// Where an XML-led payload (``<function=``) begins; its closer is found through its structure (xmlClose).
++    xml_from: ?usize = null,
+     in_string: bool = false,
+     escaped: bool = false,
+ 
+@@ -15,7 +83,9 @@ pub const Closer = struct {
+             while (c.at < text.len and (text[c.at] == ' ' or text[c.at] == '\t' or text[c.at] == '\r' or text[c.at] == '\n')) c.at += 1;
+             if (c.at >= text.len) return null; // nothing to decide on yet
+             c.json = text[c.at] == '{' or text[c.at] == '[';
++            if (!c.json.? and std.ascii.startsWithIgnoreCase(text[c.at..], fn_open)) c.xml_from = c.at;
+         }
++        if (c.xml_from) |from| return xmlClose(text, from);
+         if (!c.json.?) {
+             // not JSON: the first closer anywhere; a feed resumes where a partial closer may begin
+             if (std.ascii.findIgnoreCasePos(text, c.at, tag)) |at| return at;
+@@ -51,6 +121,23 @@ pub fn find(text: []const u8, at: usize) ?usize {
+     return closer.next(text);
+ }
+ 
++test "the closer: an XML-led payload's closer inside a parameter value is data, however the text is fed" {
++    const t = std.testing;
++    const text = "<function=write_file>\n<parameter=content>\n<tool_call><function=example></function></tool_call>\n</parameter>\n</function>\n</tool_call>";
++    const want = std.mem.lastIndexOf(u8, text, "</tool_call>").?;
++    var c: Closer = .{ .at = 0 };
++    var got: ?usize = null;
++    for (1..text.len + 1) |n| {
++        got = c.next(text[0..n]);
++        if (got != null) break;
++    }
++    try t.expectEqual(@as(?usize, want), got);
++    try t.expectEqual(@as(?usize, want), find(text, 0));
++    // a literal </parameter> that something other than the next parameter or </function> follows is data too
++    const odd = "<function=f>\n<parameter=a>x </parameter> y</parameter>\n</function>\n</tool_call>";
++    try t.expectEqual(@as(?usize, std.mem.lastIndexOf(u8, odd, "</tool_call>").?), find(odd, 0));
++}
++
+ test "the closer: found whole or fed a byte at a time, JSON-led or not, never inside a JSON string" {
+     const t = std.testing;
+     const cases = [_]struct { text: []const u8, want: ?usize }{
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 26bdb02..101d6cf 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -421,7 +421,7 @@ fn parameterBlocks(a: Allocator, body: []const u8) Allocator.Error!Params {
+         const key = body[key_start..i];
+         i += 1;
+         if (i < body.len and body[i] == '\n') i += 1;
+-        const e = findCI(body, "</parameter>", i) orelse break;
++        const e = tool_json_close.paramEnd(body, i, true) orelse break;
+         var value = body[i..e];
+         if (std.mem.endsWith(u8, value, "\n")) value = value[0 .. value.len - 1];
+         try items.append(a, .{ .key = key, .value = value });

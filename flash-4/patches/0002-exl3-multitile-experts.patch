@@ -1,0 +1,494 @@
+EXL3 grouped experts for prompt items: the multi-tile kernels (grouped_body_mtl, variants 1 to 6 of exl3_experts.cu) decode each weight tile once for several 16-row tiles (default variant 3: 4 column tiles, 2 row tiles; TF_EXL3_MTL=0 restores the 16-row-tile kernel, the same bits), prefill 1,185 -> 1,274 tok/s. TF_FLASHNEXT_PROFILE=1 prints each chunk's time per stage and the experts' per-phase times. TF_EXL3_DENSE=tiles selects the candidate dense kernels.
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 77ea3a7..172524f 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -29,6 +29,26 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
+     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
++// The plan's 64-member items with one weight decode for MTL 16-row tiles (grouped_body_mtl), NT column tiles a program: the
++// variants 1 to 6 are (NT, MTL) = (4, 4), (2, 4), (4, 2), (2, 2), (8, 2), (4, 1); a tile-64 item takes 64 / (16 MTL) groups.
++#define TF_GROUPED_MTL(V, NT_, MTL_)                                                                                         \
++    extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_mtl##V##_0(tf_exl3::GroupedArgs a) {                   \
++        tf_exl3::grouped_body_mtl<0, NT_, 4, GROUPED_LOAD, MTL_>(a, blockIdx.x, blockIdx.y, blockIdx.z);                     \
++    }                                                                                                                        \
++    extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_mtl##V##_1(tf_exl3::GroupedArgs a) {                   \
++        tf_exl3::grouped_body_mtl<1, NT_, 4, GROUPED_LOAD, MTL_>(a, blockIdx.x, blockIdx.y, blockIdx.z);                     \
++    }                                                                                                                        \
++    extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_mtl##V##_2(tf_exl3::GroupedArgs a) {                   \
++        tf_exl3::grouped_body_mtl<2, NT_, 4, GROUPED_LOAD, MTL_>(a, blockIdx.x, blockIdx.y, blockIdx.z);                     \
++    }
++TF_GROUPED_MTL(1, 4, 4)
++TF_GROUPED_MTL(2, 2, 4)
++TF_GROUPED_MTL(3, 4, 2)
++TF_GROUPED_MTL(4, 2, 2)
++TF_GROUPED_MTL(5, 8, 2)
++TF_GROUPED_MTL(6, 4, 1)
++#undef TF_GROUPED_MTL
++
+ namespace tf_exl3 {
+ 
+ // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
+diff --git a/zig/kernels/cuda/exl3_grouped.cuh b/zig/kernels/cuda/exl3_grouped.cuh
+index 930700d..d5aad49 100644
+--- a/zig/kernels/cuda/exl3_grouped.cuh
++++ b/zig/kernels/cuda/exl3_grouped.cuh
+@@ -159,4 +159,160 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+     }
+ }
+ 
++// The same warp loop for MTL 16-row tiles at once: each tile of weights is decoded once and feeds every row tile's mma, so a
++// prompt item of up to 16 * MTL members pays for one decode. Every row's accumulation is the one grouped_body's: same k order.
++template <int CB, int K2, int NT, int LOAD, int MTL>
++__device__ __forceinline__ void warp_tiles_mtl(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* const (&x0)[MTL],
++                                               const half* const (&x1)[MTL], const bool (&ok0)[MTL], const bool (&ok1)[MTL],
++                                               const bool (&live)[MTL], int lane, float (&acc)[MTL][NT][2][4]) {
++    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
++    const size_t kstride = (size_t)ntiles * TW;
++    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
++    uint32_t nx[NT][LW];
++    if (LOAD != PLAIN && nkt > 0)
++#pragma unroll
++        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + j * TW, lane, nx[j]);
++    for (int i = 0; i < nkt; ++i) {
++        uint32_t w[NT][LW];
++        if constexpr (LOAD == PLAIN) {
++            const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
++#pragma unroll
++            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
++        } else {
++#pragma unroll
++            for (int j = 0; j < NT; ++j)
++#pragma unroll
++                for (int l = 0; l < LW; ++l) w[j][l] = nx[j][l];
++            if (i + 1 < nkt)
++#pragma unroll
++                for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + (size_t)(i + 1) * kstride + j * TW, lane, nx[j]);
++        }
++        const int k = (kt0 + i) * 16;
++        uint32_t a[MTL][4];
++#pragma unroll
++        for (int m = 0; m < MTL; ++m) {
++            a[m][0] = ok0[m] ? *reinterpret_cast<const uint32_t*>(x0[m] + k) : 0u;
++            a[m][1] = ok1[m] ? *reinterpret_cast<const uint32_t*>(x1[m] + k) : 0u;
++            a[m][2] = ok0[m] ? *reinterpret_cast<const uint32_t*>(x0[m] + k + 8) : 0u;
++            a[m][3] = ok1[m] ? *reinterpret_cast<const uint32_t*>(x1[m] + k + 8) : 0u;
++        }
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            uint32_t b0[2], b1[2];
++            decode_lane<K2, CB>(w[j], lane, b0, b1);
++#pragma unroll
++            for (int m = 0; m < MTL; ++m)
++                if (live[m]) {
++                    mma16816(acc[m][j][0], a[m], b0);
++                    mma16816(acc[m][j][1], a[m], b1);
++                }
++        }
++    }
++}
++
++// grouped_body for the plan's items (standard mode) of up to a.maxm members, in groups of MTL 16-row tiles a program: one
++// decode of the weights for all of them. nblock counts NT-tile column blocks. Rows' sums equal grouped_body's bit for bit.
++template <int CB, int NT, int W, int LOAD, int MTL>
++__device__ __forceinline__ void grouped_body_mtl(const GroupedArgs a, int u, int nblock, int zz) {
++    if (u >= a.ucount[0]) return;
++    const int MG = (a.maxm + 16 * MTL - 1) / (16 * MTL);
++    const int mgroup = zz % MG;
++    const int split = (zz / MG) % a.sk;
++    const int mat = zz / MG / a.sk;
++    const half* X = mat ? a.x1 : a.x0;
++    const int e = a.uids[3 * u];
++    if (e == a.skip) return;
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
++    const int k2 = mat ? a.k2_1[e] : a.k2_0[e];
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4);
++
++    __shared__ int rows_sh[MTL][16];
++    const int count = a.uids[3 * u + 2], first = a.uids[3 * u + 1];
++    for (int q = threadIdx.x; q < MTL * 16; q += W * 32) {
++        const int m = mgroup * MTL * 16 + q;
++        rows_sh[q / 16][q % 16] = m < count ? a.members[first + m] : -1;
++    }
++    __syncthreads();
++    if (rows_sh[0][0] < 0) return;  // members come first, so this group is empty
++    const half* x0[MTL];
++    const half* x1[MTL];
++    bool ok0[MTL], ok1[MTL], live[MTL];
++#pragma unroll
++    for (int m = 0; m < MTL; ++m) {
++        const int r0 = rows_sh[m][g], r1 = rows_sh[m][g + 8];
++        x0[m] = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
++        x1[m] = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
++        ok0[m] = r0 >= 0;
++        ok1[m] = r1 >= 0;
++        live[m] = rows_sh[m][0] >= 0;
++    }
++    const int per_warp = (a.k >> 4) / a.sk / W;
++    const int kt0 = split * (per_warp * W) + warp * per_warp;
++    const int nt0 = nblock * NT;
++
++    float acc[MTL][NT][2][4];
++#pragma unroll
++    for (int m = 0; m < MTL; ++m)
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++
++    switch (k2) {
++#define TF_EXL3X_CASE(K2_)                                                                                                  \
++    case K2_:                                                                                                               \
++        warp_tiles_mtl<CB, K2_, NT, LOAD, MTL>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, live, lane, acc);           \
++        break;
++        TF_EXL3X_CASE(2)
++        TF_EXL3X_CASE(3)
++        TF_EXL3X_CASE(4)
++        TF_EXL3X_CASE(5)
++        TF_EXL3X_CASE(6)
++        TF_EXL3X_CASE(7)
++        TF_EXL3X_CASE(8)
++        TF_EXL3X_CASE(9)
++        TF_EXL3X_CASE(10)
++        TF_EXL3X_CASE(11)
++        TF_EXL3X_CASE(12)
++        TF_EXL3X_CASE(13)
++        TF_EXL3X_CASE(14)
++        TF_EXL3X_CASE(15)
++        TF_EXL3X_CASE(16)
++#undef TF_EXL3X_CASE
++        default:
++            __trap();
++    }
++
++    __shared__ __align__(16) float red[W][16][NT * 16];
++#pragma unroll
++    for (int m = 0; m < MTL; ++m) {
++        if (m) __syncthreads();
++        if (!live[m]) continue;  // uniform across the block
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = i * 16 + h * 8 + 2 * t;
++                red[warp][g][col] = acc[m][i][h][0];
++                red[warp][g][col + 1] = acc[m][i][h][1];
++                red[warp][g + 8][col] = acc[m][i][h][2];
++                red[warp][g + 8][col + 1] = acc[m][i][h][3];
++            }
++        __syncthreads();
++        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[m][row];
++            if (r < 0) continue;
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < W; ++w) s += red[w][row][col];
++            a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
++        }
++    }
++}
++
+ }  // namespace tf_exl3
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 861bb71..362c52d 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -139,6 +139,7 @@ pub const Experts = struct {
+     group: Function,
+     rot_in: Function,
+     grouped: [3]Function, // one per codebook
++    grouped_mtl: [6][3]Function, // the same for the plan's 64-member items, one weight decode for several 16-row tiles: variants 1 to 6
+     gateup: Function,
+     down_combine: Function,
+     prompt: prompt.Kernels = undefined,
+@@ -153,6 +154,7 @@ pub const Experts = struct {
+             .group = undefined,
+             .rot_in = undefined,
+             .grouped = undefined,
++            .grouped_mtl = undefined,
+             .gateup = undefined,
+             .down_combine = undefined,
+         };
+@@ -169,6 +171,11 @@ pub const Experts = struct {
+             try e.mod.function("tf_exl3_grouped_1"),
+             try e.mod.function("tf_exl3_grouped_2"),
+         };
++        inline for (.{ "1", "2", "3", "4", "5", "6" }, 0..) |v, vi| e.grouped_mtl[vi] = .{
++            try e.mod.function("tf_exl3_grouped_mtl" ++ v ++ "_0"),
++            try e.mod.function("tf_exl3_grouped_mtl" ++ v ++ "_1"),
++            try e.mod.function("tf_exl3_grouped_mtl" ++ v ++ "_2"),
++        };
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+         e.down_combine = try e.mod.function("tf_exl3_down_combine");
+         return e;
+diff --git a/zig/src/cuda/exl3_grouped.zig b/zig/src/cuda/exl3_grouped.zig
+index 9ced700..a967d3e 100644
+--- a/zig/src/cuda/exl3_grouped.zig
++++ b/zig/src/cuda/exl3_grouped.zig
+@@ -7,6 +7,7 @@ const memory = @import("memory.zig");
+ const Driver = @import("driver.zig").Driver;
+ const Stream = @import("stream.zig").Stream;
+ const launch = @import("launch.zig");
++const platform = @import("sys");
+ 
+ /// plan_rotate's and plan_finish's arguments (exl3_plan.cuh's PlanStage), in its field order.
+ pub const Stage = extern struct {
+@@ -39,10 +40,30 @@ pub const UpContract = enum { bf16, combined_fp32 };
+ 
+ pub const Grouped = struct {
+     up_contract: UpContract = .bf16,
++    /// 64-member items on a multi-tile kernel (variants 1 to 4 of exl3_experts.cu; 0: the 16-row-tile kernel, the same bits).
++    mtl: u8 = 3,
++    /// Per phase (up and down: rotate, grouped, finish) device time with every launch synchronized (TF_EXL3_PROFILE).
++    prof: bool = false,
++    prof_ns: [6]u64 = @splat(0),
++    prof_last: i128 = 0,
+     d: *const Driver,
+     kernels: *const ex.Experts,
+     storage: ?memory.DeviceBuffer = null,
+ 
++    fn begin(g: *Grouped, s: Stream) !void {
++        if (!g.prof) return;
++        try s.synchronize();
++        g.prof_last = nowNs();
++    }
++
++    fn mark(g: *Grouped, s: Stream, phase: usize) !void {
++        if (!g.prof) return;
++        try s.synchronize();
++        const now = nowNs();
++        g.prof_ns[phase] += @intCast(now - g.prof_last);
++        g.prof_last = now;
++    }
++
+     pub fn deinit(g: *Grouped) void {
+         if (g.storage) |*b| b.free();
+         g.storage = null;
+@@ -86,18 +107,28 @@ pub const Grouped = struct {
+             .down_f32 => 0,
+             .down_bf16 => 3,
+         }, .act_mode = w.act_mode, .limit = w.limit, .alpha = w.alpha };
++        try g.begin(s);
++        const base: usize = if (up) 0 else 3;
+         var rot: launch.Args = .{};
+         rot.add(a);
+         try launch.launch(g.kernels.plan_rotate, .{ .grid = .{ .x = @intCast(items), .y = @intCast(k / 128), .z = @intCast(mats) }, .block = .{ .x = 32 } }, s, &rot);
++        try g.mark(s, base);
+         var args: launch.Args = .{};
+         for ([_]u64{ x0, x1, if (up) w.gate else w.down, if (up) w.up else w.down, if (up) w.gate_k2 else w.down_k2, if (up) w.up_k2 else w.down_k2, p.items, p.counts, p.members, z }) |v| args.add(v);
+         for ([_]usize{ k, n, pairs, sk, tile, in.slots, items, mats, if (up) w.gu_stride else 0, 1 }) |v|
+             args.add(@as(i32, @intCast(v)));
+         args.add(skip);
+-        try launch.launch(g.kernels.grouped[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128), .z = @intCast(mats * sk * mt) }, .block = .{ .x = 128 } }, s, &args);
++        // one decode of the weights for several 16-row tiles of a 64-member item, when the shape allows
++        const shape = if (g.mtl != 0 and tile == 64) mtl_shapes[g.mtl - 1] else [2]usize{ 0, 0 };
++        if (shape[0] != 0 and n % (16 * shape[0]) == 0) {
++            const groups = (64 + 16 * shape[1] - 1) / (16 * shape[1]);
++            try launch.launch(g.kernels.grouped_mtl[g.mtl - 1][@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / (16 * shape[0])), .z = @intCast(mats * sk * groups) }, .block = .{ .x = 128 } }, s, &args);
++        } else try launch.launch(g.kernels.grouped[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128), .z = @intCast(mats * sk * mt) }, .block = .{ .x = 128 } }, s, &args);
++        try g.mark(s, base + 1);
+         var finish: launch.Args = .{};
+         finish.add(a);
+         try launch.launch(if (l.after) g.kernels.plan_finish_after else g.kernels.plan_finish, .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128) }, .block = .{ .x = 32 } }, s, &finish);
++        try g.mark(s, base + 2);
+     }
+ };
+ 
+@@ -110,6 +141,15 @@ fn tileBlocks(tile: usize) !usize {
+     };
+ }
+ 
++fn nowNs() i128 {
++    var t: platform.c.timespec = undefined;
++    _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &t);
++    return @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
++}
++
++/// The (column tiles a program, row tiles sharing a decode) of the multi-tile variants 1 to 6 (exl3_experts.cu).
++const mtl_shapes = [6][2]usize{ .{ 4, 4 }, .{ 2, 4 }, .{ 4, 2 }, .{ 2, 2 }, .{ 8, 2 }, .{ 4, 1 } };
++
+ /// The activations plan_finish runs (0 bf16, 1 fp32, 2 SwiGLU-OAI); SwiGLU-OAI needs its clamp and alpha.
+ fn checkAct(w: ex.Layer, after: bool) !void {
+     if (w.act_mode < 0 or w.act_mode > 2) return error.BadExperts;
+@@ -197,7 +237,7 @@ test "Grouped.run launches the plan tile's grid and compact pair stride, droppin
+     ks.plan_finish_after = .{ .d = &d, .handle = @ptrFromInt(3) };
+     for (&ks.grouped, 0..) |*f, i| f.* = .{ .d = &d, .handle = @ptrFromInt(10 + i) };
+     const base: u64 = 0x4000_0000;
+-    var g: Grouped = .{ .d = &d, .kernels = &ks, .storage = .{ .d = &d, .ptr = base, .len = 1 << 28 } };
++    var g: Grouped = .{ .d = &d, .kernels = &ks, .mtl = 0, .storage = .{ .d = &d, .ptr = base, .len = 1 << 28 } };
+     const w: ex.Layer = .{ .gate = 0x10, .up = 0x20, .down = 0x30, .gate_k2 = 0x40, .up_k2 = 0x50, .down_k2 = 0x60, .suh_g = 1, .suh_u = 2, .suh_d = 3, .svh_g = 4, .svh_u = 5, .svh_d = 6, .dims = 2048, .width = 512, .experts = 257, .codebook = .mul1 };
+     const l: experts.Layer = .{ .format = .exl3, .exl3 = w, .up = 0, .down = 0, .dims = 2048, .width = 512, .experts = 257 };
+     const pl: grouped.Plan = .{ .members = 0x100, .items = 0x200, .counts = 0x300, .rank = 0, .hist = 0 };
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 52681a1..9810e84 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -125,6 +125,10 @@ pub fn Pass(comptime Tri: type) type {
+         staged: bool = false,
+         /// This round's lanes take their attention in one launch a kernel (batch_lanes, TF_FLASHNEXT_ATTN_LANES).
+         lanes_attn: bool = false,
++        /// TF_FLASHNEXT_PROFILE=1: time (ns) per stage of the last chunk (prof_names) and the mark the next one counts from.
++        prof: [prof_names.len]u64 = @splat(0),
++        prof_last: i96 = 0,
++        prof_on: bool = false,
+ 
+         // ---- launches ----------------------------------------------------------------------------------------
+ 
+@@ -258,6 +262,7 @@ pub fn Pass(comptime Tri: type) type {
+             const pw = h.projWidth();
+             const cd = h.convDim();
+             _ = try self.lane(s.mixed, s.xsm, lw.proj, s.proj, s.dummy, n, 1);
++            self.mark(1);
+             // a lone pass keeps its projection and conv window; a shared pass keeps each lane's own
+             if (self.lanes.len == 0) {
+                 try self.copy(keep.proj, s.proj, n * pw * 2);
+@@ -304,7 +309,9 @@ pub fn Pass(comptime Tri: type) type {
+             }
+             if (!fused) try gdn_fused.norm(g.norm, self.stream, s.ys, s.proj, lw.norm.ptr, s.gout, s.gxs, n, h);
+             if (self.lanes.len == 0) try self.shiftWindow(self.seq.conv[li].ptr, s.proj, pw, n, gdn.taps - 1, cd);
++            self.mark(2);
+             self.out_slices = try split_lane.out(self, s.gout, s.gxs, lw);
++            self.mark(3);
+         }
+ 
+         /// fn_gdn_front over `rows` projection rows after the conv window `conv`.
+@@ -356,6 +363,7 @@ pub fn Pass(comptime Tri: type) type {
+             const h = lw.heads;
+             const pn = h.projN();
+             _ = try self.lane(s.mixed, s.xsm, lw.proj, pa, s.dummy, n, 1);
++            self.mark(4);
+             const qw2 = h.q * 2 * head_dim;
+             const kw = h.kv * head_dim;
+             try self.copyCols(pa, pn, keep.pq, qw2, qw2, n);
+@@ -381,7 +389,9 @@ pub fn Pass(comptime Tri: type) type {
+             } else try self.attnRows(lw, ai, pa, n, .{ .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao });
+             const gated = if (keep.gated != 0) keep.gated else s.gated;
+             try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, pn, h.q, head_dim);
++            self.mark(5);
+             self.out_slices = try split_lane.out(self, gated, s.gxs_attn, lw);
++            self.mark(6);
+         }
+ 
+         /// Where attnRows reads its rows' positions (16 bytes apart) and writes queries, indexer queries and outputs.
+@@ -451,12 +461,17 @@ pub fn Pass(comptime Tri: type) type {
+             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
+             try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
+             try self.tri.topkMany(s.router_l, s.picks, s.wts, n, s.slots);
++            self.mark(8);
+             try self.copy(keep.moe_ids, s.picks, pairs * 4);
+             try self.copy(keep.moe_wts, s.wts, pairs * 4);
+             const e = experts_n + 1;
+             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+             if (lw.native_experts) |*native| return moe_native.run(self, native, n, pairs, plan);
+-            if (lw.exl3_experts) |*x| return exl3_moe.run(self, self.k.exl3 orelse return error.FormatNotLoaded, x, n, plan);
++            if (lw.exl3_experts) |*x| {
++                try exl3_moe.run(self, self.k.exl3 orelse return error.FormatNotLoaded, x, n, plan);
++                self.mark(9);
++                return;
++            }
+             if (n >= 64) {
+                 // prompt rows on 64-pair factored tiles, expert_rows' bits
+                 try self.k.router.route(self.stream, s.picks, pairs, e, tk.fexp_tile, plan);
+@@ -497,9 +512,19 @@ pub fn Pass(comptime Tri: type) type {
+             const s = self.s;
+             const n = ids.len;
+             const t0 = std.Io.Clock.awake.now(self.io).toNanoseconds();
+-            defer if (Kernels.profile()) {
++            self.prof_on = Kernels.profile();
++            self.prof = @splat(0);
++            self.prof_last = t0;
++            defer if (self.prof_on) {
+                 self.complete() catch {};
+                 std.debug.print("batch: {d} rows at {d} in {d:.1} ms\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
++                inline for (prof_names, 0..) |name, i| std.debug.print("  {s} {d:.1}", .{ name, @as(f64, @floatFromInt(self.prof[i])) / 1e6 });
++                std.debug.print("\n", .{});
++                if (self.k.exl3) |kit| {
++                    const g = &kit.grouped;
++                    std.debug.print("  experts: up rot {d:.1} gemm {d:.1} fin {d:.1} | down rot {d:.1} gemm {d:.1} fin {d:.1}\n", .{ @as(f64, @floatFromInt(g.prof_ns[0])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[1])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[2])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[3])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[4])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[5])) / 1e6 });
++                    g.prof_ns = @splat(0);
++                }
+             };
+             if (n == 0 or n > s.cap) return error.UnexpectedTensor;
+             if (self.lanes.len > 0) {
+@@ -525,6 +550,7 @@ pub fn Pass(comptime Tri: type) type {
+                 try self.tri.embed(s.ids, self.m.table_w, self.m.table_s, self.m.table_b, s.h, dims, streams, n);
+             }
+             try @import("cuda_media.zig").inject(self.seq.media, self.lanes, self.stream, s.h, self.pos0, n);
++            self.mark(12);
+             for (self.m.layers, 0..) |*lw, layer| {
+                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+                 if (layer == ple_layer) {
+@@ -539,6 +565,7 @@ pub fn Pass(comptime Tri: type) type {
+                     }
+                     if (self.pending != null) try self.writeback(0, n);
+                     try self.pleBlock(lw, ids);
++                    self.mark(10);
+                 }
+                 if (hc.fuses(self, lw.attn_hc, n, keep.attn_hc)) {
+                     try hc.writebackNorm(self, lw.attn_hc, 0, n);
+@@ -547,6 +574,7 @@ pub fn Pass(comptime Tri: type) type {
+                     try self.writeback(0, n);
+                     try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
+                 }
++                self.mark(0);
+                 self.zero_slices = zs.usable(self.s.part_zero, keep.mix_branch, self.m.collective != null, lw.out.native != null);
+                 if (lw.linear) {
+                     try self.gdnBlock(lw, layer, wt.linearIndex(layer), keep);
+@@ -564,11 +592,13 @@ pub fn Pass(comptime Tri: type) type {
+                     try self.tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", sl.stride, n, dims, streams, 4, 1, 1, sl.count);
+                     try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
+                 }
++                self.mark(7);
+                 try self.moeBlockKeep(lw, keep);
+                 try self.moeAdds(layer, keep);
+                 self.pending = layer;
+             }
+             try self.head(logits_host);
++            self.mark(11);
+         }
+ 
+         /// A non-final prompt chunk on one rank that nothing taps: its last layer's MLP stream and experts go unread.
+@@ -577,6 +607,17 @@ pub fn Pass(comptime Tri: type) type {
+             return self.m.collective == null and h.logits == .none and h.streams == 0 and h.keep == null and h.moe_add == null;
+         }
+ 
++        pub const prof_names = [_][]const u8{ "hc_attn", "gdn_proj", "gdn_core", "gdn_out", "attn_proj", "attn_core", "attn_out", "hc_mlp", "route", "experts", "ple", "head", "embed" };
++
++        /// With TF_FLASHNEXT_PROFILE=1: the stream drained, the time since the last mark added to stage `id`.
++        pub fn mark(self: *Self, id: usize) void {
++            if (!self.prof_on) return;
++            self.stream.synchronize() catch return;
++            const now = std.Io.Clock.awake.now(self.io).toNanoseconds();
++            self.prof[id] += @intCast(now - self.prof_last);
++            self.prof_last = now;
++        }
++
+         pub fn complete(self: *Self) !void {
+             if (self.m.collective) |c| return c.finish(self.stream);
+             try self.stream.synchronize();
+diff --git a/zig/src/families/flashnext/cuda_exl3_kit.zig b/zig/src/families/flashnext/cuda_exl3_kit.zig
+index 471ec1b..96aa573 100644
+--- a/zig/src/families/flashnext/cuda_exl3_kit.zig
++++ b/zig/src/families/flashnext/cuda_exl3_kit.zig
+@@ -13,10 +13,13 @@ pub const Kit = struct {
+         errdefer gpa.destroy(k);
+         k.gpa = gpa;
+         k.dense = try cuda.exl3.Dense.load(d);
++        if (std.c.getenv("TF_EXL3_DENSE")) |v| if (std.mem.eql(u8, std.mem.span(v), "tiles")) {
++            k.dense.implementation = .tiles;
++        };
+         errdefer k.dense.unload();
+         k.experts = try cuda.exl3_experts.Experts.load(d);
+         errdefer k.experts.unload();
+-        k.grouped = .{ .d = d, .kernels = &k.experts };
++        k.grouped = .{ .d = d, .kernels = &k.experts, .mtl = if (std.c.getenv("TF_EXL3_MTL")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 3 else 3, .prof = std.c.getenv("TF_FLASHNEXT_PROFILE") != null };
+         return k;
+     }
+ 

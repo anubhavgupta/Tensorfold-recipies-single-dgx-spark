@@ -1,0 +1,2081 @@
+DFlash2 drafting for Flash Next on the native CUDA engine (--drafter DIR; flash-3's drafter, ported): a 4-bit copy of the 5-layer drafter, taps after layers 5/15/25/35/45, block drafts of 7 with a selector, in the lane backend. Knobs: TF_FLASHNEXT_DFLASH_DRAFTS (7), _CONFIDENCE (0.5), _COPIES (1; the recipe sets 0), _TIMING. Verified: greedy and sampled replies byte-identical with drafts off, in 17 checks (4 clients, resumed turn, 6K/25K prompts, vision).
+
+diff --git a/docs/environment.md b/docs/environment.md
+index d2a625f..e56ea57 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -233,6 +233,10 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_FACT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_KV_PAGE_TEST` | Whole page size the kernels take: whole blocks of the indexer's ratio up to the window; unset or blank leaves the plain caches |
+ | `TF_FLASHNEXT_CONFIDENCE` | Finite number, negative values included; default -0.4, the chain's own stop |
++| `TF_FLASHNEXT_DFLASH_DRAFTS` | With `--drafter`: whole draft count; default 7, then clamped to 1 through 7 (a DFlash2 block holds 7) |
++| `TF_FLASHNEXT_DFLASH_CONFIDENCE` | With `--drafter`: finite number from 0 to 1; default 0.5. A chain stops where the product of its drafts' chances falls under it; the first draft always stays |
++| `TF_FLASHNEXT_DFLASH_COPIES` | With `--drafter`: exactly `0` or `1`; default `1`. `0` leaves out the lane core's copies of the context, so the drafter alone drafts (JSON-like replies go about 6% faster; a reply that echoes its context goes about 2.4 times slower) |
++| `TF_FLASHNEXT_DFLASH_TIMING` | Exactly `0` or `1`; default off. `1` logs, every 64 verify calls, the host's time in the verify, keep and draft steps, and with `--drafter` synchronizes the drafter's phases to time them |
+ | `TF_FLASHNEXT_PROMPT` | Exactly `rows` for the rows path; unset or blank keeps the plain path |
+ | `TF_FLASHNEXT_DRAFT_HEAD` | Exactly `bf16` or `affine4`; unset or blank is `affine4`, a bf16 language head's draft rows held as 4-bit affine groups of 32. `bf16` keeps the rows as stored. Drafts only, so replies are unchanged |
+ 
+diff --git a/docs/recipes/flash-next-cuda.md b/docs/recipes/flash-next-cuda.md
+index f3d857b..e8b8c50 100644
+--- a/docs/recipes/flash-next-cuda.md
++++ b/docs/recipes/flash-next-cuda.md
+@@ -113,6 +113,16 @@ its path.
+ - `TF_FLASHNEXT_DRAFTS` (1 to 15, default 6) and `TF_FLASHNEXT_CONFIDENCE` (default -0.4) set the head's chain. A
+   negative value keeps drafting while the drafts' probabilities multiply to at least its size (0.4 by default), a
+   positive value keeps a later draft only at or above it, and 0 keeps every draft.
++- `--drafter DIR` names a DFlash2 checkpoint (`incoai/Qwen3.8-Flash-Next-DFlash2`, bf16, read unmodified) that drafts
++  instead of the MTP head, on one GPU with `--parallel` any (`--tp 2` and `--drafter-bits` other than 4 are refused).
++  Its five sliding-window layers read the target's outputs after layers 5, 15, 25, 35 and 45 (the mean of the four
++  hyper-connection streams, tapped after the next layer's write-back), keep them in a 2,048-row ring a stream
++  (42 MiB), and draft a block of 8: the pending token and 7 masks, 16 candidates a row, picked by the checkpoint's
++  selector. Its linears run at 4 bits on the engine's lane (0.44 GiB), its logits over the MTP head's draft
++  vocabulary, so the head stays loaded. Drafts only change speed: every one is verified, and replies equal `"draft":
++  false` byte for byte. A chain stops where its drafts' chances multiply under `TF_FLASHNEXT_DFLASH_CONFIDENCE`
++  (0.5); `TF_FLASHNEXT_DFLASH_DRAFTS` caps a round's drafts (7); `TF_FLASHNEXT_DFLASH_COPIES=0` drops the lane core's
++  context copies. A prompt resumed from the prompt cache starts its drafter context at the resume point.
+ - `TF_FLASHNEXT_LOAD_THREADS` (1 to 32, default 8) packs the routed NVFP4 experts on that many threads at load, staged
+   through at most 192 MiB of pinned memory: every layer on one GPU, and the MTP head's layer on rank 0 at `--tp 2`.
+   1 keeps the one-expert loop. Other values are refused.
+diff --git a/docs/run-guide.md b/docs/run-guide.md
+index 47d0c79..87ed643 100644
+--- a/docs/run-guide.md
++++ b/docs/run-guide.md
+@@ -148,8 +148,8 @@ The binary's `capabilities --json` response lists its supported flags and platfo
+ | `--tool-think-close` | With thinking on, a required or named tool call closes its think block at `max_tokens - max(256, max_tokens / 4)` (or a smaller request `thinking_budget`), so the call fits instead of ending as `length`. Off by default ([API](api.md)). |
+ | `--loop-guard-stop` | As `--loop-guard`, but end the reply where the guard fires: the reasoning so far, no answer or tool calls, `finish_reason` `content_filter` and a `reasoning_loop` error ([API](api.md)). |
+ | `--no-drafts` | Produce the plain reference through the same engine. |
+-| `--drafter DRAFTER` | An external drafter, as a directory or a repo id in the Hugging Face cache, for models that take one (Gemma 4 31B's recipe names its drafter); `none` serves without one. Without the flag, Qwen3.8-27B pairs DFlash2 when the cache holds it (never downloaded, not on HIP): one line names it, and serve runs without it if it does not open. |
+-| `--drafter-bits 0\|4` | Drafter weight precision where the model offers a choice: 4 bits (the default), or 0 to keep bf16. Qwen3.8-27B on CUDA takes 4 only. |
++| `--drafter DRAFTER` | An external drafter, as a directory or a repo id in the Hugging Face cache, for models that take one (Gemma 4 31B's recipe names its drafter; Flash Next on CUDA takes a DFlash2 folder such as `incoai/Qwen3.8-Flash-Next-DFlash2` and never pairs one by itself, see [its recipe](recipes/flash-next-cuda.md)); `none` serves without one. Without the flag, Qwen3.8-27B pairs DFlash2 when the cache holds it (never downloaded, not on HIP): one line names it, and serve runs without it if it does not open. |
++| `--drafter-bits 0\|4` | Drafter weight precision where the model offers a choice: 4 bits (the default), or 0 to keep bf16. Qwen3.8-27B on CUDA and Flash Next's DFlash2 take 4 only. |
+ | `--record DIR` | Write each stream's committed tokens, positions and tapped rows under DIR, for drafter training. CUDA Nemotron only; a single stream runs through the lane rounds, and recording stops below 25 GiB free disk. |
+ | `--keep-warm SECONDS` | Keep the Metal GPU active while idle for this long after a request, default 900; zero disables it. |
+ | `--cfg-gamma GAMMA` | Drama speech on Metal and CUDA: semantic guidance strength, finite 1–5; 0/default disables it. Only reference-conditioned requests are guided. Enabled replies report `X-Cfg-Gamma`; codec heads stay conditional. |
+diff --git a/zig/build/cuda_fault_host.zig b/zig/build/cuda_fault_host.zig
+index 4b1c31d..766c697 100644
+--- a/zig/build/cuda_fault_host.zig
++++ b/zig/build/cuda_fault_host.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ pub fn steps(b: *std.Build, cuda: *std.Build.Module, flashnext: *std.Build.Module, native: *std.Build.Module) void {
+     b.step("test-flashnext-warm-host", "Actual CUDA warm image policy and lane admission without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{ "a reply's warm pass", "four concurrent streams all retain MTP", "eight concurrent streams all retain MTP" } })).step);
+     b.step("test-cuda-context-health-host", "Sticky CUDA context faults and real graph-instantiation refusal without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "CUDA context health:", "CUDA graph refusal:" } })).step);
++    b.step("test-flashnext-dflash-host", "Flash Next's DFlash2 drafter: tap runs, 4-bit planes, the selector and a context's gaps, without a device").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"dflash2:"} })).step);
+     b.step("test-flashnext-loader-host", "The threaded NVFP4 expert loader: the loop's words, no pinned or device memory left after a failed load, geometry first").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next expert loader:"} })).step);
+     b.step("test-flashnext-completion-host", "Actual CUDA sequence rollback drains asynchronous destinations before release").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"Flash Next completion:"} })).step);
+     b.step("test-flashnext-window-host", "The served copy window and its buffers: a width the boot check proved, the shipped rows unless it runs").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{ "the served copy window widens", "the boot check's sweep", "a draft at 65,536 tokens", "the saved pieces follow", "the window's waits" } })).step);
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 3d16874..adf5e9b 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -179,6 +179,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
+     .{ .name = "glm_mm", .flags = &.{"-O3"} }, // ours: GLM's bf16 linears on tensor cores, weights tiled at load, row-stable
+     .{ .name = "glm_dflash", .flags = &.{"-O3"} }, // the DFlash2 block drafter
++    .{ .name = "flashnext_dflash", .flags = &.{"-O3"} }, // Flash Next's DFlash2 block drafter (hidden 2560)
+     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
+     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
+     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
+diff --git a/zig/kernels/cuda/flashnext_dflash.cu b/zig/kernels/cuda/flashnext_dflash.cu
+new file mode 100644
+index 0000000..872091e
+--- /dev/null
++++ b/zig/kernels/cuda/flashnext_dflash.cu
+@@ -0,0 +1,312 @@
++// DFlash2 drafter kernels for Flash Next (ours, after z-lab/dflash, MIT, and glm_dflash.cu): the taps of the target's
++// streams, norms + rope, two-tap convolutions, SwiGLU, ring and block attention, the candidate top-16 and the
++// selector's projection. The linears run on the engine's 4-bit lane; every width here is the drafter's (hidden 2560).
++
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++namespace {
++constexpr int D = 2560;       // the drafter's and the target's hidden size
++constexpr int HD = 128;
++constexpr int KVH = 8;
++constexpr int QH = 32;
++constexpr int QW = QH * HD;   // 4096: the attention's width, which is not D
++constexpr int KVW = KVH * HD; // 1024
++constexpr int WIN = 2048;     // the sliding window (and the ring's slots)
++constexpr int BLOCK = 8;
++constexpr int GROUP = 16;     // channels sharing one dynamic tap weight
++constexpr int GROUPS = D / GROUP;
++constexpr int CH = 16;        // key chunks of the chunked attention
++constexpr int TAPS = 5;       // target layers read
++constexpr int RANK = 256;     // the selector's projection rows
++constexpr int MAX_JOBS = 32;
++
++__device__ __forceinline__ float bf(__nv_bfloat16 x) { return __bfloat162float(x); }
++__device__ __forceinline__ __nv_bfloat16 tobf(float x) { return __float2bfloat16_rn(x); }
++
++// The ring of one layer: K then V, [WIN][KVW] each, layers one after another.
++__device__ __forceinline__ __nv_bfloat16* ringK(uint64_t base, int layer) {
++    return reinterpret_cast<__nv_bfloat16*>(base) + (long long)layer * 2 * WIN * KVW;
++}
++__device__ __forceinline__ __nv_bfloat16* ringV(uint64_t base, int layer) { return ringK(base, layer) + (long long)WIN * KVW; }
++
++// Qwen3's per-head RMSNorm then rotate-half RoPE of one head (64 threads: dims d and d + 64).
++__device__ __forceinline__ void normRope(const __nv_bfloat16* x, const __nv_bfloat16* w, float eps, long long pos, float theta,
++                                         __nv_bfloat16* out, float* red) {
++    const int d = threadIdx.x;
++    const float a = bf(x[d]), b = bf(x[d + 64]);
++    float s = a * a + b * b;
++    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
++    if ((d & 31) == 0) red[d >> 5] = s;
++    __syncthreads();
++    const float rinv = rsqrtf((red[0] + red[1]) / HD + eps);
++    __syncthreads();
++    const float na = bf(tobf(bf(w[d]) * bf(tobf(a * rinv))));
++    const float nb = bf(tobf(bf(w[d + 64]) * bf(tobf(b * rinv))));
++    const float inv = powf(theta, -(float)(2 * d) / HD);
++    const float ang = (float)pos * inv;
++    const float c = cosf(ang), sn = sinf(ang);
++    out[d] = tobf(na * c - nb * sn);
++    out[d + 64] = tobf(nb * c + na * sn);
++}
++}  // namespace
++
++// Rows of a pass, each job a run of them: job j takes source rows src0[j].. (rows[j] of them) into its own dst[j],
++// [rows][TAPS * D] bf16, column block `slot`. The source is the pass's residual [row][4][D]; the tap is the mean of
++// the four streams, summed in order and rounded once.
++struct TapJobs {
++    int n;
++    int slot;
++    int rows[MAX_JOBS];
++    int src0[MAX_JOBS];
++    unsigned long long dst[MAX_JOBS];
++};
++
++extern "C" __global__ void df_tap(const __nv_bfloat16* __restrict__ x, TapJobs jobs) {
++    int r = blockIdx.x, j = 0;
++    while (j < jobs.n - 1 && r >= jobs.rows[j]) {
++        r -= jobs.rows[j];
++        ++j;
++    }
++    const __nv_bfloat16* xr = x + (long long)(jobs.src0[j] + r) * 4 * D;
++    __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(jobs.dst[j]) + (long long)r * TAPS * D + (long long)jobs.slot * D;
++    const int end = min(D, (int)(blockIdx.y + 1) * 1024);
++    for (int d = blockIdx.y * 1024 + threadIdx.x; d < end; d += blockDim.x) {
++        const float a = ((bf(xr[d]) + bf(xr[D + d])) + bf(xr[2 * D + d])) + bf(xr[3 * D + d]);
++        o[d] = tobf(a / 4.0f);
++    }
++}
++
++// The block's queries (fused qkv, stride ldq) normed and rotated at pos[r] into q, keys into kb, values into vb.
++extern "C" __global__ void df_block_qkv(const __nv_bfloat16* __restrict__ qkv, int ldq, const __nv_bfloat16* __restrict__ qn,
++                                        const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, float eps, float theta,
++                                        __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kb, __nv_bfloat16* __restrict__ vb) {
++    __shared__ float red[2];
++    const int r = blockIdx.x, h = blockIdx.y;
++    const __nv_bfloat16* row = qkv + (long long)r * ldq;
++    if (h < QH) {
++        normRope(row + h * HD, qn, eps, pos[r], theta, q + (long long)r * QW + h * HD, red);
++    } else {
++        const int kh = h - QH;
++        normRope(row + QW + kh * HD, kn, eps, pos[r], theta, kb + (long long)r * KVW + kh * HD, red);
++        const __nv_bfloat16* v = row + QW + KVW + kh * HD;
++        __nv_bfloat16* vo = vb + (long long)r * KVW + kh * HD;
++        vo[threadIdx.x] = v[threadIdx.x];
++        vo[threadIdx.x + 64] = v[threadIdx.x + 64];
++    }
++}
++
++// Context rows' keys and values (k | v) normed, rotated at pos[r], into rings[r] at slot pos % WIN of ``layer``.
++extern "C" __global__ void df_ctx_kv(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn,
++                                     const long long* __restrict__ pos, const uint64_t* __restrict__ rings, int layer, float eps,
++                                     float theta) {
++    __shared__ float red[2];
++    const int r = blockIdx.x, kh = blockIdx.y;
++    const long long p = pos[r];
++    const int slot = (int)(p % WIN);
++    const __nv_bfloat16* row = kv + (long long)r * 2 * KVW;
++    normRope(row + kh * HD, kn, eps, p, theta, ringK(rings[r], layer) + (long long)slot * KVW + kh * HD, red);
++    __nv_bfloat16* vo = ringV(rings[r], layer) + (long long)slot * KVW + kh * HD;
++    vo[threadIdx.x] = row[KVW + kh * HD + threadIdx.x];
++    vo[threadIdx.x + 64] = row[KVW + kh * HD + threadIdx.x + 64];
++}
++
++// Two-tap dynamic conv over a block: y[t] = bf16(k0 * z[t] + k1 * z[t - 1]), k = bf16(base + dyn[t][o][c / 16]); add or store.
++extern "C" __global__ void df_conv(const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ dyn, int which,
++                                   const __nv_bfloat16* __restrict__ base, __nv_bfloat16* __restrict__ out, int add) {
++    const int r = blockIdx.x, t = r % BLOCK;
++    const __nv_bfloat16* dr = dyn + (long long)r * 4 * GROUPS + which * 2 * GROUPS;
++    const int end = min(D, (int)(blockIdx.y + 1) * 1024);
++    for (int c = blockIdx.y * 1024 + threadIdx.x; c < end; c += blockDim.x) {
++        const int g = c / GROUP;
++        const float k0 = bf(tobf(bf(base[c]) + bf(dr[g])));
++        float y = k0 * bf(z[(long long)r * D + c]);
++        if (t > 0) {
++            const float k1 = bf(tobf(bf(base[D + c]) + bf(dr[GROUPS + g])));
++            y += k1 * bf(z[(long long)(r - 1) * D + c]);
++        }
++        __nv_bfloat16* o = out + (long long)r * D + c;
++        *o = add ? tobf(bf(*o) + bf(tobf(y))) : tobf(y);
++    }
++}
++
++// SwiGLU over [gate | up] rows (width F each): bf16(bf16(silu(g)) * u). grid (R, ceil(F / 1024)), 256 threads.
++extern "C" __global__ void df_swiglu(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ out, int F) {
++    const int r = blockIdx.x;
++    const __nv_bfloat16* g = gu + (long long)r * 2 * F;
++    for (int c = blockIdx.y * 1024 + threadIdx.x; c < (blockIdx.y + 1) * 1024 && c < F; c += blockDim.x) {
++        const float x = bf(g[c]);
++        const float s = bf(tobf(x / (1.0f + expf(-x))));
++        out[(long long)r * F + c] = tobf(s * bf(g[F + c]));
++    }
++}
++
++// Each block's 8 rows attend to their ring's window (max(from, p - 2047) .. start - 1) and all 8 block keys, over CH key
++// chunks (running max, sum, fp32 output), merged by df_attn_merge.
++extern "C" __global__ void __launch_bounds__(256) df_attn_part(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++        const __nv_bfloat16* __restrict__ vb, const uint64_t* __restrict__ rings, const long long* __restrict__ starts,
++        const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
++        float* __restrict__ pacc) {
++    const int s = blockIdx.x, kh = blockIdx.y, c = blockIdx.z;
++    const int j = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int r = s * BLOCK + j;
++    const long long start = starts[s], p = start + j;
++    long long lo = p - (WIN - 1);
++    if (lo < froms[s]) lo = froms[s];
++    if (lo < 0) lo = 0;
++    const long long n_ctx = start > lo ? start - lo : 0;
++    const long long T = n_ctx + BLOCK, L = (T + CH - 1) / CH;
++    const long long n0 = (long long)c * L, n1 = n0 + L < T ? n0 + L : T;
++    float qv[4][4], m[4], l[4], acc[4][4];
++    for (int h = 0; h < 4; ++h) {
++        const __nv_bfloat16* qh = q + (long long)r * QW + (kh * 4 + h) * HD + lane * 4;
++        for (int i = 0; i < 4; ++i) qv[h][i] = bf(qh[i]) * scale;
++        m[h] = -INFINITY;
++        l[h] = 0.f;
++        for (int i = 0; i < 4; ++i) acc[h][i] = 0.f;
++    }
++    const __nv_bfloat16* K = ringK(rings[s], layer);
++    const __nv_bfloat16* V = ringV(rings[s], layer);
++    for (long long n = n0; n < n1; ++n) {
++        const __nv_bfloat16 *kr, *vr;
++        if (n < n_ctx) {
++            const int slot = (int)((lo + n) % WIN);
++            kr = K + (long long)slot * KVW + kh * HD + lane * 4;
++            vr = V + (long long)slot * KVW + kh * HD + lane * 4;
++        } else {
++            const long long rb = (long long)s * BLOCK + (n - n_ctx);
++            kr = kb + rb * KVW + kh * HD + lane * 4;
++            vr = vb + rb * KVW + kh * HD + lane * 4;
++        }
++        float kf[4], vf[4];
++        for (int i = 0; i < 4; ++i) {
++            kf[i] = bf(kr[i]);
++            vf[i] = bf(vr[i]);
++        }
++        for (int h = 0; h < 4; ++h) {
++            float d = qv[h][0] * kf[0] + qv[h][1] * kf[1] + qv[h][2] * kf[2] + qv[h][3] * kf[3];
++            for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
++            const float mn = fmaxf(m[h], d);
++            const float corr = __expf(m[h] - mn), pe = __expf(d - mn);
++            l[h] = l[h] * corr + pe;
++            for (int i = 0; i < 4; ++i) acc[h][i] = acc[h][i] * corr + pe * vf[i];
++            m[h] = mn;
++        }
++    }
++    for (int h = 0; h < 4; ++h) {
++        const long long at = ((long long)r * QH + kh * 4 + h) * CH + c;
++        float* pa = pacc + at * HD + lane * 4;
++        for (int i = 0; i < 4; ++i) pa[i] = acc[h][i];
++        if (lane == 0) {
++            pm[at] = m[h];  // -inf with l = 0 for a chunk past the row's keys: the merge weighs it 0
++            pl[at] = l[h];
++        }
++    }
++}
++
++// The chunks' partials of row r, head h into o[r][h] (bf16). grid (R, QH), 128 threads (a thread a dim).
++extern "C" __global__ void df_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
++                                         __nv_bfloat16* __restrict__ o) {
++    const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++    const long long base = ((long long)r * QH + h) * CH;
++    float m = -INFINITY;
++    for (int c = 0; c < CH; ++c) m = fmaxf(m, pm[base + c]);
++    float l = 0.f, a = 0.f;
++    for (int c = 0; c < CH; ++c) {
++        const float w = __expf(pm[base + c] - m);
++        l += pl[base + c] * w;
++        a += pacc[(base + c) * HD + d] * w;
++    }
++    o[(long long)r * QW + h * HD + d] = tobf(a / l);
++}
++
++// The 16 largest logits of a row as column ids and fp32 values: per-chunk part, then merge; ties keep the low column.
++namespace {
++constexpr int CHUNK_COLS = 4096;
++constexpr int TOP = 16;
++
++__device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
++
++// The block's best (value, index) of sv/si [n] (256 threads), the winner's slot cleared to -inf.
++__device__ void takeBest(float* sv, int* si, int n, float* rv, int* ri, float* outv, int* outi) {
++    float bv = -INFINITY;
++    int bi = 0x7fffffff, bs = -1;
++    for (int j = threadIdx.x; j < n; j += blockDim.x)
++        if (better(sv[j], si[j], bv, bi)) { bv = sv[j]; bi = si[j]; bs = j; }
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o), os = __shfl_xor_sync(0xffffffffu, bs, o);
++        if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; bs = os; }
++    }
++    const int w = threadIdx.x >> 5;
++    if ((threadIdx.x & 31) == 0) { rv[w] = bv; ri[w] = bi; ri[8 + w] = bs; }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        int best = 0;
++        for (int k = 1; k < (int)(blockDim.x >> 5); ++k)
++            if (better(rv[k], ri[k], rv[best], ri[best])) best = k;
++        *outv = rv[best];
++        *outi = ri[best];
++        if (ri[8 + best] >= 0) sv[ri[8 + best]] = -INFINITY;
++    }
++    __syncthreads();
++}
++}  // namespace
++
++extern "C" __global__ void __launch_bounds__(256) df_top16_part(const __nv_bfloat16* __restrict__ logits, int cols, int offset,
++                                                                float* __restrict__ pv, int* __restrict__ pi) {
++    __shared__ float sv[CHUNK_COLS];
++    __shared__ int si[CHUNK_COLS];
++    __shared__ float rv[8];
++    __shared__ int ri[16];
++    const int r = blockIdx.x, c0 = blockIdx.y * CHUNK_COLS;
++    const int n = min(CHUNK_COLS, cols - c0);
++    for (int j = threadIdx.x; j < n; j += blockDim.x) {
++        sv[j] = bf(logits[(long long)r * cols + c0 + j]);
++        si[j] = offset + c0 + j;
++    }
++    __syncthreads();
++    const long long base = ((long long)r * gridDim.y + blockIdx.y) * TOP;
++    for (int t = 0; t < TOP; ++t) takeBest(sv, si, n, rv, ri, pv + base + t, pi + base + t);
++}
++
++extern "C" __global__ void __launch_bounds__(256) df_top16_merge(const float* __restrict__ pv, const int* __restrict__ pi, int chunks,
++                                                                 int* __restrict__ out) {
++    __shared__ float sv[64 * TOP];
++    __shared__ int si[64 * TOP];
++    __shared__ float rv[8];
++    __shared__ int ri[16];
++    __shared__ float ov[TOP];
++    __shared__ int oi[TOP];
++    const int r = blockIdx.x, n = chunks * TOP;
++    for (int j = threadIdx.x; j < n; j += blockDim.x) {
++        sv[j] = pv[(long long)r * n + j];
++        si[j] = pi[(long long)r * n + j];
++    }
++    __syncthreads();
++    for (int t = 0; t < TOP; ++t) takeBest(sv, si, n, rv, ri, ov + t, oi + t);
++    if (threadIdx.x < TOP) {
++        out[r * 2 * TOP + threadIdx.x] = oi[threadIdx.x];
++        out[r * 2 * TOP + TOP + threadIdx.x] = __float_as_int(ov[threadIdx.x]);
++    }
++}
++
++// A row's sums over each 32-column group (the lane's xs for a 4-bit linear's input), fp32 [rows][k / 32]. 256 threads.
++extern "C" __global__ void df_gsum(const __nv_bfloat16* __restrict__ x, int k, float* __restrict__ xs) {
++    const int r = blockIdx.x, groups = k / 32, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const __nv_bfloat16* xr = x + (long long)r * k;
++    for (int g = w; g < groups; g += blockDim.x >> 5) {
++        float s = bf(xr[g * 32 + lane]);
++        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
++        if (lane == 0) xs[(long long)r * groups + g] = s;
++    }
++}
++
++// g[r][o] = float(bf16(sum_k x[r][k] * w[o][k])): the selector's hidden projection (w [RANK][D] bf16). grid (R, RANK / 8), 256 threads.
++extern "C" __global__ void df_proj(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, float* __restrict__ g) {
++    const int r = blockIdx.x, o = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    float s = 0.f;
++    for (int k = lane; k < D; k += 32) s += bf(x[(long long)r * D + k]) * bf(w[(long long)o * D + k]);
++    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
++    if (lane == 0) g[(long long)r * RANK + o] = bf(tobf(s));
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 03585f6..b36a23c 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -126,6 +126,7 @@ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes
+ pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
+ pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
+ pub const glm_dflash: []const u8 = if (available) &Blob("fatbin_glm_dflash").bytes else &.{};
++pub const flashnext_dflash: []const u8 = if (available) &Blob("fatbin_flashnext_dflash").bytes else &.{};
+ pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
+ pub const exl3_linear: []const u8 = if (available) &Blob("fatbin_exl3_linear").bytes else &.{};
+ pub const exl3_experts: []const u8 = if (available) &Blob("fatbin_exl3_experts").bytes else &.{};
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 9810e84..045cd0b 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -21,6 +21,7 @@ const exl3_moe = @import("cuda_exl3_moe.zig");
+ const zs = @import("cuda_zero_slice.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const split_lane = @import("cuda_split_lane.zig");
++const dflash_taps = @import("cuda_dflash_taps.zig");
+ 
+ const layers_n = wt.layers_n;
+ const linear_n = wt.linear_n;
+@@ -229,6 +230,23 @@ pub fn Pass(comptime Tri: type) type {
+             if (hc_w.has_inj == 1) try self.copy(keep.inject, inj, n * streams * 2);
+         }
+ 
++        /// DFlash2's tap at the start of layer `layer`: the previous layer's output, now written back, into the taps' buffers.
++        pub fn tapAt(self: *Self, layer: usize) !void {
++            const slot = dflash_taps.slotAt(layer) orelse return;
++            const f = self.k.df_tap orelse return;
++            var jobs: dflash_taps.Jobs = .{};
++            if (self.lanes.len > 0) {
++                var row0: usize = 0;
++                for (self.lanes) |l| {
++                    try jobs.add(row0, l.rows, l.taps);
++                    row0 += l.rows;
++                }
++            } else if (self.hooks.taps != 0 and self.hooks.tap_from < self.rows) {
++                try jobs.add(self.hooks.tap_from, self.rows - self.hooks.tap_from, self.hooks.taps);
++            }
++            try dflash_taps.launch(f, self.stream, self.s.h, jobs, slot);
++        }
++
+         pub fn pleBlock(self: *Self, lw: *const Layer, ids: []const u32) !void {
+             const s = self.s;
+             const n = self.rows;
+@@ -569,9 +587,11 @@ pub fn Pass(comptime Tri: type) type {
+                 }
+                 if (hc.fuses(self, lw.attn_hc, n, keep.attn_hc)) {
+                     try hc.writebackNorm(self, lw.attn_hc, 0, n);
++                    try self.tapAt(layer);
+                     try hc.readoutNative(self, lw.attn_hc, 0, n);
+                 } else {
+                     try self.writeback(0, n);
++                    try self.tapAt(layer);
+                     try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
+                 }
+                 self.mark(0);
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 6733345..1d52aeb 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -98,12 +98,15 @@ pub const Kernels = struct {
+     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
+     select: cuda.Function,
+     select_lanes: cuda.Function,
++    /// DFlash2's tap kernel (--drafter, cuda_dflash.zig): the engine's pass launches it after the tapped layers.
++    df_tap: ?cuda.Function = null,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         const tile_mode = try cuda.experts_tile.mode(if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE")) |v| std.mem.span(v) else null);
+         var k: Kernels = undefined;
+         k.exl3 = null;
++        k.df_tap = null;
+         k.forms = Forms.resolve();
+         k.expert_tile = null;
+         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index d94e883..98a979d 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -149,6 +149,9 @@ pub const Hooks = struct {
+     moe_add: ?MoeAdd = null,
+     /// The rows are prompt tokens (a fill), not a decode or verify window.
+     prompt: bool = false,
++    /// DFlash2's taps (cuda_dflash_taps.zig): device [rows - tap_from, taps * dims] bf16 for the rows from `tap_from` on; 0: none.
++    taps: u64 = 0,
++    tap_from: usize = 0,
+     /// The last row's scores also in seq.logits (a sync, a vocab-row copy); drafted windows' draws read device rows.
+     host_logits: bool = true,
+     /// Prompt cache marks inside this pass (TF_FLASHNEXT_KEEP_INPASS): each one's states go to its kept state's buffer.
+@@ -548,7 +551,7 @@ pub const scoreStride = sizes.scoreStride;
+ pub const scoreBytes = sizes.scoreBytes;
+ 
+ /// One stream's rows in a shared pass from `pos` on its own caches, and its window's rollback, hidden rows and scores.
+-pub const Lane = struct { seq: SeqState, pos: usize, rows: usize = 1, keep: ?*const Keep = null, streams: u64 = 0, logits: u64 = 0 };
++pub const Lane = struct { seq: SeqState, pos: usize, rows: usize = 1, keep: ?*const Keep = null, streams: u64 = 0, logits: u64 = 0, taps: u64 = 0 };
+ 
+ /// The engine's resident weights the pass reads.
+ pub const Model = struct {
+diff --git a/zig/src/families/flashnext/cuda_dflash.zig b/zig/src/families/flashnext/cuda_dflash.zig
+new file mode 100644
+index 0000000..6276ef6
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_dflash.zig
+@@ -0,0 +1,504 @@
++//! DFlash2 drafts for Flash Next (--drafter): incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0, read unmodified), after z-lab
++//! (MIT) and TensorFold's GLM port (glm/dflash.zig). The drafter reads the target's taps (cuda_dflash_taps.zig), keeps
++//! them as keys and values of five sliding-window layers, and drafts a block of 8 from the pending token; the target
++//! verifies every draft, so drafts only change speed. Its linears run on the engine's 4-bit lane, its logits over the
++//! MTP head's draft vocabulary (the target's lm_head rows at 4 bits), its token embeddings are the target's.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const prompt = @import("cuda_prompt.zig");
++const mtp = @import("cuda_mtp.zig");
++const tiles = @import("cuda_tiles.zig");
++const taps_mod = @import("cuda_dflash_taps.zig");
++const select = @import("cuda_dflash_select.zig");
++
++const Q4 = wt.Q4;
++
++pub const BLOCK: usize = 8;
++pub const MASK: u32 = 248077;
++pub const WIN: usize = 2048; // the context window (and a ring's slots)
++pub const LAYERS: usize = 5;
++pub const D: usize = wt.dims;
++pub const HD: usize = 128;
++pub const QH: usize = 32;
++pub const KVH: usize = 8;
++pub const QW: usize = QH * HD;
++pub const KVW: usize = KVH * HD;
++pub const QKV: usize = QW + 2 * KVW;
++pub const FF: usize = 7680;
++pub const RANK: usize = 256;
++pub const TOPK: usize = 16;
++pub const VOCAB: usize = wt.vocab;
++pub const THETA: f32 = 10000;
++pub const EPS: f32 = 1e-6;
++pub const SCALE: f32 = 0.08838834764831845; // 128^-0.5
++pub const CH: usize = 16; // key chunks of the chunked attention (df_attn_part)
++pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 columns, then 16 values' bits
++pub const MAX_S: usize = 16; // streams one block pass drafts for
++pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
++pub const MAX_CTX: usize = 2048; // context rows one ingest takes
++pub const TAP_ROW: usize = taps_mod.row_bytes;
++pub const DYN: usize = 4 * D / 16; // a convolution's dynamic tap weights a row: in and out, 2 taps, 160 groups
++pub const head_cols: usize = 4096; // columns a top-16 part takes
++pub const max_drafts: usize = BLOCK - 1;
++
++/// Device bytes a stream's context ring takes (K and V of every layer).
++pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, WIN) * KVW * 2;
++/// A stream's tap rows of its last verify window.
++pub fn tapBytes() u64 {
++    return @as(u64, mtp.bufferRows()) * TAP_ROW;
++}
++/// Device bytes each admitted stream takes beside its target's caches.
++pub fn streamBytes() u64 {
++    return ring_bytes + tapBytes();
++}
++
++/// TF_FLASHNEXT_DFLASH_DRAFTS: drafts a round at most (a block holds 7).
++pub fn drafts() !usize {
++    const n = try @import("sys").environment.read(usize, "TF_FLASHNEXT_DFLASH_DRAFTS", max_drafts);
++    return @max(1, @min(max_drafts, n));
++}
++
++/// TF_FLASHNEXT_DFLASH_CONFIDENCE: a chain stops where the product of its picks' probabilities falls under this (the first
++/// draft always stays). A draft row costs about 3 ms of the target's verify however many streams share it, so a row
++/// must land at least 0.3 of the time (one stream) to pay; 0.5 held up from one stream to nine.
++pub fn confidence() !f64 {
++    return @import("sys").environment.read(f64, "TF_FLASHNEXT_DFLASH_CONFIDENCE", 0.5);
++}
++
++/// TF_FLASHNEXT_DFLASH_COPIES: whether the lane core also proposes copies of the context (0: the drafter alone drafts).
++/// Copies make a copy-heavy reply (echoing a file) 2.4x faster and cost JSON-like replies about 6%.
++pub fn copies() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_DFLASH_COPIES", true);
++}
++
++/// flashnext_dflash's functions.
++pub const Kernels = struct {
++    tap: cuda.Function,
++    block_qkv: cuda.Function,
++    ctx_kv: cuda.Function,
++    conv: cuda.Function,
++    swiglu: cuda.Function,
++    attn_part: cuda.Function,
++    attn_merge: cuda.Function,
++    top16_part: cuda.Function,
++    top16_merge: cuda.Function,
++    gsum: cuda.Function,
++    proj: cuda.Function,
++
++    pub fn load(m: cuda.Module) !Kernels {
++        var k: Kernels = undefined;
++        inline for (@typeInfo(Kernels).@"struct".field_names) |n| @field(k, n) = try m.function("df_" ++ n);
++        return k;
++    }
++};
++
++/// One layer's device tensors: norm weights fp32, q/k norms and conv bases bf16, linears on the 4-bit lane.
++pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Q4, kv: Q4, o: Q4, gu: Q4, down: Q4, a_proj: Q4, m_proj: Q4 };
++
++/// A stream's drafter state: its context ring, the tap rows of its last verify window, where its context starts and ends.
++pub const LaneState = struct {
++    ring: cuda.DeviceBuffer,
++    taps: cuda.DeviceBuffer,
++    from: i64 = 0, // the first position the ring holds for this sequence
++    end: i64 = -1, // the next position it takes (-1: none yet)
++
++    /// `n` rows at `pos0` went into the ring: a gap restarts the context there.
++    pub fn took(l: *LaneState, pos0: i64, n: usize) void {
++        if (pos0 != l.end) l.from = pos0;
++        l.end = pos0 + @as(i64, @intCast(n));
++    }
++
++    pub fn free(l: *LaneState) void {
++        l.ring.free();
++        l.taps.free();
++    }
++};
++
++/// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
++pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
++
++/// One stream's block: the pending token at `start`, its ring, up to `depth` drafts into `out`.
++pub const Req = struct { lane: *const LaneState, anchor: u32, start: i64, depth: usize, out: *mtp.Chain, sampling: ?mtp.Sampling = null, position: u64 = 0 };
++
++/// The loaded drafter: weights, scratch, the selector's codebooks and the host tables of a pass.
++pub const Drafter = struct {
++    gpa: std.mem.Allocator,
++    d: *cuda.Driver,
++    module: cuda.Module,
++    k: Kernels,
++    layers: [LAYERS]LayerW = undefined,
++    fc: Q4 = undefined,
++    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty, // the small tensors, freed with it
++    hproj: u64 = 0,
++    hnorm: u64 = 0,
++    norm: u64 = 0,
++    pred: []u16 = &.{}, // the selector's codebooks, bf16 [VOCAB][RANK] (host: a draft reads 16 rows)
++    succ: []u16 = &.{},
++    ids: []const u32 = &.{}, // the draft vocabulary: head column j is token ids[j]
++    head: Q4 = undefined, // the target's lm_head rows at `ids`, 4 bits (the MTP head's, borrowed)
++    confidence: f64 = 0.5,
++    copies: bool = true,
++    depth: usize = max_drafts,
++    spare: std.ArrayList(LaneState) = .empty, // rings and tap rows of finished streams
++    scratch: cuda.DeviceBuffer = undefined,
++    timing: bool = false, // TF_FLASHNEXT_DFLASH_TIMING=1: each phase synchronized and timed, logged every 64 rounds (also the lanes' round timing)
++    timed_calls: u64 = 0,
++    phase_ms: [3]f64 = @splat(0),
++    // device scratch (carved by carve)
++    x: u64 = 0,
++    y: u64 = 0,
++    y2: u64 = 0,
++    dyn: u64 = 0,
++    qkv: u64 = 0,
++    q: u64 = 0,
++    kb: u64 = 0,
++    vb: u64 = 0,
++    att: u64 = 0,
++    a: u64 = 0,
++    gu: u64 = 0,
++    act: u64 = 0,
++    hn: u64 = 0,
++    xs: u64 = 0,
++    g: u64 = 0,
++    logits: u64 = 0,
++    cin: u64 = 0,
++    c1: u64 = 0,
++    ctx: u64 = 0,
++    ckv: u64 = 0,
++    ids_d: u64 = 0,
++    bpos: u64 = 0,
++    rings: u64 = 0,
++    starts: u64 = 0,
++    froms: u64 = 0,
++    cpos: u64 = 0,
++    crings: u64 = 0,
++    pv: u64 = 0,
++    pi: u64 = 0,
++    pm: u64 = 0,
++    pl: u64 = 0,
++    pacc: u64 = 0,
++    gtk: u64 = 0,
++    // host tables
++    h_ids: [MAX_M]i32 = undefined,
++    h_bpos: [MAX_M]i32 = undefined,
++    h_rings: [MAX_S]u64 = undefined,
++    h_starts: [MAX_S]i64 = undefined,
++    h_froms: [MAX_S]i64 = undefined,
++    h_cpos: []i64 = &.{},
++    h_crings: []u64 = &.{},
++    cand: []i32 = &.{}, // the candidates [MAX_M][CW]
++    gh: []f32 = &.{}, // the selector's hidden projections [MAX_M][RANK]
++
++    pub fn deinit(dr: *Drafter) void {
++        for (dr.spare.items) |*l| l.free();
++        dr.spare.deinit(dr.gpa);
++        dr.scratch.free();
++        for (&dr.layers) |*l| for ([_]*Q4{ &l.qkv, &l.kv, &l.o, &l.gu, &l.down, &l.a_proj, &l.m_proj }) |q| q.free();
++        dr.fc.free();
++        for (dr.bufs.items) |*b| b.free();
++        dr.bufs.deinit(dr.gpa);
++        dr.module.unload();
++        const g = dr.gpa;
++        g.free(dr.pred);
++        g.free(dr.succ);
++        g.free(dr.h_cpos);
++        g.free(dr.h_crings);
++        g.free(dr.cand);
++        g.free(dr.gh);
++        g.destroy(dr);
++    }
++
++    /// Device bytes the weights and scratch take (the startup log's figure).
++    pub fn nbytes(dr: *const Drafter) u64 {
++        var n: u64 = dr.scratch.len + dr.fc.w.len + dr.fc.s.len + dr.fc.b.len;
++        for (dr.layers) |l| for ([_]Q4{ l.qkv, l.kv, l.o, l.gu, l.down, l.a_proj, l.m_proj }) |q| {
++            n += q.w.len + q.s.len + q.b.len;
++        };
++        for (dr.bufs.items) |b| n += b.len;
++        return n;
++    }
++
++    /// A stream's state (its ring and tap rows from the spares, or new), its context empty.
++    pub fn lane(dr: *Drafter) !LaneState {
++        if (dr.spare.pop()) |l| {
++            var s = l;
++            s.from = 0;
++            s.end = -1;
++            return s;
++        }
++        var ring = try cuda.DeviceBuffer.alloc(dr.d, ring_bytes);
++        errdefer ring.free();
++        const taps = try cuda.DeviceBuffer.alloc(dr.d, tapBytes());
++        return .{ .ring = ring, .taps = taps };
++    }
++
++    /// A finished stream's buffers back to the spares (or freed when none can be kept).
++    pub fn give(dr: *Drafter, l: LaneState) void {
++        dr.spare.append(dr.gpa, l) catch {
++            var m = l;
++            m.free();
++        };
++    }
++
++    /// The device pointer the prompt passes tap into, and its rows.
++    pub fn promptTaps(dr: *const Drafter) u64 {
++        return dr.cin;
++    }
++};
++
++/// The drafter's passes over an engine: `tri` launches the engine's norms and embeddings.
++pub fn Ops(comptime Tri: type) type {
++    return struct {
++        e: *prompt.Engine,
++        tri: Tri,
++        dr: *Drafter,
++
++        const Self = @This();
++
++        fn go(o: Self, f: cuda.Function, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++            try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, o.e.stream.*, a);
++        }
++
++        /// out[m, n] = x[m, k] . w^T on the engine's 4-bit lane (xs: x's 32-group sums).
++        fn lin(o: Self, x: u64, xs: u64, w: Q4, out: u64, m: usize) !void {
++            const s = try o.e.reserve(1);
++            _ = try tiles.matmul(&o.e.batch_k, o.e.stream.*, x, xs, w, out, s.dummy, s.native_part, m, 1);
++        }
++
++        fn gsum(o: Self, x: u64, k: usize, m: usize, xs: u64) !void {
++            var a: cuda.Args = .{};
++            a.add(x);
++            a.add(@as(i32, @intCast(k)));
++            a.add(xs);
++            try o.go(o.dr.k.gsum, .{ .x = @intCast(m) }, 256, &a);
++        }
++
++        fn upload(o: Self, dst: u64, bytes: []const u8) !void {
++            const b: cuda.DeviceBuffer = .{ .d = o.e.driver, .ptr = dst, .len = bytes.len, .borrowed = true };
++            try b.uploadAsync(0, bytes, o.e.stream.handle);
++        }
++
++        fn copy(o: Self, dst: u64, src: u64, n: usize) !void {
++            if (dst == src or n == 0) return;
++            const d = o.e.driver;
++            try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, n, o.e.stream.handle), "cuMemcpyDtoDAsync");
++        }
++
++        /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
++        pub fn ingest(o: Self, runs: []const Run) !void {
++            const dr = o.dr;
++            var n: usize = 0;
++            for (runs) |r| n += r.n;
++            if (n == 0) return;
++            if (n > MAX_CTX) return error.DrafterContextTooWide;
++            var row: usize = 0;
++            for (runs) |r| {
++                try o.copy(dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
++                for (0..r.n) |j| {
++                    dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
++                    dr.h_crings[row + j] = r.ring;
++                }
++                row += r.n;
++            }
++            try o.upload(dr.cpos, std.mem.sliceAsBytes(dr.h_cpos[0..n]));
++            try o.upload(dr.crings, std.mem.sliceAsBytes(dr.h_crings[0..n]));
++            try o.ingestPass(n);
++        }
++
++        /// `N` context rows (cin, cpos, crings in place) through fc, the hidden norm and each layer's k, v into the rings.
++        fn ingestPass(o: Self, N: usize) !void {
++            const dr = o.dr;
++            try o.gsum(dr.cin, taps_mod.layers.len * D, N, dr.xs);
++            try o.lin(dr.cin, dr.xs, dr.fc, dr.c1, N);
++            try o.tri.rmsnorm(dr.c1, dr.hnorm, dr.ctx, dr.xs, EPS, D, N, D, D);
++            for (dr.layers, 0..) |l, li| {
++                try o.lin(dr.ctx, dr.xs, l.kv, dr.ckv, N);
++                var a: cuda.Args = .{};
++                a.add(dr.ckv);
++                a.add(l.kn);
++                a.add(dr.cpos);
++                a.add(dr.crings);
++                a.add(@as(i32, @intCast(li)));
++                a.add(EPS);
++                a.add(THETA);
++                try o.go(dr.k.ctx_kv, .{ .x = @intCast(N), .y = KVH }, 64, &a);
++            }
++        }
++
++        fn conv(o: Self, z: u64, which: i32, base: u64, out: u64, add: bool, M: usize) !void {
++            var a: cuda.Args = .{};
++            a.add(z);
++            a.add(o.dr.dyn);
++            a.add(which);
++            a.add(base);
++            a.add(out);
++            a.add(@as(i32, @intFromBool(add)));
++            try o.go(o.dr.k.conv, .{ .x = @intCast(M), .y = @intCast((D + 1023) / 1024) }, 256, &a);
++        }
++
++        /// The block pass for `S` streams (tables uploaded): embed, 5 layers, norm, the draft head, each row's 16 best.
++        fn pass(o: Self, S: usize) !void {
++            const dr = o.dr;
++            const e = o.e;
++            const M = S * BLOCK;
++            if (e.table.dense) try o.tri.embedDense(dr.ids_d, e.table.w.ptr, dr.x, D, 1, M) else try o.tri.embed(dr.ids_d, e.table.w.ptr, e.table.s.ptr, e.table.b.ptr, dr.x, D, 1, M);
++            for (dr.layers, 0..) |l, li| {
++                // attention, wrapped in the attention convolution
++                try o.tri.rmsnorm(dr.x, l.in_norm, dr.y, dr.xs, EPS, D, M, D, D);
++                try o.lin(dr.y, dr.xs, l.a_proj, dr.dyn, M);
++                try o.conv(dr.y, 0, l.a_base, dr.y2, false, M);
++                try o.gsum(dr.y2, D, M, dr.xs);
++                try o.lin(dr.y2, dr.xs, l.qkv, dr.qkv, M);
++                {
++                    var a: cuda.Args = .{};
++                    a.add(dr.qkv);
++                    a.add(@as(i32, @intCast(QKV)));
++                    a.add(l.qn);
++                    a.add(l.kn);
++                    a.add(dr.bpos);
++                    a.add(EPS);
++                    a.add(THETA);
++                    a.add(dr.q);
++                    a.add(dr.kb);
++                    a.add(dr.vb);
++                    try o.go(dr.k.block_qkv, .{ .x = @intCast(M), .y = @intCast(QH + KVH) }, 64, &a);
++                }
++                {
++                    var a: cuda.Args = .{};
++                    for ([_]u64{ dr.q, dr.kb, dr.vb, dr.rings, dr.starts, dr.froms }) |p| a.add(p);
++                    a.add(@as(i32, @intCast(li)));
++                    a.add(SCALE);
++                    for ([_]u64{ dr.pm, dr.pl, dr.pacc }) |p| a.add(p);
++                    try o.go(dr.k.attn_part, .{ .x = @intCast(S), .y = KVH, .z = CH }, 256, &a);
++                    var b: cuda.Args = .{};
++                    for ([_]u64{ dr.pm, dr.pl, dr.pacc, dr.att }) |p| b.add(p);
++                    try o.go(dr.k.attn_merge, .{ .x = @intCast(M), .y = QH }, HD, &b);
++                }
++                try o.gsum(dr.att, QW, M, dr.xs);
++                try o.lin(dr.att, dr.xs, l.o, dr.a, M);
++                try o.conv(dr.a, 1, l.a_base + 2 * D * 2, dr.x, true, M);
++                // the MLP, wrapped in the MLP convolution
++                try o.tri.rmsnorm(dr.x, l.post_norm, dr.y, dr.xs, EPS, D, M, D, D);
++                try o.lin(dr.y, dr.xs, l.m_proj, dr.dyn, M);
++                try o.conv(dr.y, 0, l.m_base, dr.y2, false, M);
++                try o.gsum(dr.y2, D, M, dr.xs);
++                try o.lin(dr.y2, dr.xs, l.gu, dr.gu, M);
++                {
++                    var a: cuda.Args = .{};
++                    a.add(dr.gu);
++                    a.add(dr.act);
++                    a.add(@as(i32, @intCast(FF)));
++                    try o.go(dr.k.swiglu, .{ .x = @intCast(M), .y = @intCast((FF + 1023) / 1024) }, 256, &a);
++                }
++                try o.gsum(dr.act, FF, M, dr.xs);
++                try o.lin(dr.act, dr.xs, l.down, dr.a, M);
++                try o.conv(dr.a, 1, l.m_base + 2 * D * 2, dr.x, true, M);
++            }
++            try o.tri.rmsnorm(dr.x, dr.norm, dr.hn, dr.xs, EPS, D, M, D, D);
++            // every row through the draft head (a few rows a launch: the lane's tile), its 16 best columns
++            const n = dr.head.n;
++            var r0: usize = 0;
++            while (r0 < M) : (r0 += 32) {
++                const rows = @min(32, M - r0);
++                try o.lin(dr.hn + r0 * D * 2, dr.xs + r0 * (D / 32) * 4, dr.head, dr.logits + r0 * n * 2, rows);
++            }
++            const chunks = (n + head_cols - 1) / head_cols;
++            {
++                var a: cuda.Args = .{};
++                a.add(dr.logits);
++                a.add(@as(i32, @intCast(n)));
++                a.add(@as(i32, 0));
++                a.add(dr.pv);
++                a.add(dr.pi);
++                try o.go(dr.k.top16_part, .{ .x = @intCast(M), .y = @intCast(chunks) }, 256, &a);
++                var b: cuda.Args = .{};
++                b.add(dr.pv);
++                b.add(dr.pi);
++                b.add(@as(i32, @intCast(chunks)));
++                b.add(dr.gtk);
++                try o.go(dr.k.top16_merge, .{ .x = @intCast(M) }, 256, &b);
++            }
++            var pj: cuda.Args = .{};
++            pj.add(dr.hn);
++            pj.add(dr.hproj);
++            pj.add(dr.g);
++            try o.go(dr.k.proj, .{ .x = @intCast(M), .y = RANK / 8 }, 256, &pj);
++        }
++
++        /// Kept rows into each context (`runs`), then every request's block: its drafts into `out`, chance by chance.
++        pub fn draft(o: Self, runs: []const Run, reqs: []const Req) !void {
++            const dr = o.dr;
++            const timed = dr.timing;
++            var t0: i96 = 0;
++            if (timed) {
++                try o.e.stream.synchronize();
++                t0 = std.Io.Clock.awake.now(o.e.io).toNanoseconds();
++            }
++            try o.ingest(runs);
++            var t1 = t0;
++            if (timed) {
++                try o.e.stream.synchronize();
++                t1 = std.Io.Clock.awake.now(o.e.io).toNanoseconds();
++            }
++            var at: usize = 0;
++            while (at < reqs.len) : (at += MAX_S) try o.block(reqs[at..@min(reqs.len, at + MAX_S)]);
++            if (timed and reqs.len > 0) {
++                const t2 = std.Io.Clock.awake.now(o.e.io).toNanoseconds();
++                dr.phase_ms[0] += @as(f64, @floatFromInt(t1 - t0)) / 1e6;
++                dr.phase_ms[1] += @as(f64, @floatFromInt(t2 - t1)) / 1e6;
++                dr.phase_ms[2] += @as(f64, @floatFromInt(reqs.len));
++                dr.timed_calls += 1;
++                if (dr.timed_calls % 64 == 0) {
++                    const k: f64 = 64;
++                    std.log.info("dflash2 a round: ingest {d:.2} ms, block pass and selection {d:.2} ms, {d:.1} streams", .{ dr.phase_ms[0] / k, dr.phase_ms[1] / k, dr.phase_ms[2] / k });
++                    dr.phase_ms = @splat(0);
++                }
++            }
++        }
++
++        fn block(o: Self, reqs: []const Req) !void {
++            const dr = o.dr;
++            const S = reqs.len;
++            for (reqs, 0..) |q, i| {
++                dr.h_rings[i] = q.lane.ring.ptr;
++                dr.h_starts[i] = q.start;
++                dr.h_froms[i] = q.lane.from;
++                for (0..BLOCK) |t| {
++                    dr.h_ids[i * BLOCK + t] = @intCast(if (t == 0) q.anchor else MASK);
++                    dr.h_bpos[i * BLOCK + t] = @intCast(q.start + @as(i64, @intCast(t)));
++                }
++            }
++            const M = S * BLOCK;
++            try o.upload(dr.ids_d, std.mem.sliceAsBytes(dr.h_ids[0..M]));
++            try o.upload(dr.bpos, std.mem.sliceAsBytes(dr.h_bpos[0..M]));
++            try o.upload(dr.rings, std.mem.sliceAsBytes(dr.h_rings[0..S]));
++            try o.upload(dr.starts, std.mem.sliceAsBytes(dr.h_starts[0..S]));
++            try o.upload(dr.froms, std.mem.sliceAsBytes(dr.h_froms[0..S]));
++            try o.pass(S);
++            try o.e.stream.synchronize();
++            const d = o.e.driver;
++            try cuda.memory.download(d, dr.gtk, std.mem.sliceAsBytes(dr.cand[0 .. M * CW]));
++            try cuda.memory.download(d, dr.g, std.mem.sliceAsBytes(dr.gh[0 .. M * RANK]));
++            for (reqs, 0..) |q, i| select.select(dr, i, q);
++        }
++    };
++}
++
++test "dflash2: a context restarts where its rows leave a gap" {
++    var l: LaneState = .{ .ring = undefined, .taps = undefined };
++    l.took(0, 40);
++    try std.testing.expectEqual(@as(i64, 0), l.from);
++    l.took(40, 3);
++    try std.testing.expectEqual(@as(i64, 0), l.from);
++    try std.testing.expectEqual(@as(i64, 43), l.end);
++    l.took(50, 2); // rows 43..49 never arrived
++    try std.testing.expectEqual(@as(i64, 50), l.from);
++    try std.testing.expectEqual(@as(i64, 52), l.end);
++}
++
++test {
++    _ = @import("cuda_dflash_taps.zig");
++    _ = @import("cuda_dflash_load.zig");
++    _ = @import("cuda_dflash_select.zig");
++}
+diff --git a/zig/src/families/flashnext/cuda_dflash_load.zig b/zig/src/families/flashnext/cuda_dflash_load.zig
+new file mode 100644
+index 0000000..e1032e6
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_dflash_load.zig
+@@ -0,0 +1,392 @@
++//! The DFlash2 checkpoint onto the device: its bf16 tensors read from model.safetensors, the linears quantized to 4 bits
++//! (affine, group 32, as the engine's lane reads them; they only propose), scratch carved from one buffer.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const wt = @import("cuda_prompt_wt.zig");
++const prompt = @import("cuda_prompt.zig");
++const mtp = @import("cuda_mtp.zig");
++const taps_mod = @import("cuda_dflash_taps.zig");
++const df = @import("cuda_dflash.zig");
++
++const Q4 = wt.Q4;
++const D = df.D;
++
++const Ent = struct { off: u64, n: u64 };
++
++/// Whether `dir`'s config.json declares a DFlash2 drafter (an architecture named DFlash2 and a dflash_config).
++pub fn declares(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
++    const path = std.fs.path.join(gpa, &.{ dir, "config.json" }) catch return false;
++    defer gpa.free(path);
++    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return false;
++    defer gpa.free(text);
++    const p = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch return false;
++    defer p.deinit();
++    if (p.value != .object) return false;
++    const o = p.value.object;
++    if (o.get("dflash_config") == null) return false;
++    const arch = o.get("architectures") orelse return false;
++    if (arch != .array) return false;
++    for (arch.array.items) |a| if (a == .string and std.mem.indexOf(u8, a.string, "DFlash2") != null) return true;
++    return false;
++}
++
++fn number(v: ?std.json.Value) ?f64 {
++    const x = v orelse return null;
++    return switch (x) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => null,
++    };
++}
++
++/// config.json's geometry against the constants the kernels are built for.
++pub fn checkConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
++    defer gpa.free(text);
++    const p = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
++    defer p.deinit();
++    if (p.value != .object) return error.DrafterConfigUnexpected;
++    const o = p.value.object;
++    const dc = (o.get("dflash_config") orelse return error.NotDFlash2).object;
++    const rope = (o.get("rope_parameters") orelse return error.DrafterConfigUnexpected).object;
++    const want = [_]struct { v: ?f64, n: f64 }{
++        .{ .v = number(o.get("hidden_size")), .n = D },
++        .{ .v = number(o.get("num_hidden_layers")), .n = df.LAYERS },
++        .{ .v = number(o.get("num_attention_heads")), .n = df.QH },
++        .{ .v = number(o.get("num_key_value_heads")), .n = df.KVH },
++        .{ .v = number(o.get("head_dim")), .n = df.HD },
++        .{ .v = number(o.get("intermediate_size")), .n = df.FF },
++        .{ .v = number(o.get("vocab_size")), .n = df.VOCAB },
++        .{ .v = number(o.get("sliding_window")), .n = df.WIN },
++        .{ .v = number(rope.get("rope_theta")), .n = df.THETA },
++        .{ .v = number(dc.get("block_size")), .n = df.BLOCK },
++        .{ .v = number(dc.get("mask_token_id")), .n = df.MASK },
++        .{ .v = number(dc.get("selector_top_k")), .n = df.TOPK },
++        .{ .v = number(dc.get("selector_rank")), .n = df.RANK },
++        .{ .v = number(dc.get("conv_kernel_size")), .n = 2 },
++        .{ .v = number(dc.get("conv_group_size")), .n = 16 },
++    };
++    for (want) |w| if (w.v == null or w.v.? != w.n) return error.DrafterConfigUnexpected;
++    const eps = number(o.get("rms_norm_eps")) orelse return error.DrafterConfigUnexpected;
++    if (@abs(eps - df.EPS) > 1e-9) return error.DrafterConfigUnexpected;
++    const taps = (dc.get("target_layer_ids") orelse return error.DrafterConfigUnexpected).array.items;
++    if (taps.len != taps_mod.layers.len) return error.DrafterConfigUnexpected;
++    for (taps, taps_mod.layers) |t, l| if (t != .integer or t.integer != l) return error.DrafterConfigUnexpected;
++}
++
++fn bf16(x: u16) f32 {
++    return @bitCast(@as(u32, x) << 16);
++}
++
++fn toBf16(x: f32) u16 {
++    const b: u32 = @bitCast(x);
++    return @intCast((b +% 0x7FFF +% ((b >> 16) & 1)) >> 16);
++}
++
++/// A linear's 4-bit planes as MLX stores them: u32 words [n][k / 8], bf16 scales and biases [n][k / 32].
++const Planes = struct {
++    n: usize,
++    k: usize,
++    words: []u32,
++    scales: []u16,
++    biases: []u16,
++
++    fn alloc(gpa: std.mem.Allocator, n: usize, k: usize) !Planes {
++        const words = try gpa.alloc(u32, n * k / 8);
++        errdefer gpa.free(words);
++        const scales = try gpa.alloc(u16, n * k / 32);
++        errdefer gpa.free(scales);
++        return .{ .n = n, .k = k, .words = words, .scales = scales, .biases = try gpa.alloc(u16, n * k / 32) };
++    }
++
++    fn free(p: Planes, gpa: std.mem.Allocator) void {
++        gpa.free(p.words);
++        gpa.free(p.scales);
++        gpa.free(p.biases);
++    }
++};
++
++const QuantJob = struct { src: []const u16, pl: Planes, row0: usize, r0: usize, r1: usize };
++
++/// Rows r0..r1 of `src` ([rows][k] bf16) into planes' rows from row0 on: each group of 32 by its min and max.
++fn quantRows(j: QuantJob) void {
++    const k = j.pl.k;
++    for (j.r0..j.r1) |r| {
++        const o = j.row0 + r;
++        for (0..k / 32) |g| {
++            const v = j.src[r * k + g * 32 ..][0..32];
++            var lo: f32 = std.math.inf(f32);
++            var hi: f32 = -std.math.inf(f32);
++            for (v) |b| {
++                const x = bf16(b);
++                lo = @min(lo, x);
++                hi = @max(hi, x);
++            }
++            const sb = toBf16(if (hi > lo) (hi - lo) / 15.0 else 1.0);
++            const bb = toBf16(lo);
++            const s = bf16(sb);
++            const bias = bf16(bb);
++            j.pl.scales[o * (k / 32) + g] = sb;
++            j.pl.biases[o * (k / 32) + g] = bb;
++            var word: u32 = 0;
++            for (v, 0..) |b, i| {
++                const q = std.math.clamp(@round((bf16(b) - bias) / s), 0, 15);
++                word |= @as(u32, @intFromFloat(q)) << @intCast(4 * (i % 8));
++                if (i % 8 == 7) {
++                    j.pl.words[o * (k / 8) + g * 4 + i / 8] = word;
++                    word = 0;
++                }
++            }
++        }
++    }
++}
++
++/// `rows` rows of `src` quantized into `pl` from its row `row0`, over the machine's threads.
++fn quantize(src: []const u16, pl: Planes, row0: usize, rows: usize) !void {
++    const threads = @max(1, @min(16, std.Thread.getCpuCount() catch 1));
++    const each = (rows + threads - 1) / threads;
++    var ts: [16]std.Thread = undefined;
++    var started: usize = 0;
++    var r: usize = 0;
++    while (r < rows) {
++        const r1 = @min(rows, r + each);
++        const job: QuantJob = .{ .src = src, .pl = pl, .row0 = row0, .r0 = r, .r1 = r1 };
++        if (r1 == rows) {
++            quantRows(job);
++        } else {
++            ts[started] = try std.Thread.spawn(.{}, quantRows, .{job});
++            started += 1;
++        }
++        r = r1;
++    }
++    for (ts[0..started]) |t| t.join();
++}
++
++const Reader = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    file: std.Io.File,
++    ents: *const std.StringHashMap(Ent),
++
++    fn read(r: *Reader, name: []const u8, comptime T: type, count: usize) ![]T {
++        const e = r.ents.get(name) orelse {
++            std.log.err("dflash2: no {s} in the drafter's checkpoint", .{name});
++            return error.DrafterTensorMissing;
++        };
++        if (e.n != count * @sizeOf(T)) {
++            std.log.err("dflash2: {s} holds {d} bytes, not {d}", .{ name, e.n, count * @sizeOf(T) });
++            return error.DrafterTensorShape;
++        }
++        const out = try r.gpa.alloc(T, count);
++        errdefer r.gpa.free(out);
++        if (try r.file.readPositionalAll(r.io, std.mem.sliceAsBytes(out), e.off) != e.n) return error.BadDrafterHeader;
++        return out;
++    }
++
++    /// `names`' rows ([rows[i]][k] each) stacked and quantized.
++    fn stack(r: *Reader, names: []const []const u8, rows: []const usize, k: usize) !Planes {
++        var n: usize = 0;
++        for (rows) |x| n += x;
++        const pl = try Planes.alloc(r.gpa, n, k);
++        errdefer pl.free(r.gpa);
++        var at: usize = 0;
++        for (names, rows) |name, x| {
++            const src = try r.read(name, u16, x * k);
++            defer r.gpa.free(src);
++            try quantize(src, pl, at, x);
++            at += x;
++        }
++        return pl;
++    }
++};
++
++fn upload(gpa: std.mem.Allocator, d: *cuda.Driver, pl: Planes, row0: usize, rows: usize) !Q4 {
++    const k8 = pl.k / 8;
++    const k32 = pl.k / 32;
++    return wt.uploadQ4(gpa, d, std.mem.sliceAsBytes(pl.words[row0 * k8 ..][0 .. rows * k8]), std.mem.sliceAsBytes(pl.scales[row0 * k32 ..][0 .. rows * k32]), std.mem.sliceAsBytes(pl.biases[row0 * k32 ..][0 .. rows * k32]), rows, k8);
++}
++
++fn addEntries(arena: std.mem.Allocator, json: []const u8, data_len: u64, ents: *std.StringHashMap(Ent)) !void {
++    const names = try core.safetensors.parseHeader(arena, json, std.math.cast(usize, data_len) orelse return error.BadDrafterHeader);
++    for (names.keys(), names.values()) |name, e| {
++        if (e.dtype != .bf16) return error.DrafterNotBf16;
++        try ents.put(name, .{ .off = 8 + json.len + e.begin, .n = e.end - e.begin });
++    }
++}
++
++fn layerName(b: *[96]u8, li: usize, s: []const u8) ![]const u8 {
++    return std.fmt.bufPrint(b, "layers.{d}.{s}", .{ li, s });
++}
++
++const Small = struct {
++    dr: *df.Drafter,
++
++    /// A tensor as stored (bf16), on the device.
++    fn bf(s: Small, r: *Reader, name: []const u8, count: usize) !u64 {
++        const t = try r.read(name, u16, count);
++        defer r.gpa.free(t);
++        return s.put(std.mem.sliceAsBytes(t));
++    }
++
++    /// A norm weight widened to fp32 (the engine's norms read fp32).
++    fn f32w(s: Small, r: *Reader, name: []const u8, count: usize) !u64 {
++        const t = try r.read(name, u16, count);
++        defer r.gpa.free(t);
++        const w = try r.gpa.alloc(f32, count);
++        defer r.gpa.free(w);
++        for (w, t) |*o, x| o.* = bf16(x);
++        return s.put(std.mem.sliceAsBytes(w));
++    }
++
++    fn put(s: Small, bytes: []const u8) !u64 {
++        var b = try cuda.DeviceBuffer.fromHost(s.dr.d, bytes);
++        errdefer b.free();
++        try s.dr.bufs.append(s.dr.gpa, b);
++        return b.ptr;
++    }
++};
++
++/// The drafter from `dir` (config.json and model.safetensors, bf16) on engine `e`, drafting over `head`'s vocabulary.
++pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *prompt.Engine, head: *mtp.Head, dir: []const u8) !*df.Drafter {
++    try checkConfig(gpa, io, dir);
++    const path = try std.fs.path.join(gpa, &.{ dir, "model.safetensors" });
++    defer gpa.free(path);
++    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
++    defer file.close(io);
++    const size = try file.length(io);
++    var lenb: [8]u8 = undefined;
++    if (size < 8 or try file.readPositionalAll(io, &lenb, 0) != 8) return error.BadDrafterHeader;
++    const hlen = core.safetensors.headerSize(std.mem.readInt(u64, &lenb, .little), size) catch return error.BadDrafterHeader;
++    if (hlen > 1 << 20) return error.BadDrafterHeader;
++    var names: std.heap.ArenaAllocator = .init(gpa);
++    defer names.deinit();
++    const text = try names.allocator().alloc(u8, hlen);
++    if (try file.readPositionalAll(io, text, 8) != hlen) return error.BadDrafterHeader;
++    var ents = std.StringHashMap(Ent).init(gpa);
++    defer ents.deinit();
++    try addEntries(names.allocator(), text, size - 8 - hlen, &ents);
++    var r: Reader = .{ .gpa = gpa, .io = io, .file = file, .ents = &ents };
++
++    const d = e.driver;
++    var module = try cuda.Module.load(d, cuda.kernels.flashnext_dflash);
++    errdefer module.unload();
++    const dr = try gpa.create(df.Drafter);
++    errdefer gpa.destroy(dr);
++    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.load(module), .ids = head.ids, .head = head.draft, .depth = try df.drafts(), .confidence = try df.confidence(), .copies = try df.copies(), .timing = try @import("sys").environment.read(bool, "TF_FLASHNEXT_DFLASH_TIMING", false) };
++    const small: Small = .{ .dr = dr };
++    var nb: [4][96]u8 = undefined;
++    for (&dr.layers, 0..) |*lw, i| {
++        lw.in_norm = try small.f32w(&r, try layerName(&nb[0], i, "input_layernorm.weight"), D);
++        lw.post_norm = try small.f32w(&r, try layerName(&nb[0], i, "post_attention_layernorm.weight"), D);
++        lw.qn = try small.bf(&r, try layerName(&nb[0], i, "self_attn.q_norm.weight"), df.HD);
++        lw.kn = try small.bf(&r, try layerName(&nb[0], i, "self_attn.k_norm.weight"), df.HD);
++        lw.a_base = try small.bf(&r, try layerName(&nb[0], i, "attention_conv.base_kernel"), 4 * D);
++        lw.m_base = try small.bf(&r, try layerName(&nb[0], i, "mlp_conv.base_kernel"), 4 * D);
++        const q = try layerName(&nb[1], i, "self_attn.q_proj.weight");
++        const kq = try layerName(&nb[2], i, "self_attn.k_proj.weight");
++        const v = try layerName(&nb[3], i, "self_attn.v_proj.weight");
++        {
++            const pl = try r.stack(&.{ q, kq, v }, &.{ df.QW, df.KVW, df.KVW }, D);
++            defer pl.free(gpa);
++            lw.qkv = try upload(gpa, d, pl, 0, df.QKV);
++            lw.kv = try upload(gpa, d, pl, df.QW, 2 * df.KVW); // k and v again, as the context rows take them
++        }
++        lw.o = try linear(&r, d, &.{try layerName(&nb[1], i, "self_attn.o_proj.weight")}, &.{D}, df.QW);
++        const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
++        const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
++        lw.gu = try linear(&r, d, &.{ gate, up }, &.{ df.FF, df.FF }, D);
++        lw.down = try linear(&r, d, &.{try layerName(&nb[3], i, "mlp.down_proj.weight")}, &.{D}, df.FF);
++        lw.a_proj = try linear(&r, d, &.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{df.DYN}, D);
++        lw.m_proj = try linear(&r, d, &.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{df.DYN}, D);
++    }
++    dr.fc = try linear(&r, d, &.{"fc.weight"}, &.{D}, taps_mod.layers.len * D);
++    dr.hproj = try small.bf(&r, "candidate_selector.hidden_projection.weight", df.RANK * D);
++    dr.hnorm = try small.f32w(&r, "hidden_norm.weight", D);
++    dr.norm = try small.f32w(&r, "norm.weight", D);
++    dr.pred = try r.read("candidate_selector.predecessor_codebook", u16, df.VOCAB * df.RANK);
++    dr.succ = try r.read("candidate_selector.successor_codebook", u16, df.VOCAB * df.RANK);
++    dr.h_cpos = try gpa.alloc(i64, df.MAX_CTX);
++    dr.h_crings = try gpa.alloc(u64, df.MAX_CTX);
++    dr.cand = try gpa.alloc(i32, df.MAX_M * df.CW);
++    dr.gh = try gpa.alloc(f32, df.MAX_M * df.RANK);
++    try carve(dr, head.draft.n);
++    e.batch_k.df_tap = dr.k.tap;
++    std.log.info("dflash2: drafter from {s} (Apache-2.0), linears at 4 bits, {d:.2} GiB on the device, up to {d} drafts a round, chains stop under {d:.2}, copies {s}", .{ dir, @as(f64, @floatFromInt(dr.nbytes())) / (1 << 30), dr.depth, dr.confidence, if (dr.copies) "on" else "off" });
++    return dr;
++}
++
++/// `names` stacked, quantized and uploaded as one 4-bit linear of [sum of rows][k].
++fn linear(r: *Reader, d: *cuda.Driver, names: []const []const u8, rows: []const usize, k: usize) !Q4 {
++    const pl = try r.stack(names, rows, k);
++    defer pl.free(r.gpa);
++    return upload(r.gpa, d, pl, 0, pl.n);
++}
++
++/// The drafter's scratch, every field one carved piece of one buffer.
++fn carve(dr: *df.Drafter, head_n: usize) !void {
++    const M: u64 = df.MAX_M;
++    const C: u64 = df.MAX_CTX;
++    const chunks: u64 = (head_n + df.head_cols - 1) / df.head_cols;
++    const xs_row: u64 = @max(@max(df.FF, df.QW), taps_mod.layers.len * D) / 32;
++    const fields = .{
++        .{ "x", M * D * 2 },                      .{ "y", M * D * 2 },                    .{ "y2", M * D * 2 },                   .{ "dyn", M * df.DYN * 2 },
++        .{ "qkv", M * df.QKV * 2 },               .{ "q", M * df.QW * 2 },                .{ "kb", M * df.KVW * 2 },              .{ "vb", M * df.KVW * 2 },
++        .{ "att", M * df.QW * 2 },                .{ "a", M * D * 2 },                    .{ "gu", M * 2 * df.FF * 2 },           .{ "act", M * df.FF * 2 },
++        .{ "hn", M * D * 2 },                     .{ "xs", @max(M, C) * xs_row * 4 },     .{ "g", M * df.RANK * 4 },              .{ "logits", M * head_n * 2 },
++        .{ "cin", C * df.TAP_ROW },               .{ "c1", C * D * 2 },                   .{ "ctx", C * D * 2 },                  .{ "ckv", C * 2 * df.KVW * 2 },
++        .{ "ids_d", M * 4 },                      .{ "bpos", M * 4 },                     .{ "rings", df.MAX_S * 8 },             .{ "starts", df.MAX_S * 8 },
++        .{ "froms", df.MAX_S * 8 },               .{ "cpos", C * 8 },                     .{ "crings", C * 8 },                   .{ "gtk", M * df.CW * 4 },
++        .{ "pv", M * chunks * df.TOPK * 4 },      .{ "pi", M * chunks * df.TOPK * 4 },    .{ "pm", M * df.QH * df.CH * 4 },       .{ "pl", M * df.QH * df.CH * 4 },
++        .{ "pacc", M * df.QH * df.CH * df.HD * 4 },
++    };
++    var at: u64 = 0;
++    inline for (fields) |f| {
++        @field(dr, f[0]) = at;
++        at += std.mem.alignForward(u64, f[1], 256);
++    }
++    dr.scratch = try cuda.DeviceBuffer.alloc(dr.d, at);
++    errdefer dr.scratch.free();
++    inline for (fields) |f| @field(dr, f[0]) += dr.scratch.ptr;
++    try dr.d.check(dr.d.api.cuMemsetD8_v2(dr.scratch.ptr, 0, at), "cuMemsetD8");
++}
++
++/// Device bytes the drafter takes before it is loaded (the startup estimate): 4-bit weights with their scales and
++/// biases, the selector's projection, and the scratch of an ingest and of a block pass over `head_n` draft columns.
++pub fn estimateBytes(head_n: usize) u64 {
++    const per_layer: u64 = df.QKV * D + 2 * df.KVW * D + D * df.QW + 3 * D * df.FF + 2 * df.DYN * D;
++    const weights: u64 = (df.LAYERS * per_layer + D * taps_mod.layers.len * D) * 5 / 8;
++    const ingest: u64 = df.MAX_CTX * (taps_mod.row_bytes + 2 * D * 2 + 2 * df.KVW * 2 + taps_mod.layers.len * D / 8);
++    const block: u64 = df.MAX_M * (head_n * 2 + df.QH * df.CH * df.HD * 4 + 4 * df.FF * 2 + 8 * D * 2);
++    return weights + ingest + block + df.RANK * D * 2;
++}
++
++test "dflash2: 4-bit planes dequantize within half a step of each weight" {
++    const gpa = std.testing.allocator;
++    const n = 3;
++    const k = 64;
++    var src: [n * k]u16 = undefined;
++    var x: u32 = 12345;
++    for (&src, 0..) |*v, i| {
++        x = x *% 1664525 +% 1013904223;
++        const f: f32 = (@as(f32, @floatFromInt(x >> 8)) / 16777216.0 - 0.5) * (if (i < k) @as(f32, 0.1) else 4.0);
++        v.* = toBf16(f);
++    }
++    const pl = try Planes.alloc(gpa, n, k);
++    defer pl.free(gpa);
++    try quantize(&src, pl, 0, n);
++    for (0..n) |r| for (0..k) |c| {
++        const g = r * (k / 32) + c / 32;
++        const word = pl.words[r * (k / 8) + c / 8];
++        const q: f32 = @floatFromInt((word >> @intCast(4 * (c % 8))) & 15);
++        const got = q * bf16(pl.scales[g]) + bf16(pl.biases[g]);
++        try std.testing.expect(@abs(got - bf16(src[r * k + c])) <= 0.5 * bf16(pl.scales[g]) * 1.01 + 1e-6);
++    };
++}
++
++test "dflash2: a drafter checkpoint's geometry is checked against the kernels' constants" {
++    const gpa = std.testing.allocator;
++    try std.testing.expect(!declares(gpa, std.testing.io, "/no/such/folder"));
++}
+diff --git a/zig/src/families/flashnext/cuda_dflash_select.zig b/zig/src/families/flashnext/cuda_dflash_select.zig
+new file mode 100644
+index 0000000..fb266da
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_dflash_select.zig
+@@ -0,0 +1,112 @@
++//! DFlash2's path selector on the host: each draft among a row's 16 likeliest by the previous draft's codebook row.
++const std = @import("std");
++const lanes = @import("lanes");
++const mtp = @import("cuda_mtp.zig");
++const df = @import("cuda_dflash.zig");
++const CW = df.CW;
++const RANK = df.RANK;
++const TOPK = df.TOPK;
++
++const Cand = struct { v: f32, id: u32 };
++
++fn bf(x: u16) f32 {
++    return @bitCast(@as(u32, x) << 16);
++}
++
++/// Stream `i`'s drafts (the block's rows 1..): each row's best of its 16 by logit plus codebook score; a sampled stream's
++/// pick is the target's own keyed draw over those 16 scores at the draft's position, which lands when the target's
++/// distribution looks like the drafter's. Each pick's chance goes to `out.probs`, and a chain stops where the product
++/// of its chances falls under the drafter's confidence (the first draft always stays).
++pub fn select(dr: *const df.Drafter, i: usize, q: df.Req) void {
++    const out = q.out;
++    out.n = 0;
++    var prev: usize = q.anchor;
++    var chain: f64 = 1;
++    for (1..@min(df.BLOCK, q.depth + 1)) |t| {
++        const r = i * df.BLOCK + t;
++        const blk = dr.cand[r * CW ..][0..CW];
++        var c: [TOPK]Cand = undefined;
++        var n: usize = 0;
++        for (0..TOPK) |j| {
++            if (blk[j] < 0) continue;
++            c[n] = .{ .v = @bitCast(blk[TOPK + j]), .id = dr.ids[@intCast(blk[j])] };
++            n += 1;
++        }
++        if (n == 0) return;
++        const g = dr.gh[r * RANK ..][0..RANK];
++        const P = dr.pred[prev * RANK ..][0..RANK];
++        var pg: [RANK]f32 = undefined;
++        for (&pg, P, g) |*o, p, x| o.* = bf(p) * x;
++        var sc: [TOPK]f32 = undefined;
++        var best: usize = 0;
++        for (0..n) |m| {
++            const S = dr.succ[@as(usize, c[m].id) * RANK ..][0..RANK];
++            var dot: f32 = 0;
++            for (pg, S) |a, b| dot += a * bf(b);
++            sc[m] = c[m].v + dot;
++            if (sc[m] > sc[best]) best = m;
++        }
++        var z: f64 = 0;
++        for (sc[0..n]) |x| z += @exp(@as(f64, x - sc[best]));
++        var pick = best;
++        if (q.sampling) |sm| if (mtp.isSampled(sm)) {
++            var vals: [TOPK]f64 = undefined;
++            var keys: [TOPK]u64 = undefined;
++            for (0..n) |m| {
++                vals[m] = sc[m];
++                keys[m] = c[m].id;
++            }
++            if (lanes.sampling.choose(dr.gpa, vals[0..n], keys[0..n], q.position + (t - 1), sm)) |id| {
++                for (0..n) |m| if (c[m].id == id) {
++                    pick = m;
++                };
++            } else |_| {}
++        };
++        const p = @exp(@as(f64, sc[pick] - sc[best])) / z;
++        chain *= p;
++        if (t > 1 and chain < dr.confidence) return;
++        out.tokens[t - 1] = c[pick].id;
++        out.probs[t - 1] = p;
++        out.n += 1;
++        prev = c[pick].id;
++    }
++}
++
++test "dflash2: the selector follows the codebooks and a chain stops under the confidence" {
++    const gpa = std.testing.allocator;
++    var dr: df.Drafter = .{ .gpa = gpa, .d = undefined, .module = undefined, .k = undefined };
++    dr.confidence = 0.5;
++    const vocab = 8;
++    dr.ids = &.{ 2, 5, 7 };
++    dr.pred = try gpa.alloc(u16, vocab * RANK);
++    defer gpa.free(dr.pred);
++    dr.succ = try gpa.alloc(u16, vocab * RANK);
++    defer gpa.free(dr.succ);
++    @memset(dr.pred, 0x3f80); // bf16 1.0
++    @memset(dr.succ, 0);
++    dr.cand = try gpa.alloc(i32, df.MAX_M * CW);
++    defer gpa.free(dr.cand);
++    dr.gh = try gpa.alloc(f32, df.MAX_M * RANK);
++    defer gpa.free(dr.gh);
++    @memset(dr.gh, 0);
++    // row 1: columns 0, 1, 2 (tokens 2, 5, 7) at logits 3, 1, 0; row 2: three equal logits, so a chance of a third
++    @memset(dr.cand, -1);
++    const rows = [_][3]f32{ .{ 3, 1, 0 }, .{ 1, 1, 1 } };
++    for (rows, 1..) |vals, t| for (vals, 0..) |v, j| {
++        dr.cand[t * CW + j] = @intCast(j);
++        dr.cand[t * CW + TOPK + j] = @bitCast(v);
++    };
++    // token 5's successor row favors nothing, so the best logit stands: row 1 picks token 2
++    var chain: mtp.Chain = .{};
++    select(&dr, 0, .{ .lane = undefined, .anchor = 1, .start = 10, .depth = 2, .out = &chain });
++    try std.testing.expectEqual(@as(usize, 1), chain.n); // row 2's chance is 1/3 and the product falls under 0.5
++    try std.testing.expectEqual(@as(u32, 2), chain.tokens[0]);
++    try std.testing.expect(chain.probs[0] > 0.8 and chain.probs[0] < 0.9);
++    dr.confidence = 0.1;
++    select(&dr, 0, .{ .lane = undefined, .anchor = 1, .start = 10, .depth = 2, .out = &chain });
++    try std.testing.expectEqual(@as(usize, 2), chain.n);
++    // the first draft always stays, whatever its chance
++    dr.confidence = 0.99;
++    select(&dr, 0, .{ .lane = undefined, .anchor = 1, .start = 10, .depth = 2, .out = &chain });
++    try std.testing.expectEqual(@as(usize, 1), chain.n);
++}
+diff --git a/zig/src/families/flashnext/cuda_dflash_taps.zig b/zig/src/families/flashnext/cuda_dflash_taps.zig
+new file mode 100644
+index 0000000..5f37d93
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_dflash_taps.zig
+@@ -0,0 +1,77 @@
++//! DFlash2's taps on the batched pass: after each tapped decoder layer, the mean of its four hyper-connection streams.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++
++/// The target layers the drafter reads (incoai/Qwen3.8-Flash-Next-DFlash2's target_layer_ids), in tap-slot order.
++pub const layers = [_]usize{ 5, 15, 25, 35, 45 };
++/// Bytes of one row's taps: every tapped layer's mean, bf16.
++pub const row_bytes: usize = layers.len * wt.dims * 2;
++pub const max_jobs = 32;
++
++/// The tap kernel's runs (flashnext_dflash.cu's TapJobs): run j takes `rows[j]` rows from row `src0[j]` of the pass into `dst[j]`.
++pub const Jobs = extern struct {
++    n: c_int = 0,
++    slot: c_int = 0,
++    rows: [max_jobs]c_int = @splat(0),
++    src0: [max_jobs]c_int = @splat(0),
++    dst: [max_jobs]u64 = @splat(0),
++
++    pub fn add(j: *Jobs, src0: usize, rows: usize, dst: u64) !void {
++        if (rows == 0 or dst == 0) return;
++        if (j.n >= max_jobs) return error.TooManyTapRuns;
++        const i: usize = @intCast(j.n);
++        j.rows[i] = @intCast(rows);
++        j.src0[i] = @intCast(src0);
++        j.dst[i] = dst;
++        j.n += 1;
++    }
++
++    pub fn total(j: *const Jobs) usize {
++        var n: usize = 0;
++        for (j.rows[0..@intCast(j.n)]) |r| n += @intCast(r);
++        return n;
++    }
++};
++
++/// The tap slot read at the start of layer `layer` (the previous layer's output, once its write-back lands), or null.
++pub fn slotAt(layer: usize) ?usize {
++    if (layer == 0) return null;
++    for (layers, 0..) |l, i| if (l + 1 == layer) return i;
++    return null;
++}
++
++/// The launch: rows of `h` ([row][4][dims] bf16) into each run's destination, column block `slot`.
++pub fn launch(f: cuda.Function, stream: cuda.Stream, h: u64, jobs: Jobs, slot: usize) !void {
++    const n = jobs.total();
++    if (n == 0) return;
++    var j = jobs;
++    j.slot = @intCast(slot);
++    var a: cuda.Args = .{};
++    a.add(h);
++    a.add(j);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n), .y = @intCast((wt.dims + 1023) / 1024) }, .block = .{ .x = 256 } }, stream, &a);
++}
++
++comptime {
++    std.debug.assert(@sizeOf(Jobs) == 520);
++}
++
++test "dflash2: tap slots follow the layer after each tapped one" {
++    try std.testing.expectEqual(@as(?usize, 0), slotAt(6));
++    try std.testing.expectEqual(@as(?usize, 4), slotAt(46));
++    try std.testing.expectEqual(@as(?usize, null), slotAt(5));
++    try std.testing.expectEqual(@as(?usize, null), slotAt(0));
++}
++
++test "dflash2: tap runs add up, skip empty ones and refuse more than the kernel holds" {
++    var j: Jobs = .{};
++    try j.add(0, 3, 0x1000);
++    try j.add(3, 0, 0x2000);
++    try j.add(3, 5, 0);
++    try j.add(3, 4, 0x3000);
++    try std.testing.expectEqual(@as(usize, 7), j.total());
++    try std.testing.expectEqual(@as(c_int, 2), j.n);
++    for (0..max_jobs - 2) |_| try j.add(0, 1, 0x4000);
++    try std.testing.expectError(error.TooManyTapRuns, j.add(0, 1, 0x4000));
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 339a906..42f7f76 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -15,6 +15,7 @@ const slide_mod = @import("cuda_slide.zig");
+ const train = @import("cuda_train.zig");
+ const bytes = @import("cuda_lanes_bytes.zig");
+ const kvl = @import("cuda_kv_lanes.zig");
++const dflash = @import("cuda_dflash.zig");
+ const be = lanes.backend;
+ const ring = 1024;
+ const round_streams = 32; // Streams a round takes at most (a round with more live streams takes them in turns).
+@@ -60,7 +61,9 @@ pub fn Namespace(comptime Tri: type) type {
+             pub const min_prompt: u32 = 512;
+         };
+         pub const warm_quiet: u64 = 150 * std.time.ns_per_ms; // warm turns: a reply's background pass waits for quiet
+-        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false };
++        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false, drafter: ?[]const u8 = null, drafter_bits: u8 = 4 };
++        /// --drafter: a DFlash2 checkpoint (incoai/Qwen3.8-Flash-Next-DFlash2) drafts instead of the MTP head.
++        pub const takes_drafter = true;
+         /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert.
+         pub const slide = slide_mod.Slide(Tri);
+         /// The first file a lesson would rewrite through a link, or null: a teaching copy may hard-link the others.
+@@ -94,11 +97,17 @@ pub fn Namespace(comptime Tri: type) type {
+             follow: ?*const fn (*anyopaque) anyerror!void = null,
+             /// TF_FLASHNEXT_KV_PAGES: the streams beside the first take pages of one pool (null: their own caches).
+             layout: ?@import("core").kv_pool.Layout = null,
++            /// "DFlash2" when --drafter drafts (the host's startup line names it).
++            draft_kind: ?[]const u8 = null,
+         };
+         /// Device bytes of the checkpoint: the n-gram tables stay mapped, the MTP head counts; 0 if unread.
+         pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
+             return bytes.deviceWeightBytes(gpa, io, dir);
+         }
++        /// --drafter: the DFlash2 drafter's device bytes beside the checkpoint's (its 4-bit weights and scratch).
++        pub fn drafterBytes() u64 {
++            return @import("cuda_dflash_load.zig").estimateBytes(80_000);
++        }
+         pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, drafts: bool) !u64 {
+             return bytes.placementWeightBytes(gpa, io, dir, world, rank, drafts);
+         }
+@@ -143,6 +152,8 @@ pub fn Namespace(comptime Tri: type) type {
+             part_draft: ?cuda.DeviceBuffer = null,
+             /// Kept states its current prompt chunk fills on the way, until the cache takes them
+             prepared: [prompt.batch.max_marks]?*snap.Snap = .{ null, null },
++            /// --drafter: its context ring and the tap rows of its last verify window.
++            df: ?dflash.LaneState = null,
+         };
+ 
+         const Parts = @import("cuda_lane_parts.zig").Parts;
+@@ -159,6 +170,10 @@ pub fn Namespace(comptime Tri: type) type {
+             vision: ?*@import("cuda_images.zig").Vision = null,
+             ranks: ?*ranks.Session = null,
+             head: ?*mtp.Head = null,
++            /// --drafter: DFlash2 drafts a round (the head stays loaded for its draft vocabulary and the windows' rollbacks).
++            dflash: ?*dflash.Drafter = null,
++            /// TF_FLASHNEXT_DFLASH_TIMING=1: a round's steps timed and logged (synchronizes nothing extra).
++            timing: bool = false,
+             depth: usize = mtp.default_depth,
+             depth_greedy: usize = mtp.default_depth_greedy,
+             confidence: f64 = mtp.default_confidence,
+@@ -235,8 +250,9 @@ pub fn Namespace(comptime Tri: type) type {
+                     .mtp = drafting,
+                     .speculate = drafting,
+                     .speculate_early = false,
+-                    .drafts = if (drafting) @intCast(@max(self.depth, self.depth_greedy)) else 0,
++                    .drafts = if (!drafting) 0 else if (self.dflash) |dr| @intCast(dr.depth) else @intCast(@max(self.depth, self.depth_greedy)),
+                     .draft_probabilities = drafting,
++                    .copy_drafts = if (self.dflash) |dr| dr.copies else true,
+                     .streams_exact = true,
+                     .hidden_rows = true,
+                     .batch_rows = if (drafting) mtp.round_rows else round_streams,
+@@ -309,6 +325,10 @@ pub fn Namespace(comptime Tri: type) type {
+                     l.draft = try mtp.Draft.initParts(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads, l.part_draft.?);
+                 } else if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.init(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads);
+                 if (l.draft) |*d| d.label = s.id;
++                if (self.dflash) |dr| if (l.draft) |*d| {
++                    l.df = try dr.lane();
++                    d.taps = l.df.?.taps.ptr;
++                };
+                 s.cached = 0;
+                 // one rank restores first so a kept state's images skip the tower; ranks send every image's rows unfed
+                 if (self.ranks == null) try snaps.resumeKept(self, s, l, ids.len);
+@@ -321,6 +341,24 @@ pub fn Namespace(comptime Tri: type) type {
+                 if (self.ranks != null) try snaps.resumeKept(self, s, l, ids.len);
+                 return l;
+             }
++            fn dflashOps(self: *Cuda, dr: *dflash.Drafter) dflash.Ops(Tri) {
++                return .{ .e = self.engine, .tri = self.tri(), .dr = dr };
++            }
++
++            /// A prompt chunk with DFlash2: the pass taps the rows its window can still reach, which go into the stream's context.
++            fn dflashChunk(self: *Cuda, dr: *dflash.Drafter, l: *Lane, d: *mtp.Draft, ids: []const u32, at: usize, stop: usize, marks: [prompt.batch.max_marks]prompt.batch.Mark) !void {
++                if (l.seq.fed != at) return error.PositionMismatch;
++                const st = &l.df.?;
++                const from = @max(at, ids.len -| dflash.WIN);
++                const tapped = stop > from;
++                try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..stop], .{ .logits = if (stop == ids.len) .last else .none, .prompt = true, .marks = marks, .taps = if (tapped) dr.promptTaps() else 0, .tap_from = from - at });
++                if (tapped) {
++                    try self.dflashOps(dr).ingest(&.{.{ .ring = st.ring.ptr, .taps = dr.promptTaps(), .n = stop - from, .pos0 = @intCast(from) }});
++                    st.took(@intCast(from), stop - from);
++                }
++                d.len = stop;
++            }
++
+             /// One prompt chunk, rows picked as it starts (busy for a warm pass), cut at an unkept mark; true at last.
+             fn step(self: *Cuda, s: *lanes.Stream, l: *Lane, _: u32) !bool {
+                 const ids = s.prompt();
+@@ -336,7 +374,7 @@ pub fn Namespace(comptime Tri: type) type {
+                 const last = cut.stop == ids.len;
+                 self.engine.ngram.warmAhead(ids, cut.stop, @min(ids.len, cut.stop + rows));
+                 if (l.draft) |*d| {
+-                    try self.ops().prefillChunk(&l.seq, d, ids, at, cut.stop, marks);
++                    if (self.dflash) |dr| try self.dflashChunk(dr, l, d, ids, at, cut.stop, marks) else try self.ops().prefillChunk(&l.seq, d, ids, at, cut.stop, marks);
+                 } else if (self.ranks) |r| {
+                     try r.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], .{ .logits = if (last) .last else .none, .prompt = true });
+                 } else try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], .{ .logits = if (last) .last else .none, .prompt = true, .marks = marks });
+@@ -369,6 +407,10 @@ pub fn Namespace(comptime Tri: type) type {
+             own.parts.deinit(own.gpa);
+             own.engine.round_graph.clear();
+             own.logits.free();
++            if (own.dflash) |dr| {
++                own.engine.batch_k.df_tap = null;
++                dr.deinit();
++            }
+             if (own.head) |h| h.deinit();
+             if (own.vision) |v| v.deinit();
+             if (own.ranks) |r| r.deinit();
+@@ -383,6 +425,8 @@ pub fn Namespace(comptime Tri: type) type {
+         fn dropLane(self: *Cuda, l: *Lane) void {
+             cuda.completion.drain(self.engine.driver, self.stream, "flashnext: a failed or closed lane did not drain");
+             snaps.dropPrepared(self, l);
++            if (l.df) |st| self.dflash.?.give(st);
++            l.df = null;
+             if (l.draft) |*d| d.deinit();
+             if (self.ranks) |r| r.drop(&l.seq) else if (!self.kv.close(l.from, &l.seq)) l.seq.deinit(self.gpa);
+             // the blocks after both: a state / spare swap may have left views of each in the other
+@@ -445,8 +489,66 @@ pub fn Namespace(comptime Tri: type) type {
+             return self.drawn[handle % ring];
+         }
+ 
+-        /// A drafting stream's window in one batched pass; streams without drafts share rounds, each row its own bits.
++        /// TF_FLASHNEXT_DFLASH_TIMING=1: the host's time in verify, keep and draft calls (a round's three steps), logged every
++        /// 64 rounds, and a lone stream's verify ms by window rows every 256 (with or without --drafter).
++        var round_ms: [3]f64 = @splat(0);
++        var round_rows: f64 = 0;
++        var round_calls: u64 = 0;
++        var rows_ms: [mtp.round_rows + 1]f64 = @splat(0);
++        var rows_n: [mtp.round_rows + 1]u64 = @splat(0);
++
++        fn timed(self: *Cuda, which: usize, t0: i96) void {
++            round_ms[which] += @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.engine.io).toNanoseconds() - t0)) / 1e6;
++            if (which != 0) return;
++            round_calls += 1;
++            if (round_calls % 64 != 0) return;
++            std.log.info("round: verify {d:.1} ms, keep {d:.1} ms, draft {d:.1} ms, {d:.1} rows a window", .{ round_ms[0] / 64, round_ms[1] / 64, round_ms[2] / 64, round_rows / 64 });
++            round_ms = @splat(0);
++            round_rows = 0;
++            if (round_calls % 256 != 0) return;
++            for (rows_n, rows_ms, 0..) |n, ms, r| if (n > 0) std.log.info("round: lone window of {d} rows: {d} windows, {d:.1} ms", .{ r, n, ms / @as(f64, @floatFromInt(n)) });
++            rows_ms = @splat(0);
++            rows_n = @splat(0);
++        }
++
++        fn watching(self: *Cuda) bool {
++            return self.timing;
++        }
++
+         fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++            const self = of(ptr);
++            if (!watching(self)) return verifyBody(ptr, windows, out);
++            const t0 = std.Io.Clock.awake.now(self.engine.io).toNanoseconds();
++            defer {
++                if (windows.len == 1) {
++                    const rows = @min(windows[0].rows(), mtp.round_rows);
++                    rows_n[rows] += 1;
++                    rows_ms[rows] += @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.engine.io).toNanoseconds() - t0)) / 1e6;
++                }
++                timed(self, 0, t0);
++            }
++            for (windows) |w| round_rows += @as(f64, @floatFromInt(w.rows())) / @as(f64, @floatFromInt(windows.len));
++            return verifyBody(ptr, windows, out);
++        }
++
++        fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++            const self = of(ptr);
++            if (!watching(self)) return keepBody(ptr, windows, paths);
++            const t0 = std.Io.Clock.awake.now(self.engine.io).toNanoseconds();
++            defer timed(self, 1, t0);
++            return keepBody(ptr, windows, paths);
++        }
++
++        fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++            const self = of(ptr);
++            if (!watching(self)) return draftBody(ptr, requests);
++            const t0 = std.Io.Clock.awake.now(self.engine.io).toNanoseconds();
++            defer timed(self, 2, t0);
++            return draftBody(ptr, requests);
++        }
++
++        /// A drafting stream's window in one batched pass; streams without drafts share rounds, each row its own bits.
++        fn verifyBody(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
+             const self = of(ptr);
+             const seqs = try self.gpa.alloc(*prompt.Seq, windows.len);
+             defer self.gpa.free(seqs);
+@@ -493,7 +595,7 @@ pub fn Namespace(comptime Tri: type) type {
+         }
+ 
+         /// Each window keeps its first rows (a chain's prefix): the DeltaNet states replayed over them alone.
+-        fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++        fn keepBody(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+             const self = of(ptr);
+             for (windows, paths) |w, path| {
+                 if (path.len == 0 or path.len > w.rows()) return error.CannotRewind;
+@@ -504,10 +606,11 @@ pub fn Namespace(comptime Tri: type) type {
+         }
+ 
+         /// The head absorbs the kept rows and chains the next window's drafts (Python decode.draft).
+-        fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++        fn draftBody(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+             const self = of(ptr);
+             if (self.head == null) return error.NoDraftHead;
+             defer lanes_draft.depthLog(self, requests);
++            if (self.dflash) |dr| return dflashDraft(self, dr, requests);
+             const rule = lanes_draft.rule(self, requests.len);
+             // a shared round's chains: their heads in one pass a step (the drafts each would get alone)
+             var batched: [mtp_ops.max_lanes]bool = @splat(false);
+@@ -535,6 +638,47 @@ pub fn Namespace(comptime Tri: type) type {
+             }
+         }
+ 
++        /// DFlash2: every request's kept rows into its context, then one block pass drafts for them all.
++        fn dflashDraft(self: *Cuda, dr: *dflash.Drafter, requests: []const be.DraftRequest) !void {
++            if (requests.len > round_streams) return error.TooManyStreams;
++            var runs: [round_streams]dflash.Run = undefined;
++            var reqs: [round_streams]dflash.Req = undefined;
++            var n_runs: usize = 0;
++            var n_reqs: usize = 0;
++            for (requests) |r| {
++                if (r.lanes != null) return error.TreesNotBuilt;
++                const l = try self.lane(r.stream);
++                const d = if (l.draft) |*x| x else return error.NoDraftHead;
++                const st = if (l.df) |*x| x else return error.NoDraftHead;
++                l.chain.n = 0;
++                var anchor: u32 = undefined;
++                if (r.rows) |path| {
++                    for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
++                    if (r.follow.len < path.len) return error.PositionMismatch;
++                    try self.ops().rollback(&l.seq, d, path.len);
++                    anchor = r.follow[path.len - 1];
++                    // the kept rows of its last verify window: positions fed - n .. fed - 1, the window's first n
++                    const pos0 = l.seq.fed - path.len;
++                    if (d.fed0 == pos0) {
++                        runs[n_runs] = .{ .ring = st.ring.ptr, .taps = st.taps.ptr, .n = path.len, .pos0 = @intCast(pos0) };
++                        n_runs += 1;
++                        st.took(@intCast(pos0), path.len);
++                    } else st.end = -1;
++                } else {
++                    if (d.open) try self.ops().rollback(&l.seq, d, d.rows);
++                    anchor = self.value(r.first orelse return error.NoFirstToken);
++                }
++                if (r.position != l.seq.fed + 1) return error.PositionMismatch;
++                const start: i64 = @intCast(l.seq.fed);
++                const room = l.seq.cap - l.seq.fed - 1;
++                const count = @min(@min(r.depth, dr.depth), room);
++                if (count == 0 or st.end != start or st.end <= st.from) continue;
++                reqs[n_reqs] = .{ .lane = st, .anchor = anchor, .start = start, .depth = count, .out = &l.chain, .sampling = r.stream.sampling, .position = r.position };
++                n_reqs += 1;
++            }
++            try self.dflashOps(dr).draft(runs[0..n_runs], reqs[0..n_reqs]);
++        }
++
+         /// The held chain as host tokens: the round loop verifies them as it would copied ones.
+         fn treeFn(ptr: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
+             const self = of(ptr);
+@@ -567,6 +711,7 @@ pub fn Namespace(comptime Tri: type) type {
+         }
+ 
+         test {
++            _ = @import("cuda_dflash.zig");
+             _ = @import("cuda_images_test.zig").Cases(Cuda, Cuda.open, dropLane);
+             _ = @import("cuda_lanes_restore_test.zig").Cases(Cuda, Cuda.open, snaps.restore, dropLane);
+             _ = @import("cuda_lanes_admission_test.zig").Cases(Cuda, Cuda.open, dropLane);
+diff --git a/zig/src/families/flashnext/cuda_lanes_explain.zig b/zig/src/families/flashnext/cuda_lanes_explain.zig
+index e6f732a..d15ed94 100644
+--- a/zig/src/families/flashnext/cuda_lanes_explain.zig
++++ b/zig/src/families/flashnext/cuda_lanes_explain.zig
+@@ -8,6 +8,10 @@ pub fn open(err: anyerror) ?[]const u8 {
+         error.FlashNextRanksOnCapturedGlue => "--tp 2 runs Flash Next's own glue, not a captured set: set TENSORFOLD_CUDA_KERNELS=native, or serve on one GPU",
+         error.BadFlashNextKvPages, error.BadFlashNextPageTest, error.FlashNextPagesUnsupported, error.UnsupportedCheckpoint => explain(err),
+         error.UnsupportedLearningFormat, error.TrainingOnCapturedGlue => explain(err),
++        error.DFlashNeedsOneGpu => "--drafter: DFlash2 drafts on Flash Next run on one GPU: serve without --tp 2, or without --drafter",
++        error.DFlashBits => "--drafter-bits: Flash Next's DFlash2 drafter runs its linears at 4 bits: serve without --drafter-bits or with 4",
++        error.NotDFlash2 => "--drafter: the folder holds no DFlash2 checkpoint (its config.json names a DFlash2 architecture and a dflash_config)",
++        error.DrafterConfigUnexpected => "--drafter: this DFlash2 checkpoint's geometry is not Qwen3.8-Flash-Next's (hidden 2560, 5 layers, block 8, taps 5/15/25/35/45); the log names none: compare its config.json",
+         error.VisionWithoutTower => @import("engine_api").visionWords("this Flash Next checkpoint", err),
+         else => null,
+     };
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index e879a85..6224abc 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -48,6 +48,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     errdefer gpa.destroy(own);
+     own.* = .{ .gpa = gpa, .context = o.context, .engine = undefined, .glue = undefined, .stream = undefined, .logits = undefined, .device = ctx.device, .io = io };
+     // fixed-size lane buffers reused across streams (cuda_lane_parts.zig; TF_FLASHNEXT_LANE_PARTS=0: allocate each)
++    own.timing = try @import("sys").environment.read(bool, "TF_FLASHNEXT_DFLASH_TIMING", false);
+     own.parts.on = try @import("sys").environment.read(bool, "TF_FLASHNEXT_LANE_PARTS", true);
+     own.stream = try cuda.Stream.init(driver, true);
+     errdefer own.stream.deinit();
+@@ -98,6 +99,24 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         own.confidence = try @import("sys").environment.read(f64, "TF_FLASHNEXT_CONFIDENCE", mtp.default_confidence);
+     }
+     errdefer if (own.head) |h| h.deinit();
++    // --drafter: a DFlash2 checkpoint drafts instead of the MTP head, which stays for its draft vocabulary and rollbacks
++    if (o.drafter) |ddir| if (o.drafts) {
++        if (o.tp != 1) return error.DFlashNeedsOneGpu;
++        if (o.drafter_bits != 4) return error.DFlashBits;
++        const dload = @import("cuda_dflash_load.zig");
++        if (!dload.declares(gpa, io, ddir)) {
++            std.log.err("flashnext: --drafter {s} holds no DFlash2 checkpoint (config.json names no DFlash2 architecture)", .{ddir});
++            return error.NotDFlash2;
++        }
++        own.dflash = dload.load(gpa, io, own.engine, own.head orelse return error.NoDraftHead, ddir) catch |err| {
++            std.log.err("flashnext: the DFlash2 drafter at {s} did not load ({s})", .{ ddir, @errorName(err) });
++            return err;
++        };
++    };
++    errdefer if (own.dflash) |dr| {
++        own.engine.batch_k.df_tap = null;
++        dr.deinit();
++    };
+     // TF_FLASHNEXT_WINDOW_CHECK=1: the boot self-check measures the copied rows against their one-token steps
+     const check = try @import("sys").environment.read(bool, "TF_FLASHNEXT_WINDOW_CHECK", false);
+     const runs = check and own.head != null and o.drafts and o.tp == 1;
+@@ -127,6 +146,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     if (own.head) |h| {
+         stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
+     } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
++    if (own.dflash != null) stream_bytes += @import("cuda_dflash.zig").streamBytes();
+     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
+     if (page_tokens > 0) {
+         // the lane's head runs at the engine's chunk: its cache on the stream's pages, its buffers in the run
+@@ -152,6 +172,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         .target = own,
+         .own_glue = own.set == null,
+         .follow = if (o.rank != 0) F.follow else null,
++        .draft_kind = if (own.dflash != null) "DFlash2" else null,
+     };
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index 2a8d1f8..34e0ebf 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -77,6 +77,8 @@ pub const Draft = struct {
+     rows_cap: usize,
+     /// The prompt's last row of streams in `streams`, which the first draft reads with the first token.
+     prompt_last: u64 = 0,
++    /// DFlash2 (--drafter): where each verify window's taps go, [window rows, taps * dims] bf16 (0: none; the lane's own).
++    taps: u64 = 0,
+     /// The head's last output row (its streams after the MoE write-back): the next chained draft's input.
+     out: cuda.DeviceBuffer,
+     /// A window's scores [layout.rows, vocab], the draft head's [ids], best values (bestBytes at layout.rows).
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index e8208e0..dd44540 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -288,7 +288,7 @@ pub fn Ops(comptime Tri: type) type {
+             d.history = seq.history;
+             @memcpy(d.ids[0..n], ids);
+             if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+-            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits() });
++            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .taps = d.taps, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits() });
+             if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);
+             d.open = keeps;
+         }
+@@ -314,7 +314,7 @@ pub fn Ops(comptime Tri: type) type {
+                 d.history = seq.history;
+                 @memcpy(d.ids[0..n], ids);
+                 if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+-                w.* = .{ .seq = seq, .ids = ids, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .logits = d.logits.ptr };
++                w.* = .{ .seq = seq, .ids = ids, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .logits = d.logits.ptr, .taps = d.taps };
+             }
+             try o.e.windows(Tri, o.tri, wins, out);
+             var row0: usize = 0;
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 7b48bd4..4a15332 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -432,6 +432,10 @@ pub const Engine = struct {
+             e.ngram.warmAhead(ids, at + n, @min(ids.len, at + n + s.cap));
+             p.hooks.logits = if (last) hooks.logits else .none;
+             p.hooks.streams = if (hooks.streams != 0) hooks.streams + at * wide * 2 else 0;
++            // the tapped rows of this chunk: those from the call's tap_from on, their buffer at that row's place
++            const tapped = @max(hooks.tap_from, at);
++            p.hooks.taps = if (hooks.taps != 0 and tapped < at + n) hooks.taps + (tapped - hooks.tap_from) * @import("cuda_dflash_taps.zig").row_bytes else 0;
++            p.hooks.tap_from = tapped - at;
+             try p.chunk(ids[at..][0..n], seq.fed + at, if (last and hooks.logits != .none and hooks.host_logits) seq.logits else null);
+             at += n;
+         }
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 601bfbd..0f33744 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -21,7 +21,7 @@ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *S
+ }
+ 
+ /// A stream's window in a shared pass: its rows, and where its rollback rows, hidden rows and scores go (0: none).
+-pub const Window = struct { seq: *Seq, ids: []const u32, keep: ?*const batch.Keep = null, streams: u64 = 0, logits: u64 = 0 };
++pub const Window = struct { seq: *Seq, ids: []const u32, keep: ?*const batch.Keep = null, streams: u64 = 0, logits: u64 = 0, taps: u64 = 0 };
+ 
+ /// Several streams' windows in one batched pass, each row's bits its lone pass's; `out` holds every row's scores.
+ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, out: u64) !void {
+@@ -47,7 +47,7 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     const scores = try e.reserveScores(cap, s.cap);
+     var at: usize = 0;
+     for (wins, lanes) |w, *l| {
+-        l.* = .{ .seq = w.seq.view(scores), .pos = w.seq.fed, .rows = w.ids.len, .keep = w.keep, .streams = w.streams, .logits = w.logits };
++        l.* = .{ .seq = w.seq.view(scores), .pos = w.seq.fed, .rows = w.ids.len, .keep = w.keep, .streams = w.streams, .logits = w.logits, .taps = w.taps };
+         @memcpy(ids[at..][0..w.ids.len], w.ids);
+         @memset(untaught[at..][0..w.ids.len], w.seq.untaught);
+         at += w.ids.len;
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index c02795c..ae53ee6 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -117,7 +117,7 @@ pub const Key = struct {
+     pub fn init(seq: anytype, pos0: usize, rows: usize, s: *const parts.Scratch, scores: u64, model: u64, hooks: parts.Hooks) Key {
+         var h: Hash = .{};
+         h.geometry(.at(pos0 + rows, seq.cap));
+-        h.values(&[_]u64{ seq.gen, seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.streams });
++        h.values(&[_]u64{ seq.gen, seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.streams, hooks.taps });
+         if (retainSettleGraphs()) {
+             var parity: u64 = 0;
+             if (hooks.keep) |keep| if (seq.state.len != 0) {
+@@ -165,7 +165,7 @@ pub const SharedKey = struct {
+         for (lanes) |l| {
+             h.fixed(l.rows);
+             h.geometry(.at(l.pos + l.rows, l.seq.cap));
+-            h.values(&[_]u64{ l.seq.gen, pieces(l.seq), l.seq.cap, l.streams, l.logits });
++            h.values(&[_]u64{ l.seq.gen, pieces(l.seq), l.seq.cap, l.streams, l.logits, l.taps });
+             h.keep(l.keep);
+             rows += l.rows;
+         }
+diff --git a/zig/src/native/cuda_family_memory.zig b/zig/src/native/cuda_family_memory.zig
+index d6e0ecf..a390513 100644
+--- a/zig/src/native/cuda_family_memory.zig
++++ b/zig/src/native/cuda_family_memory.zig
+@@ -72,7 +72,8 @@ pub fn weights(comptime F: type, a: Allocator, io: std.Io, o: api.Open, problem:
+         problem.* = (if (@hasDecl(F, "explains_open")) F.explain(null, err) else null) orelse try std.fmt.allocPrint(a, "cannot size this rank's weights ({s})", .{@errorName(err)});
+         return null;
+     } else whole;
+-    return text + try @import("cuda_vision_offer.zig").weightBytes(F, a, io, o);
++    const drafter: u64 = if (comptime @hasDecl(F, "drafterBytes")) (if (o.drafts and o.drafter != null) F.drafterBytes() else 0) else 0; // a family that loads its own drafter
++    return text + drafter + try @import("cuda_vision_offer.zig").weightBytes(F, a, io, o);
+ }
+ 
+ /// `F.weightShare`, plain bytes or an error union (a family whose split settings can be refused).
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index f56ec64..a33d645 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -325,6 +325,10 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_FACT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_KV_PAGE_TEST", .scope = .flashnext, .kind = .size, .forms = "a page size the kernels take, whole blocks of the indexer's ratio up to the window (unset: off)" },
+     .{ .name = "TF_FLASHNEXT_CONFIDENCE", .scope = .flashnext, .kind = .signed_real, .forms = "a finite number (default -0.4)" },
++    .{ .name = "TF_FLASHNEXT_DFLASH_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 7; clamped to 1 through 7), with --drafter" },
++    .{ .name = "TF_FLASHNEXT_DFLASH_TIMING", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1 synchronizes and times the DFlash2 drafter's phases, logged every 64 rounds)" },
++    .{ .name = "TF_FLASHNEXT_DFLASH_COPIES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1), with --drafter: 0 leaves out the lane core's copies of the context" },
++    .{ .name = "TF_FLASHNEXT_DFLASH_CONFIDENCE", .scope = .flashnext, .kind = .real, .max = 1, .forms = "a finite number from 0 to 1 (default 0.5), with --drafter: a chain stops where the product of its drafts' chances falls under it" },
+     .{ .name = "TF_FLASHNEXT_PROMPT", .scope = .flashnext, .kind = .word, .words = &.{"rows"}, .forms = "rows for the rows path (unset or blank keeps the plain path)" },
+     .{ .name = "TENSORFOLD_API_KEY", .scope = .chat, .kind = .path, .trim = " \t\n\r\x0b\x0c", .forms = "API keys split by commas, without control characters (checked here by tensorfold chat --url)" },
+     .{ .name = "HF_TOKEN", .scope = .hub, .kind = .path, .trim = " \t\n\r\x0b\x0c", .forms = "a Hugging Face token without control characters (pull only)" },

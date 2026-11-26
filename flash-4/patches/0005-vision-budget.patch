@@ -1,0 +1,25 @@
+Vision budget: the engine rejected --vision-image-tokens above 4096 (BadImageLimits) although the shared budget of a request may be up to 65,536; each image keeps its own 4,096 cap. Needed for the recipe default of 36100 tokens and 50 images. Verified by starting the server with those flags.
+
+diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
+index f147222..e07596c 100644
+--- a/zig/src/vision/qwen_cuda_media.zig
++++ b/zig/src/vision/qwen_cuda_media.zig
+@@ -3,9 +3,10 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const vision = @import("qwen_cuda.zig");
++/// image_tokens: the rows all of a request's images take at most (the server's shared budget, up to 65,536); each image keeps its own 4,096.
+ pub const Limits = struct { image_tokens: u32 = 4096, max_images: u32 = 4 };
+ pub fn checkLimits(l: Limits) !void {
+-    if (l.image_tokens == 0 or l.image_tokens > 4096 or l.max_images == 0 or l.max_images > 64)
++    if (l.image_tokens == 0 or l.image_tokens > 65536 or l.max_images == 0 or l.max_images > 64)
+         return error.BadImageLimits;
+ }
+ pub const Run = extern struct {
+@@ -201,5 +202,5 @@ test "an image plan bounds its grids, counts and limits, and lays out interleave
+     try std.testing.expectError(error.BadImagePlaceholders, Plan.init(a, 5, &.{.{ .at = 2, .gh = 4, .gw = 4 }}, .{}));
+     try std.testing.expectError(error.BadImageCount, Plan.init(a, 20, &.{ .{ .at = 2, .gh = 2, .gw = 2 }, .{ .at = 8, .gh = 2, .gw = 2 } }, .{ .max_images = 1 }));
+     try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .max_images = 65 }));
+-    try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .image_tokens = 4097 }));
++    try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .image_tokens = 65537 }));
+ }

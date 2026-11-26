@@ -1,0 +1,73 @@
+Media limits (flash-3's patch 0003 on the native server): chat request bodies up to TENSORFOLD_MAX_BODY_MIB (default 32), 64 MiB of images and 400 Mpixel a request, 4 videos of 64 MiB, 192 MiB in all.
+
+diff --git a/zig/src/server/audio.zig b/zig/src/server/audio.zig
+index 6aa4d0e..f8a5041 100644
+--- a/zig/src/server/audio.zig
++++ b/zig/src/server/audio.zig
+@@ -16,7 +16,15 @@ pub const max_audio_bytes = body_limit;
+ 
+ /// The body limit of a route that reads chat messages: an hour of audio when the engine takes it.
+ pub fn bodyLimit(info: api.Info) usize {
+-    return if (info.audio != null) body_limit else http_body.limit;
++    return if (info.audio != null) body_limit else chatLimit();
++}
++
++/// TENSORFOLD_MAX_BODY_MIB (whole MiB, at most 1024): a larger chat request body than http_body.limit, for pages of
++/// screenshots as base64; unset or malformed keeps the default.
++fn chatLimit() usize {
++    const v = std.c.getenv("TENSORFOLD_MAX_BODY_MIB") orelse return http_body.limit;
++    const mib = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return http_body.limit;
++    return if (mib == 0 or mib > 1024) http_body.limit else @max(http_body.limit, mib << 20);
+ }
+ 
+ /// The audio token: the locator the template writes must be one added token, the one a clip's rows take.
+diff --git a/zig/src/server/images.zig b/zig/src/server/images.zig
+index 74133a8..92e3d8c 100644
+--- a/zig/src/server/images.zig
++++ b/zig/src/server/images.zig
+@@ -14,7 +14,7 @@ const Cx = errors.Cx;
+ 
+ /// images.py's limits: an image's and a request's encoded bytes, and the visual tokens of a low-detail image.
+ pub const max_image_bytes = 10 << 20;
+-pub const max_request_bytes = 20 << 20;
++pub const max_request_bytes = 64 << 20;
+ const low_detail_tokens = 256;
+ 
+ /// A request's encoded image bytes: each image's and all of them together; the defaults are chat's.
+diff --git a/zig/src/server/videos.zig b/zig/src/server/videos.zig
+index 711ce6b..23ffcea 100644
+--- a/zig/src/server/videos.zig
++++ b/zig/src/server/videos.zig
+@@ -8,9 +8,9 @@ const media_fetch = @import("media_fetch.zig");
+ const Cx = errors.Cx;
+ 
+ /// videos.py's VideoLimits.
+-pub const max_videos = 2;
+-pub const max_bytes = 16 << 20;
+-pub const max_total_bytes = 20 << 20;
++pub const max_videos = 4;
++pub const max_bytes = 64 << 20;
++pub const max_total_bytes = 192 << 20;
+ pub const max_side = 8192;
+ pub const max_seconds = 3600;
+ pub const timeout_s = 20;
+diff --git a/zig/src/server/vision_inputs.zig b/zig/src/server/vision_inputs.zig
+index 51e9bc9..5ac86a5 100644
+--- a/zig/src/server/vision_inputs.zig
++++ b/zig/src/server/vision_inputs.zig
+@@ -12,11 +12,11 @@ const qi = api.qwen_image;
+ 
+ const vision_start = "<|vision_start|>";
+ const vision_end = "<|vision_end|>";
+-const max_video_bytes: usize = 16 * 1024 * 1024;
+-const max_videos = 2;
++const max_video_bytes: usize = 64 * 1024 * 1024;
++const max_videos = 4;
+ const max_bytes_one: usize = 10 * 1024 * 1024;
+-const max_bytes_all: usize = 20 * 1024 * 1024;
+-const max_pixels_all: u64 = 32 * 1024 * 1024;
++const max_bytes_all: usize = 64 * 1024 * 1024;
++const max_pixels_all: u64 = 400 * 1024 * 1024;
+ const max_tokens_one: u64 = 4096;
+ 
+ pub const Extracted = struct { messages: Value, images: []api.Image };

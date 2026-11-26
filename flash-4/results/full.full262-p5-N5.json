@@ -1,0 +1,35 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8888/v1",
+ "chars_per_token": 3.987,
+ "ok": 5,
+ "of": 5,
+ "per_stream": [
+  9.8,
+  9.6,
+  9.2,
+  9.2,
+  39.5
+ ],
+ "per_stream_mean": 15.5,
+ "aggregate_window": 0.2,
+ "aggregate_steady": null,
+ "errors": [],
+ "N": 5,
+ "prompt_tokens_each": [
+  249000,
+  249122,
+  249139,
+  249148,
+  249492
+ ],
+ "wall_s": 1197.2,
+ "ttft_s": [
+  458.5,
+  732.1,
+  927.3,
+  1077.8,
+  1196.3
+ ],
+ "aggregate_prefill_tok_s": 1041.4
+}

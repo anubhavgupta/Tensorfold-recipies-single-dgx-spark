@@ -1,0 +1,26 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8888/v1",
+ "code/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   99.1
+  ],
+  "per_stream_mean": 99.1,
+  "aggregate_window": 99.5,
+  "aggregate_steady": 99.5,
+  "errors": []
+ },
+ "prose/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   51.0
+  ],
+  "per_stream_mean": 51.0,
+  "aggregate_window": 51.2,
+  "aggregate_steady": 51.2,
+  "errors": []
+ }
+}

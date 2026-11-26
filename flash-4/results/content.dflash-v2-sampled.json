@@ -1,0 +1,136 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8890/v1",
+ "code/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   47.2,
+   42.6,
+   45.0,
+   42.8
+  ],
+  "per_stream_mean": 44.4,
+  "aggregate_window": 168.4,
+  "aggregate_steady": 178.3,
+  "errors": []
+ },
+ "code/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   31.7,
+   31.7,
+   29.0,
+   30.2,
+   29.9,
+   26.4,
+   26.1,
+   24.9,
+   24.3
+  ],
+  "per_stream_mean": 28.2,
+  "aggregate_window": 217.5,
+  "aggregate_steady": 255.2,
+  "errors": []
+ },
+ "prose/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   26.6,
+   24.2,
+   23.9,
+   23.9
+  ],
+  "per_stream_mean": 24.6,
+  "aggregate_window": 92.5,
+  "aggregate_steady": 98.9,
+  "errors": []
+ },
+ "prose/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   18.9,
+   17.7,
+   17.3,
+   16.4,
+   16.9,
+   15.9,
+   15.7,
+   16.2,
+   16.2
+  ],
+  "per_stream_mean": 16.8,
+  "aggregate_window": 139.1,
+  "aggregate_steady": 151.8,
+  "errors": []
+ },
+ "devops/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   48.9,
+   43.6,
+   37.6,
+   35.0
+  ],
+  "per_stream_mean": 41.3,
+  "aggregate_window": 133.6,
+  "aggregate_steady": 165.8,
+  "errors": []
+ },
+ "devops/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   32.1,
+   25.9,
+   26.6,
+   24.6,
+   24.7,
+   23.0,
+   24.4,
+   23.2,
+   21.5
+  ],
+  "per_stream_mean": 25.1,
+  "aggregate_window": 191.6,
+  "aggregate_steady": 226.9,
+  "errors": []
+ },
+ "json/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   52.9,
+   46.8,
+   49.6,
+   43.0
+  ],
+  "per_stream_mean": 48.1,
+  "aggregate_window": 169.1,
+  "aggregate_steady": 193.1,
+  "errors": []
+ },
+ "json/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   31.9,
+   29.2,
+   29.8,
+   28.9,
+   28.5,
+   30.5,
+   29.5,
+   28.8,
+   27.2
+  ],
+  "per_stream_mean": 29.4,
+  "aggregate_window": 242.9,
+  "aggregate_steady": 265.5,
+  "errors": []
+ }
+}

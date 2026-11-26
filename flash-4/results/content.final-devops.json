@@ -1,0 +1,48 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8888/v1",
+ "devops/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   87.4
+  ],
+  "per_stream_mean": 87.4,
+  "aggregate_window": 87.7,
+  "aggregate_steady": 87.7,
+  "errors": []
+ },
+ "devops/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   53.3,
+   42.6,
+   41.0,
+   39.9
+  ],
+  "per_stream_mean": 44.2,
+  "aggregate_window": 151.1,
+  "aggregate_steady": 177.5,
+  "errors": []
+ },
+ "devops/N=9": {
+  "ok": 9,
+  "of": 9,
+  "per_stream": [
+   33.4,
+   31.9,
+   27.9,
+   25.1,
+   26.3,
+   26.8,
+   25.4,
+   26.2,
+   24.2
+  ],
+  "per_stream_mean": 27.5,
+  "aggregate_window": 214.9,
+  "aggregate_steady": 248.1,
+  "errors": []
+ }
+}
