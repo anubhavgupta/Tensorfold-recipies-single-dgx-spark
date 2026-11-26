@@ -1,0 +1,79 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:18892/v1",
+ "code/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   105.9
+  ],
+  "per_stream_mean": 105.9,
+  "aggregate_window": 106.4,
+  "aggregate_steady": 106.4,
+  "errors": []
+ },
+ "code/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   47.7,
+   46.8,
+   45.9,
+   41.5
+  ],
+  "per_stream_mean": 45.5,
+  "aggregate_window": 166.7,
+  "aggregate_steady": 182.8,
+  "errors": []
+ },
+ "prose/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   51.7
+  ],
+  "per_stream_mean": 51.7,
+  "aggregate_window": 51.9,
+  "aggregate_steady": 51.9,
+  "errors": []
+ },
+ "prose/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   27.0,
+   26.2,
+   25.7,
+   26.0
+  ],
+  "per_stream_mean": 26.2,
+  "aggregate_window": 99.6,
+  "aggregate_steady": 105.5,
+  "errors": []
+ },
+ "json/N=1": {
+  "ok": 1,
+  "of": 1,
+  "per_stream": [
+   100.6
+  ],
+  "per_stream_mean": 100.6,
+  "aggregate_window": 101.1,
+  "aggregate_steady": 101.1,
+  "errors": []
+ },
+ "json/N=4": {
+  "ok": 4,
+  "of": 4,
+  "per_stream": [
+   53.6,
+   55.4,
+   48.9,
+   49.8
+  ],
+  "per_stream_mean": 51.9,
+  "aggregate_window": 191.3,
+  "aggregate_steady": 208.8,
+  "errors": []
+ }
+}

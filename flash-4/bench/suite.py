@@ -4,6 +4,7 @@
   suite.py content <tag> <Ns e.g. 1,2,4,9> [gen=512]     per content class (code, prose, devops, json): decode tok/s, N concurrent streams
                                                           (greedy; env TEMPERATURE samples, CLS=code,prose picks classes)
   suite.py prefill <tag> <token counts e.g. 4096,32768>   one stream, unique prompt, gen=1: prefill tok/s = prompt_tokens / TTFT
+  suite.py compact <tag> [retained tokens, default 100000]   TensorFold only: cold, repeat, and compacted prompts
   suite.py full    <tag> <N> [prompt_tokens=250000] [gen=256]   N streams at once, each with a unique long prompt
 
 BASE_URL (default http://127.0.0.1:8888/v1), API_KEY optional. Results go to results/<mode>.<tag>.json.
@@ -168,6 +169,26 @@ def main():
                            "prefill_tok_s": round(r["prompt"] / ttft, 1) if not r["err"] else None, "err": r["err"]}
             print(f"[{tag}] prefill {res[str(n)]}", flush=True)
             save(mode, tag, res)
+    elif mode == "compact":
+        retained = int(sys.argv[3]) if len(sys.argv) > 3 else 100000
+        ws = words(); cpt = calibrate(ws, m)
+        rng = random.Random(319)
+        prefix = long_prompt(ws, rng, retained, cpt)
+        cold = prefix + "\n" + long_prompt(ws, rng, retained * 65 // 100, cpt)
+        compacted = prefix + "\n" + long_prompt(ws, rng, retained // 25, cpt)
+        for case, prompt in (("cold", cold), ("repeat", cold), ("compacted", compacted)):
+            body = {"model": m, "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 32, "temperature": 0, "top_k": 1,
+                    "chat_template_kwargs": {"enable_thinking": False}}
+            with urllib.request.urlopen(req("/chat/completions", body), timeout=7200) as response:
+                reply = json.load(response)
+            usage = reply["usage"]
+            runtime = reply["tensorfold"]
+            res[case] = {"prompt": usage["prompt_tokens"], "cached": usage["prompt_tokens_details"]["cached_tokens"],
+                         "gen": usage["completion_tokens"], "token_sha256": runtime["token_sha256"],
+                         "ttft_s": round(runtime["time_to_first_token"], 3)}
+            print(f"[{tag}] {case}: {res[case]}", flush=True)
+            save(mode, tag, res)
     elif mode == "full":
         N = int(sys.argv[3]); ptok = int(sys.argv[4]) if len(sys.argv) > 4 else 250000
         gen = int(sys.argv[5]) if len(sys.argv) > 5 else 256
@@ -192,4 +213,5 @@ def main():
         sys.exit(__doc__)
 
 
-main()
+if __name__ == "__main__":
+    main()

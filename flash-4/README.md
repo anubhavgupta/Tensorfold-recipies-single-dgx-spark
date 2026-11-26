@@ -43,6 +43,51 @@ acceptance. Acceptance (server `done` lines): code 81 %, prose 57 %, devops 72 %
 **Load time** ~60 s (flash-3 ~3 min). **Exactness:** greedy and sampled replies are byte-identical with drafts on and off
 (17 checks: 4 clients, a resumed turn, 6K and 25K prompts, vision, `--parallel 1`).
 
+### BF16 performance follow-up
+
+Tests used the same cached EXL3 target and DFlash2 drafter on one Spark, with the 262,144-token window and vision enabled.
+
+For a machine dedicated to four full windows and long follow-ups that are often compacted, use:
+
+```bash
+PARALLEL=4 KV_PAGES=0 PROMPT_CACHE_GIB=8 TF_PROMPT_INTERMEDIATE=1 ./flash-4/start.sh restart
+```
+
+This trades elastic pages for four full windows and reserves room for intermediate prompt checkpoints. The actual
+recipe image admitted all four windows and kept an 8 GiB cache; if other workloads leave insufficient memory,
+reduce `PARALLEL` rather than reducing the safety reserve. Keep the regular launcher defaults for elastic paging.
+At seed 42, the stock and warm-cache profiles matched generated-token hashes in the tool and PNG vision checks.
+The same two typed-tool fixtures failed in both profiles.
+
+- **Compacted multi-turn prompts:** with three full windows and a 10 GiB cache
+  (`PARALLEL=3 KV_PAGES=0 PROMPT_CACHE_GIB=10`), `TF_PROMPT_INTERMEDIATE=1` cut time to first token on a 43,504-token
+  follow-up from **35.71 s to 8.90 s** by restoring 32,768 cached tokens instead of two. The cold 69,078-token request,
+  its identical repeat, and the compacted request all produced the same token hashes in both arms. The four-window
+  recipe above repeated the hit in **9.07 s**, with matching token hashes. The 5.0 GiB effective cache in the
+  four-stream paged A/B did not retain a usable intermediate checkpoint, so the setting is not enabled by default.
+  More checkpoints use more cache memory; this does not speed up cold prompts or decode.
+- **Cold prefill:** keep the 1,024-row EXL3 expert window. In one matched sweep at 4K / 16K / 65K, it ran at
+  1,290 / 1,277 / 1,257 tok/s. The 2,048-row window ran at 1,254 / 1,232 / 1,195 and the 3,072-row window at
+  931 / 864 / 836. Widening the expert window is not the same as changing the outer prompt chunk size.
+- **Long-context indexer:** in an instrumented 249K prompt, the 3,072-row chunks nearest 128K / 192K / 249K
+  spent about 176 / 265 / 331 ms scoring candidate blocks and 36 / 57 / 71 ms selecting them, out of
+  2,804 / 2,908 / 3,007 ms total (median of the three closest full chunks). Scoring, not selection, is the
+  larger opportunity. A warp-aggregated selector produced identical results but did not improve measured selection
+  time. A four-row score tile was bit-exact but slower than the existing eight-row tile in a component A/B
+  (3.54 vs 2.57 ms at 262K, 256 queries); neither change was kept.
+- **Decode:** the distinct packed expert-weight footprint tracked kernel time at fixed verification widths.
+  Across 24 profiled eight-row passes at short context, the distinct footprint ranged from 3.93 to 7.20 GB,
+  with Pearson r=0.997 against expert stage time. This counts distinct selected weight bytes, not hardware DRAM
+  transactions; it does not establish that choosing different drafts would increase end-to-end throughput.
+  In a separate greedy sweep (192-token cap, thinking off, 1 / 4 clients), the existing seven-draft cap and 0.5
+  confidence were the best all-round settings. Four drafts reduced single-client code from 107-109 to 88 tok/s.
+  Lowering confidence to 0.35 moved four-client JSON from 205-207 to 209 tok/s, within noise, without improving code or prose.
+
+To reproduce the prefix-cache A/B, restart between configurations and run
+`python3 flash-4/bench/suite.py compact TAG 42000`. It reports the server's cold, repeated, and compacted
+prompt latency, cached tokens, and exact generated-token hashes. Compare hashes across configurations before
+comparing performance.
+
 ### Parallel full 262K streams
 
 Full 262,144-token window, bf16 KV (the native engine has no int8/fp8 KV): **7.9-8.1 GiB per stream**; the model takes 67.3 GiB, so

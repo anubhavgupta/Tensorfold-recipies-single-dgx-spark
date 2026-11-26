@@ -1,0 +1,25 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:18888/v1",
+ "cold": {
+  "prompt": 164480,
+  "cached": 0,
+  "gen": 32,
+  "token_sha256": "74bd560091aa92ed7748a7c5dcfb24747acaa78909b2d947bd51ad60f72308a5",
+  "ttft_s": 154.787
+ },
+ "repeat": {
+  "prompt": 164480,
+  "cached": 164473,
+  "gen": 32,
+  "token_sha256": "74bd560091aa92ed7748a7c5dcfb24747acaa78909b2d947bd51ad60f72308a5",
+  "ttft_s": 0.351
+ },
+ "compacted": {
+  "prompt": 103710,
+  "cached": 2,
+  "gen": 29,
+  "token_sha256": "dfca7f632cd056c077e6cbe54e1526277d4be6f655099b7169bbc793ca0c067a",
+  "ttft_s": 88.746
+ }
+}
