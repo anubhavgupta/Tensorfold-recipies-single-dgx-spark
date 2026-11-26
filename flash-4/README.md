@@ -88,6 +88,29 @@ To reproduce the prefix-cache A/B, restart between configurations and run
 prompt latency, cached tokens, and exact generated-token hashes. Compare hashes across configurations before
 comparing performance.
 
+#### EXL3 kernel experiments
+
+Same BF16 recipe, cached checkpoints, 262K server window, four admitted streams, greedy output for throughput.
+Prefill is cold, one stream, and reports prompt tokens per second at 4K / 16K / 65K:
+
+| Optimization | Stock tok/s | Experimental tok/s | Decision |
+|---|---:|---:|---|
+| Four-warps-per-item split-K finish | 1,302 / 1,292 / 1,258 | 1,300 / 1,286 / 1,263 | No repeatable improvement |
+| Fuse gate/up finish and down input rotation | 1,309 / 1,302 / 1,268 | 1,307 / 1,296 / 1,265 | Removed a launch and intermediate write, but no request speedup |
+
+Component tests matched output bits for both finishes and for the fused down rotation. The fusion retains the
+original BF16 rounding between SwiGLU and the down transform; the cold, repeated, and compacted request hashes
+also matched. Neither prefill experiment is enabled.
+
+Narrowing the decode's output tiles from 128 to 64 columns matched greedy and seeded sampled token IDs
+with DFlash2 on and off. It reduced four-client JSON from 200-206 to 147 aggregate tok/s, so it was rejected.
+
+Grouping up to 32 verification members per expert instead of 16 let the grouped kernel reuse a decoded weight
+tile across both 16-row tiles. In a separate greedy A/B/A at 98,304 context with nine admitted streams and a
+192-token cap, all 78 generated-token hashes matched. At nine clients, code / prose / JSON throughput was
+268 / 169 / 307 tok/s, within or below the two stock runs' ranges of 268-270 / 165-172 / 301-309. At four clients,
+the change did not beat both stock runs on any workload either. The original grouping remains the default.
+
 ### Parallel full 262K streams
 
 Full 262,144-token window, bf16 KV (the native engine has no int8/fp8 KV): **7.9-8.1 GiB per stream**; the model takes 67.3 GiB, so
