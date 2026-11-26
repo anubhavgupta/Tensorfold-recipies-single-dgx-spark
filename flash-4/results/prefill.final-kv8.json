@@ -4,20 +4,20 @@
  "chars_per_token": 3.987,
  "4096": {
   "prompt_tokens": 4101,
-  "ttft_s": 3.19,
-  "prefill_tok_s": 1284.1,
+  "ttft_s": 3.13,
+  "prefill_tok_s": 1309.8,
   "err": null
  },
  "16384": {
   "prompt_tokens": 16408,
-  "ttft_s": 13.0,
-  "prefill_tok_s": 1261.9,
+  "ttft_s": 12.65,
+  "prefill_tok_s": 1297.3,
   "err": null
  },
  "65536": {
   "prompt_tokens": 65245,
-  "ttft_s": 53.02,
-  "prefill_tok_s": 1230.5,
+  "ttft_s": 51.59,
+  "prefill_tok_s": 1264.6,
   "err": null
  }
 }

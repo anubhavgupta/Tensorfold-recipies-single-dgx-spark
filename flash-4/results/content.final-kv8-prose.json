@@ -5,44 +5,44 @@
   "ok": 1,
   "of": 1,
   "per_stream": [
-   53.8
+   56.9
   ],
-  "per_stream_mean": 53.8,
-  "aggregate_window": 54.0,
-  "aggregate_steady": 54.0,
+  "per_stream_mean": 56.9,
+  "aggregate_window": 57.1,
+  "aggregate_steady": 57.1,
   "errors": []
  },
  "prose/N=4": {
   "ok": 4,
   "of": 4,
   "per_stream": [
-   27.5,
-   24.8,
-   24.1,
-   24.2
+   29.3,
+   26.2,
+   25.2,
+   25.5
   ],
-  "per_stream_mean": 25.1,
-  "aggregate_window": 93.7,
-  "aggregate_steady": 100.9,
+  "per_stream_mean": 26.6,
+  "aggregate_window": 99.3,
+  "aggregate_steady": 106.7,
   "errors": []
  },
  "prose/N=9": {
   "ok": 9,
   "of": 9,
   "per_stream": [
-   19.3,
+   19.8,
+   19.7,
    18.8,
-   18.2,
-   18.4,
-   16.6,
+   19.1,
+   18.0,
+   17.2,
+   16.8,
    17.3,
-   16.3,
-   16.7,
-   16.1
+   16.7
   ],
-  "per_stream_mean": 17.5,
-  "aggregate_window": 144.2,
-  "aggregate_steady": 158.2,
+  "per_stream_mean": 18.2,
+  "aggregate_window": 149.3,
+  "aggregate_steady": 164.1,
   "errors": []
  }
 }

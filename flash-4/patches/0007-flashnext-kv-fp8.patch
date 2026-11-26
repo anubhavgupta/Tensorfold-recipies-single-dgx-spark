@@ -1,7 +1,6 @@
 FP8 attention K/V caches for Flash Next on the native CUDA engine (the engine keeps bf16 there): each position and KV head is E4M3 codes with an fp32 scale (amax/448, as the other families' kv_fp8.cuh), 528 bytes a position for keys or values instead of 1024. A stream's 262,144-token window takes ~4.7 GiB instead of 8.1 GiB. The indexer keys, pooled keys and everything else stay bf16. The writer quantizes after the key norm and rope; the readers cp.async the codes into a staging area, convert to bf16 (code x scale, rounded once) and feed the unchanged mma tiles, so each row's result still depends on that row only (greedy replies are byte-identical with drafts on and off). Switch: wt.kv_fp8 in cuda_prompt_wt.zig and KV8 in flashnext_pages.cuh (compile time; both false = the bf16 caches).
-
 diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
-index 3d9f7bb..9efd3ce 100644
+index 3d9f7bb..3fa59e6 100644
 --- a/zig/kernels/cuda/flashnext_attn.cu
 +++ b/zig/kernels/cuda/flashnext_attn.cu
 @@ -8,6 +8,7 @@
@@ -78,7 +77,7 @@ index 3d9f7bb..9efd3ce 100644
 +    __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NBT * 2 * TK));
 +    // KV8: a tile's raw codes and scales (keys, then values), cp.async'd here and converted into the bf16 tile rows once they land
 +    unsigned char* stage = reinterpret_cast<unsigned char*>(ps + QR);
-+    auto stg = [&](int pass, int k) { return stage + (static_cast<long long>(ONE ? 0 : pass) * TK + k) * KV8_STAGE; };
++    auto stg = [&](int pass, int k) { return stage + (static_cast<long long>(pass) * TK + k) * KV8_STAGE; };
      __shared__ float red_m[4][QR], red_l[4][QR];
      __shared__ int key_ids[NB][TK];
      __shared__ long long key_at[PAGED ? NB : 1][PAGED ? TK : 1];
@@ -110,7 +109,7 @@ index 3d9f7bb..9efd3ce 100644
              }
              qmm_frag::commit();
          }
-@@ -295,12 +340,28 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -295,41 +340,64 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
      // ONE: the keys (pass 0) or the values (pass 1) of the tile whose ids are in key_ids[0], into the one buffer
      auto load_one = [&](int pass) {
          const __nv_bfloat16* src = pass == 0 ? KC : VC;
@@ -142,7 +141,17 @@ index 3d9f7bb..9efd3ce 100644
      float mm[2] = {-INFINITY, -INFINITY}, ll[2] = {0.0f, 0.0f}, oo[FUSE ? 8 : 1][4] = {};
      for (int cc = c; cc < c_end; ++cc) {
      start = cc * CH;
-@@ -316,20 +377,26 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+     float o[8][4] = {};
+     const int tiles = min(n - start, CH);
+-    if (NB == 2) load(0, 0);
++    if (NB == 2 || (KV8 && ONE)) load(0, 0);   // KV8 ONE: the tile after this one goes out once its values are converted
+     for (int t0 = 0, it = 0; t0 < tiles; t0 += TK, ++it) {
+         const int buf = NB == 2 ? it & 1 : 0;
+         const bool ahead = NB == 2 && t0 + TK < tiles;  // the next tile's loads go out before this tile's math
+-        if constexpr (ONE) {
++        if constexpr (ONE && !KV8) {
+             if (threadIdx.x < TK) {
                  const int ki = start + t0 + threadIdx.x;
                  const int key = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
                  key_ids[0][threadIdx.x] = key;
@@ -152,8 +161,9 @@ index 3d9f7bb..9efd3ce 100644
              __syncthreads();
              load_one(0);
          } else {
-             if (NB == 1) load(t0, 0);
+-            if (NB == 1) load(t0, 0);
 -            if (ahead) load(t0 + TK, buf ^ 1);
++            if (NB == 1 && !(KV8 && ONE)) load(t0, 0);
 +            if (!KV8 && ahead) load(t0 + TK, buf ^ 1);
          }
 -        Row* kt = tiles_kv + (ONE ? 0 : buf * 2 * TK);
@@ -161,7 +171,8 @@ index 3d9f7bb..9efd3ce 100644
          Row* vt = ONE ? kt : kt + TK;
          const int* keys = key_ids[buf];
 -        if constexpr (ONE) qmm_frag::wait<0>();
-+        if constexpr (ONE || KV8) qmm_frag::wait<0>();
++        if constexpr (ONE && KV8) qmm_frag::wait<1>();   // the values are still in flight
++        else if constexpr (ONE || KV8) qmm_frag::wait<0>();
          else if (ahead) qmm_frag::wait<3>(); else qmm_frag::wait<1>();
          __syncthreads();
 +        if constexpr (KV8) {                       // the tile's codes landed: keys (and values) to bf16, then the next tile's go out
@@ -173,7 +184,16 @@ index 3d9f7bb..9efd3ce 100644
          constexpr int JT = TK / 32;  // a warp's 8-key tiles
          float s[JT][4] = {};
  #pragma unroll 4
-@@ -390,8 +457,14 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -345,7 +413,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+                 qmm_frag::mma(s[jt], a1, b[2], b[3]);
+             }
+         }
+-        if constexpr (ONE) {                              // every warp has read the keys: the values take their place
++        if constexpr (ONE && !KV8) {                      // every warp has read the keys: the values take their place
+             __syncthreads();
+             load_one(1);
+         }
+@@ -390,8 +458,15 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
              rows[h] = __fadd_rn(rows[h], __shfl_xor_sync(0xffffffffu, rows[h], 2));
              if (t == 0) red_l[warp][g + 8 * h] = rows[h];
          }
@@ -185,6 +205,7 @@ index 3d9f7bb..9efd3ce 100644
 +        if constexpr (KV8 && ONE) {
 +            convert(1);
 +            __syncthreads();
++            if (t0 + TK < tiles) load(t0 + TK, 0);        // the next tile's codes fly while the values are multiplied
 +        }
  #pragma unroll
          for (int h = 0; h < 2; ++h) {
@@ -205,7 +226,7 @@ index b25aed8..33be281 100644
 +    return KV8 ? (static_cast<long long>(heads) * HD + 16) / 2 : static_cast<long long>(heads) * HD;
 +}
 diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
-index 764aea3..eb8c685 100644
+index 764aea3..d663724 100644
 --- a/zig/src/families/flashnext/cuda_glue.zig
 +++ b/zig/src/families/flashnext/cuda_glue.zig
 @@ -10,11 +10,16 @@ const tile_head_dim = 256;
@@ -223,7 +244,7 @@ index 764aea3..eb8c685 100644
  /// The one-buffer form: a tile's keys, then its values, in the same rows of shared memory.
  fn oneSmem() u32 {
 -    return (tile_heads + 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2;
-+    return (tile_heads + 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2 + stageBytes(1);
++    return (tile_heads + 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2 + stageBytes(2);
  }
  /// Rows up to which attention reads the next tile ahead (fewer blocks, so latency, not occupancy, sets the time).
  pub const ahead_rows = 16;

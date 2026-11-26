@@ -5,33 +5,33 @@
   "ok": 4,
   "of": 4,
   "per_stream": [
-   28.3,
-   25.3,
-   24.8,
-   24.7
+   27.2,
+   25.7,
+   25.4,
+   25.1
   ],
-  "per_stream_mean": 25.8,
-  "aggregate_window": 98.1,
-  "aggregate_steady": 103.5,
+  "per_stream_mean": 25.9,
+  "aggregate_window": 99.2,
+  "aggregate_steady": 103.9,
   "errors": []
  },
  "prose/N=9": {
   "ok": 9,
   "of": 9,
   "per_stream": [
+   19.3,
    19.4,
-   18.8,
-   17.9,
-   17.2,
-   16.7,
-   16.7,
-   16.2,
+   17.7,
+   16.4,
+   16.5,
    16.1,
-   16.0
+   16.4,
+   16.4,
+   15.7
   ],
-  "per_stream_mean": 17.2,
-  "aggregate_window": 144.3,
-  "aggregate_steady": 155.5,
+  "per_stream_mean": 17.1,
+  "aggregate_window": 140.2,
+  "aggregate_steady": 154.5,
   "errors": []
  }
 }

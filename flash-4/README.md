@@ -27,23 +27,27 @@ and one client's number depends on the text it happens to generate (draft accept
 
 | class | flash-3 N=1 / 4 / 9 | flash-4 bf16 KV | **flash-4 fp8 KV** (default) | MTP head, bf16 KV (`DRAFTER=mtp`) |
 |---|---|---|---|---|
-| code | 114.9 / 202.3 / 269.2 | 115.3 / 193.5 / 280.5 | 92.2 / 183.4 / 271.6 | 100.2 / 186.2 / 265.3 |
-| prose | 58.0 / 115.6 / 167.1 | 52.7 / 109.1 / 163.9 | 54.0 / 100.9 / 158.2 | 51.2 / 109.5 / 166.6 |
-| devops | 90.5 / 182.7 / 254.6 | 87.7 / 177.5 / 248.1 | 84.6 / 169.4 / 249.2 | 103.4 / 176.0 / 244.1 |
-| json | 106.0 / 223.7 / 306.8 | 107.7 / 208.6 / 312.9 | 103.2 / 209.8 / 308.4 | 103.4 / 193.0 / 282.1 |
+| code | 114.9 / 202.3 / 269.2 | 115.3 / 193.5 / 280.5 | 96.9 / 184.4 / 273.3 | 100.2 / 186.2 / 265.3 |
+| prose | 58.0 / 115.6 / 167.1 | 52.7 / 109.1 / 163.9 | 57.1 / 106.7 / 164.1 | 51.2 / 109.5 / 166.6 |
+| devops | 90.5 / 182.7 / 254.6 | 87.7 / 177.5 / 248.1 | 88.8 / 174.0 / 248.5 | 103.4 / 176.0 / 244.1 |
+| json | 106.0 / 223.7 / 306.8 | 107.7 / 208.6 / 312.9 | 107.7 / 209.9 / 306.7 | 103.4 / 193.0 / 282.1 |
 
-Sampled (T=0.7, 4 / 9 clients), fp8 KV: code 182.6 / 261.4, prose 103.5 / 155.5 (bf16 KV: code 179.5 / 269.1, prose 105.6 / 152.5).
+Sampled (T=0.7, 4 / 9 clients), fp8 KV: code 171.9 / 256.0, prose 103.9 / 154.5 (bf16 KV: code 179.5 / 269.1, prose 105.6 / 152.5).
 Not measured on flash-3.
 
 **Prefill** (one prompt, cold, tok/s at 4K / 16K / 65K): flash-3 1054 / 1037 / 1020; flash-4 bf16 KV 1314 / 1294 / 1261 (+25 %);
-**fp8 KV 1284 / 1262 / 1231 (+22 %)**. A 3072-row prefill chunk went 2.5 s -> 2.3 s from multi-tile expert kernels (patch 0002);
-experts are ~60 % of it.
+**fp8 KV 1310 / 1297 / 1265 (+25 %)**, level with bf16 KV. A 3072-row prefill chunk went 2.5 s -> 2.3 s from multi-tile expert
+kernels (patch 0002); experts are ~60 % of it, attention only ~7.5 %.
 
-**Decode** is level with flash-3 on json and code at 9 clients and 0-8 % lower elsewhere; fp8 KV costs another 0-7 % at 4 and 9 clients
-(an A/B of the same build with and without it measured the same time per round, ~52 ms for a verify of 8 rows, and the
-differences come from different greedy text, hence different acceptance). Decode is bound by expert-weight bandwidth (a verify
-window costs ~33 ms plus ~2.9 ms a row), so gains can only come from acceptance. Acceptance (server `done` lines, bf16 KV):
-code 81 %, prose 57 %, devops 72 %, json 75 % (flash-3: json 84 %).
+**Decode** is level with flash-3 on json and code at 9 clients and 0-8 % lower elsewhere; fp8 KV is within the run-to-run noise
+of bf16 KV, apart from one-client code, whose number follows the text it generates (acceptance 89 % vs 76 % on the same prompt
+with the two caches). The same build with and without fp8, one client, ms per round of a verify window: 4K context 44 / 48 / 51
+(bf16) vs 44 / 47 / 52 (fp8); 100K context 46 / 51 / 53 vs 45 / 49 / 50, i.e. fp8 is 1-5 % faster per round at long context.
+**fp8 KV does not make this model much faster, by construction:** decode attention reads only the indexer's top ~2K keys (at most
+~8K), a few tens of MB a round against ~8 GB of expert weights, and prefill attention is a compute-bound ~7.5 % of a chunk.
+Its gain is memory: 8-9 full windows instead of 5. Decode is bound by expert-weight bandwidth (a verify window costs ~33 ms
+plus ~2.9 ms a row), so gains can only come from acceptance. Acceptance (server `done` lines, bf16 KV): code 81 %, prose 57 %,
+devops 72 %, json 75 % (flash-3: json 84 %).
 
 **Load time** ~60 s (flash-3 ~3 min). **Exactness:** greedy and sampled replies are byte-identical with drafts on and off
 (17 checks on the bf16 build: 4 clients, a resumed turn, 6K and 25K prompts, vision, `--parallel 1`; `bench/exact_draft.py`
@@ -54,7 +58,8 @@ re-checks 5 prompts on the fp8 build).
 TensorFold 1.3.5 keeps Flash Next's attention K/V in bf16 and has no int8/fp8 option for it (`--kv-cache fp8` is refused for this
 family). Patch 0007 stores them as E4M3 codes with an fp32 scale per position and KV head (528 bytes a position for keys, same for
 values, against 1,024), converts back to bf16 in shared memory (code x scale, rounded once) and leaves the attention tiles, the
-indexer keys and everything else as they were. A full 262,144-token window takes **4.9-5.1 GiB instead of 8.1 GiB**.
+indexer keys and everything else as they were. The first version cost +13 ms of a chunk's 180 ms attention (prefill -1 %); the
+prompt kernel now prefetches keys and values together and the next tile during the value products, which brought prefill back to bf16's level. A full 262,144-token window takes **4.9-5.1 GiB instead of 8.1 GiB**.
 
 I chose fp8 (E4M3) over int8: no scale search or outlier handling beyond one amax per row, a hardware conversion, and it is the
 format the engine's other families use for their KV. Quality, bf16 vs fp8 on the same server, greedy

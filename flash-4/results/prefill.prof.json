@@ -1,0 +1,11 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8888/v1",
+ "chars_per_token": 3.987,
+ "16384": {
+  "prompt_tokens": 16436,
+  "ttft_s": 13.05,
+  "prefill_tok_s": 1259.1,
+  "err": null
+ }
+}
