@@ -1,58 +1,61 @@
-BF16 Tensor-Core QSA indexer scores (fn_qsa_scores_tc / fn_qsa_scores_tc_paged)
+BF16 Tensor-Core QSA indexer scores v2 (fn_qsa_scores_tc / fn_qsa_scores_tc_paged)
 
 Replaces the scalar FP32 FMA inner loop in `qsa_tile::scores` for prompt chunks
 (rows >= 16, HI == 4, DI == 128) with BF16 `mma16816` Tensor Core instructions
-using FP32 accumulators (same `qmm_frag::ldmatrix4` + `qmm_frag::mma` primitive
-used by `fn_attn_chunks`), with both contiguous and paged variants.
+using FP32 accumulators (64 query rows x 512 pooled blocks per CTA, 256 threads /
+8 warps, cp.async double-buffered pooled keys in 87,040 B dynamic SMEM, register-only
+4-head reduction with no SMEM reduction buffer), with both contiguous and paged variants.
 Gated by `TF_FLASHNEXT_QSA_TC` (default 1; `0` restores scalar `qsa_tile::scores`).
 
-Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2):
-- 248K cold prefill: 147.42 s (1,679.6 tok/s) -> 141.63 s (1,748.4 tok/s) (-5.8 s / +4.1% total)
-- 65K cold prefill: 34.19 s (1,908.3 tok/s) -> 33.86 s (1,926.9 tok/s)
+Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2, with patches 0007-0010):
+- 248K cold prefill: 141.46 s (1,749.3 tok/s) -> 130.21 s (1,900.4 tok/s) (-11.25 s / +8.6%)
+- 65K cold prefill: 32.52 s (2,011.5 tok/s) -> 31.69 s (2,063.9 tok/s) (+2.6%)
 - Exactness: 120K needle retrieval byte-identical (sha ae38468a7f52, FALCON-9472-OMEGA),
   5/5 greedy and 5/5 T=0.7 token_sha256 identical to stock, drafts on == drafts off.
 
 diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
-index 3d9f7bb..7e100b8 100644
+index 3d9f7bb..b265ee7 100644
 --- a/zig/kernels/cuda/flashnext_attn.cu
 +++ b/zig/kernels/cuda/flashnext_attn.cu
-@@ -581,4 +581,17 @@ extern "C" __global__ void __launch_bounds__(256)
+@@ -581,4 +581,19 @@ extern "C" __global__ void __launch_bounds__(256)
      qsa_tile::scores_body<8, 4, true>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, pg);
  }
  
-+extern "C" __global__ void __launch_bounds__(128)
++extern "C" __global__ void __launch_bounds__(256, 1)
 +    fn_qsa_scores_tc(const __nv_bfloat16* __restrict__ IQ, const __nv_bfloat16* __restrict__ POOLED,
 +                     const int* __restrict__ POS0, float* __restrict__ SC, int NB, int RATIO, int TOP, int rows) {
-+    qsa_tile::scores_tc_body<false>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, Pg{});
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    qsa_tile::scores_tc_body<false>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, Pg{}, smem_raw);
 +}
 +
-+extern "C" __global__ void __launch_bounds__(128)
++extern "C" __global__ void __launch_bounds__(256, 1)
 +    fn_qsa_scores_tc_paged(const __nv_bfloat16* __restrict__ IQ, const __nv_bfloat16* __restrict__ POOLED,
 +                           const int* __restrict__ POS0, float* __restrict__ SC, int NB, int RATIO, int TOP, int rows,
 +                           Pg pg) {
-+    qsa_tile::scores_tc_body<true>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, pg);
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    qsa_tile::scores_tc_body<true>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, pg, smem_raw);
 +}
 +
  #include "flashnext_attn_lanes.cuh"
 diff --git a/zig/kernels/cuda/flashnext_qsa_tile.cuh b/zig/kernels/cuda/flashnext_qsa_tile.cuh
-index 5ead983..279557e 100644
+index 5ead983..c3ebb48 100644
 --- a/zig/kernels/cuda/flashnext_qsa_tile.cuh
 +++ b/zig/kernels/cuda/flashnext_qsa_tile.cuh
-@@ -84,4 +84,92 @@ __global__ void __launch_bounds__(256) scores(const __nv_bfloat16* __restrict__
+@@ -84,4 +84,109 @@ __global__ void __launch_bounds__(256) scores(const __nv_bfloat16* __restrict__
                                                float* __restrict__ SC, int NB, int RATIO, int TOP, int rows) {
      scores_body<R, HI, false>(IQ, POOLED, POS0, SC, NB, RATIO, TOP, rows, Pg{});
  }
 +
-+// BF16 Tensor-Core indexer scores (HI == 4, DI == 128): 16 query rows x 128 pooled blocks per CTA (4 warps, 1 head/warp).
++// BF16 Tensor-Core indexer scores v2 (HI == 4, DI == 128): 64 query rows x 512 pooled blocks per CTA,
++// 256 threads (8 warps: 4 row-tiles x 2 block-16 tiles), cp.async double-buffered ks, register-only head reduction.
 +template <bool PAGED>
 +__device__ __forceinline__ void scores_tc_body(const __nv_bfloat16* __restrict__ IQ,
 +                                               const __nv_bfloat16* __restrict__ POOLED, const int* __restrict__ POS0,
 +                                               float* __restrict__ SC, int NB, int RATIO, int TOP, int rows,
-+                                               const Pg& pg) {
-+    constexpr int R = 16, BK = 32, TILES = 4, LD = DI + 8;
-+    __shared__ __align__(16) __nv_bfloat16 qs[4][R][LD];
-+    __shared__ __align__(16) __nv_bfloat16 ks[BK][LD];
-+    __shared__ float sh_sum[4][R][BK];
++                                               const Pg& pg, unsigned char* smem_raw) {
++    constexpr int R = 64, BK = 32, TILES = 16, LD = DI + 8;
++    auto* qs = reinterpret_cast<__nv_bfloat16(*)[R][LD]>(smem_raw);
++    auto* ks = reinterpret_cast<__nv_bfloat16(*)[BK][LD]>(smem_raw + 4 * R * LD * sizeof(__nv_bfloat16));
 +    const int r0 = blockIdx.x * R;
 +    const int b0 = blockIdx.y * (BK * TILES);
 +    const int pos0 = POS0[0];
@@ -62,77 +65,94 @@ index 5ead983..279557e 100644
 +
 +    const int tid = threadIdx.x;
 +    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-+    const uint4 zero4 = make_uint4(0, 0, 0, 0);
++    const int rg = warp >> 1, bg = warp & 1;
 +
-+    // Load 4 heads x 16 query rows x 128 bf16 (1024 uint4s) once per CTA
-+    for (int e = tid; e < 4 * R * (DI / 8); e += 128) {
++    // Load 4 heads x 64 query rows x 128 bf16 (4096 uint4s) once per CTA via cp.async.
++    for (int e = tid; e < 4 * R * (DI / 8); e += 256) {
 +        const int h = e / (R * (DI / 8));
 +        const int rem = e % (R * (DI / 8));
 +        const int ri = rem / (DI / 8), v = rem % (DI / 8);
 +        const int r = r0 + ri;
-+        uint4 val = zero4;
-+        if (r < rows) val = *reinterpret_cast<const uint4*>(IQ + (static_cast<long long>(r) * 4 + h) * DI + 8 * v);
-+        *reinterpret_cast<uint4*>(&qs[h][ri][8 * v]) = val;
++        qmm_frag::cp16z(&qs[h][ri][8 * v], IQ + (static_cast<long long>(r < rows ? r : 0) * 4 + h) * DI + 8 * v, r < rows);
 +    }
++    qmm_frag::commit();
++
++    auto issue_k = [&](int tb0, int buf) {
++        for (int e = tid; e < BK * (DI / 8); e += 256) {
++            const int bi = e >> 4, v = e & 15;
++            const int b = tb0 + bi;
++            const bool valid = b < cmax;
++            const int sb = valid ? b : 0;
++            const long long at = PAGED ? page_row(pg, sb, pg.ptok / RATIO, DI) : static_cast<long long>(sb) * DI;
++            qmm_frag::cp16z(&ks[buf][bi][8 * v], POOLED + at + 8 * v, valid);
++        }
++        qmm_frag::commit();
++    };
++
++    issue_k(b0, 0);
++    qmm_frag::wait<1>();  // qs ready
 +    __syncthreads();
 +
 +    const float scale = __fsqrt_rn(static_cast<float>(DI));
 +    for (int tile = 0; tile < TILES; ++tile) {
 +        const int tb0 = b0 + tile * BK;
 +        if (tb0 >= cmax) break;
-+        for (int e = tid; e < BK * (DI / 8); e += 128) {
-+            const int bi = e / (DI / 8), v = e % (DI / 8);
-+            const int b = tb0 + bi;
-+            uint4 val = zero4;
-+            if (b < cmax) {
-+                const long long at = PAGED ? page_row(pg, b, pg.ptok / RATIO, DI) : static_cast<long long>(b) * DI;
-+                val = *reinterpret_cast<const uint4*>(POOLED + at + 8 * v);
-+            }
-+            *reinterpret_cast<uint4*>(&ks[bi][8 * v]) = val;
-+        }
++        const int buf = tile & 1;
++        const bool has_next = (tile + 1 < TILES) && (tb0 + BK < cmax);
++        if (has_next) issue_k(tb0 + BK, buf ^ 1);
++        if (has_next) qmm_frag::wait<1>();
++        else qmm_frag::wait<0>();
 +        __syncthreads();
 +
-+        float acc[4][4] = {};
++        float tot[2][4] = {};
 +#pragma unroll
-+        for (int kstep = 0; kstep < DI / 16; kstep += 2) {
-+            uint32_t a0[4], a1[4];
-+            qmm_frag::ldmatrix4(a0, &qs[warp][lane % 16][kstep * 16 + (lane / 16) * 8]);
-+            qmm_frag::ldmatrix4(a1, &qs[warp][lane % 16][(kstep + 1) * 16 + (lane / 16) * 8]);
++        for (int h = 0; h < 4; ++h) {
++            float acc[2][4] = {};
 +#pragma unroll
-+            for (int jt = 0; jt < 4; ++jt) {
-+                uint32_t bm[4];
-+                qmm_frag::ldmatrix4(bm, &ks[jt * 8 + lane % 8][kstep * 16 + (lane / 8) * 8]);
-+                qmm_frag::mma(acc[jt], a0, bm[0], bm[1]);
-+                qmm_frag::mma(acc[jt], a1, bm[2], bm[3]);
++            for (int kstep = 0; kstep < DI / 16; kstep += 2) {
++                uint32_t a0[4], a1[4];
++                qmm_frag::ldmatrix4(a0, &qs[h][rg * 16 + (lane % 16)][kstep * 16 + (lane / 16) * 8]);
++                qmm_frag::ldmatrix4(a1, &qs[h][rg * 16 + (lane % 16)][(kstep + 1) * 16 + (lane / 16) * 8]);
++#pragma unroll
++                for (int jt = 0; jt < 2; ++jt) {
++                    uint32_t bm[4];
++                    qmm_frag::ldmatrix4(bm, &ks[buf][bg * 16 + jt * 8 + (lane % 8)][kstep * 16 + (lane / 8) * 8]);
++                    qmm_frag::mma(acc[jt], a0, bm[0], bm[1]);
++                    qmm_frag::mma(acc[jt], a1, bm[2], bm[3]);
++                }
++            }
++#pragma unroll
++            for (int jt = 0; jt < 2; ++jt) {
++#pragma unroll
++                for (int e = 0; e < 4; ++e) {
++                    tot[jt][e] = __fadd_rn(tot[jt][e], fmaxf(acc[jt][e], 0.0f));
++                }
 +            }
 +        }
-+#pragma unroll
-+        for (int jt = 0; jt < 4; ++jt) {
-+#pragma unroll
-+            for (int e = 0; e < 4; ++e) {
-+                const int ri = g + 8 * (e >> 1);
-+                const int bi = jt * 8 + 2 * t + (e & 1);
-+                sh_sum[warp][ri][bi] = fmaxf(acc[jt][e], 0.0f);
-+            }
-+        }
-+        __syncthreads();
 +
-+        for (int e = tid; e < R * BK; e += 128) {
-+            const int ri = e >> 5, bi = e & 31;
-+            const int r = r0 + ri, b = tb0 + bi;
-+            if (r >= rows) continue;
-+            const int complete = (pos0 + r + 1) / RATIO;
-+            if (complete <= TOP || b >= complete) continue;
-+            const float tot = __fadd_rn(__fadd_rn(sh_sum[0][ri][bi], sh_sum[1][ri][bi]),
-+                                        __fadd_rn(sh_sum[2][ri][bi], sh_sum[3][ri][bi]));
-+            SC[static_cast<long long>(r) * NB + b] = __fdiv_rn(tot, scale);
++#pragma unroll
++        for (int jt = 0; jt < 2; ++jt) {
++            const int b_base = tb0 + bg * 16 + jt * 8 + 2 * t;
++#pragma unroll
++            for (int rh = 0; rh < 2; ++rh) {
++                const int r = r0 + rg * 16 + g + 8 * rh;
++                if (r < rows) {
++                    const int complete = (pos0 + r + 1) / RATIO;
++                    if (complete > TOP) {
++                        if (b_base < complete)
++                            SC[static_cast<long long>(r) * NB + b_base] = __fdiv_rn(tot[jt][rh * 2], scale);
++                        if (b_base + 1 < complete)
++                            SC[static_cast<long long>(r) * NB + b_base + 1] = __fdiv_rn(tot[jt][rh * 2 + 1], scale);
++                    }
++                }
++            }
 +        }
 +        __syncthreads();
 +    }
 +}
  }  // namespace qsa_tile
 diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
-index 764aea3..b8d3673 100644
+index 764aea3..746968d 100644
 --- a/zig/src/families/flashnext/cuda_glue.zig
 +++ b/zig/src/families/flashnext/cuda_glue.zig
 @@ -61,6 +61,8 @@ const Fns = struct {
@@ -169,7 +189,16 @@ index 764aea3..b8d3673 100644
              .chunks = try g.attn.function("fn_attn_chunks"),
              .chunks_ahead = try g.attn.function("fn_attn_chunks_ahead"),
              .chunks_one = try g.attn.function("fn_attn_chunks_one"),
-@@ -304,9 +310,13 @@ pub const Glue = struct {
+@@ -184,6 +190,8 @@ pub const Glue = struct {
+         try g.f.chunks_lanes.allowDynamicShared(chunkSmem(2));
+         try g.f.chunks_one_paged.allowDynamicShared(oneSmem());
+         try g.f.fused_paged.allowDynamicShared(oneSmem());
++        try g.f.scores_tc.allowDynamicShared(87040);
++        try g.f.scores_tc_paged.allowDynamicShared(87040);
+         return g;
+     }
+ 
+@@ -304,9 +312,13 @@ pub const Glue = struct {
          var a: cuda.Args = .{};
          ptrs(&a, &.{ iq, pooled, pos, sc });
          if (wt.index_heads == 4) {
@@ -178,7 +207,7 @@ index 764aea3..b8d3673 100644
              if (pg.pt != 0) a.add(pg);
 +            if (g.qsa_tc and rows >= 16) {
 +                const f = if (pg.pt != 0) g.f.scores_tc_paged else g.f.scores_tc;
-+                return go(f, s, .{ cdiv(rows, 16), cdiv(blocks, 128), 1 }, 128, 0, &a);
++                return go(f, s, .{ cdiv(rows, 64), cdiv(blocks, 512), 1 }, 256, 87040, &a);
 +            }
 +            // 8 rows and 256 blocks a CTA, every head, fn_qsa_scores' sums in its order (its bits)
              const f = if (pg.pt != 0) g.f.scores_paged else g.f.scores_tile;
