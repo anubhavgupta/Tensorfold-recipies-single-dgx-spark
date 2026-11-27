@@ -1,0 +1,274 @@
+Multi-threaded PLE n-gram gather, 3-pass QSA select, and granular profile markers
+
+1. Parallelizes host PLE n-gram gather (`Gather.main` in `cuda_batch_state.zig`) across
+   8 CPU threads for prompt chunks >= 512 rows, cutting `ple` GPU stall from 155.7 ms ->
+   16.6 ms on 16K prefill and 35.2 ms -> 9.3 ms on 245K prefill (100% bit-exact).
+2. Upgrades `fn_qsa_select_body` (`flashnext_batch.cu`) from 4-pass 8-bit radix to 3-pass
+   11+11+10-bit radix with `__match_any_sync` warp-aggregated SMEM atomics, cutting 245K
+   `qsa_select` from 69.4 ms -> 64.5 ms (100% bit-exact).
+3. Adds granular `attn_sub` (prep/pool/score/select/core/gate) and `exp_prompt`
+   (routed4/shared6) timing lines under `TF_FLASHNEXT_PROFILE=1`.
+
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index c52f183..e3d1bbc 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -451,11 +451,60 @@ __device__ __forceinline__ void fn_qsa_bin_cut(const int* hist, int need, uint32
+     }
+ }
+ 
+-// attention._select and _select_tiles, a row a block: a row past `top` complete blocks lists the best, then its tail.
++// A wide radix pass's cut (nbins = 1024 or 2048, blockDim.x = 1024): highest bin whose suffix sum reaches need.
++__device__ __forceinline__ void fn_qsa_bin_cut_wide(const int* hist, int nbins, int need, uint32_t cut, int shift,
++                                                    uint32_t* cut_s, int* need_s, int* warp_sums) {
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int per_t = nbins >> 10;  // 1 for 1024 bins, 2 for 2048 bins
++    int c0 = hist[tid * per_t];
++    int c1 = per_t == 2 ? hist[tid * 2 + 1] : 0;
++    int wsum = c0 + c1;
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) wsum += __shfl_xor_sync(0xffffffffu, wsum, o);
++    if (lane == 0) warp_sums[warp] = wsum;
++    __syncthreads();
++    // Suffix sum across 32 warps in warp 0 (and broadcast warp_above to each warp).
++    if (warp == 0) {
++        int val = warp_sums[lane];
++        int above = val;
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int v = __shfl_down_sync(0xffffffffu, above, o);
++            if (lane + o < 32) above += v;
++        }
++        warp_sums[lane] = above - val;  // sum of all warps > lane
++    }
++    __syncthreads();
++    const int w_above = warp_sums[warp];
++    // Suffix sum within this warp (lanes > lane).
++    int l_local = c0 + c1;
++    int l_above = l_local;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int v = __shfl_down_sync(0xffffffffu, l_above, o);
++        if (lane + o < 32) l_above += v;
++    }
++    l_above = w_above + (l_above - l_local);
++    // Check highest bin in this thread: bin1 = tid*2+1 (if per_t==2), then bin0 = tid*per_t.
++    int s = l_above;
++    if (per_t == 2) {
++        if (s < need && s + c1 >= need) {
++            *need_s = need - s;
++            *cut_s = cut | (static_cast<uint32_t>(tid * 2 + 1) << shift);
++        }
++        s += c1;
++    }
++    if (s < need && s + c0 >= need) {
++        *need_s = need - s;
++        *cut_s = cut | (static_cast<uint32_t>(tid * per_t) << shift);
++    }
++}
++
++// attention._select and _select_tiles, a row a block: 3-pass (11+11+10 bit) radix with warp-aggregated atomics.
+ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc, const int* __restrict__ pos0,
+                                                    int* __restrict__ ids, int* __restrict__ nkr, int* __restrict__ spr,
+                                                    int nb, int idw, int top, int ratio) {
+-    __shared__ int hist[256];
++    __shared__ int hist[2048];
+     __shared__ int warp_sums[32];
+     __shared__ uint32_t cut_s;
+     __shared__ int need_s;
+@@ -474,11 +523,18 @@ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc,
+     uint32_t cut = 0;
+     int need = top;
+     const int lane = threadIdx.x & 31;
+-    for (int p = 0; p < 4; ++p) {
+-        const int shift = 24 - 8 * p;
+-        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
++    constexpr int shifts[3] = {21, 10, 0};
++    constexpr int nbins_arr[3] = {2048, 2048, 1024};
++    constexpr uint32_t masks[3] = {0x7FFu, 0x7FFu, 0x3FFu};
++    constexpr int pref_shifts[3] = {32, 21, 10};
++    for (int p = 0; p < 3; ++p) {
++        const int shift = shifts[p];
++        const int nbins = nbins_arr[p];
++        const uint32_t mask = masks[p];
++        const int pshift = pref_shifts[p];
++        for (int i = threadIdx.x; i < nbins; i += blockDim.x) hist[i] = 0;
+         __syncthreads();
+-        constexpr int U = 8;  // a thread's keys in flight before their adds (one L2 wait a key was the pass's time)
++        constexpr int U = 8;
+         for (int b0 = 0; b0 < complete; b0 += U * blockDim.x) {
+             float v[U];
+ #pragma unroll
+@@ -490,11 +546,17 @@ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc,
+             for (int u = 0; u < U; ++u) {
+                 const int b = b0 + u * blockDim.x + threadIdx.x;
+                 const uint32_t k = fn_qsa_key(v[u]);
+-                if (b < complete && (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8)))) atomicAdd(&hist[(k >> shift) & 0xFF], 1);
++                const bool active = b < complete && (p == 0 || (k >> pshift) == (cut >> pshift));
++                const unsigned amask = __ballot_sync(0xffffffffu, active);
++                if (active) {
++                    const uint32_t bin = (k >> shift) & mask;
++                    const unsigned same = __match_any_sync(amask, bin);
++                    if (__ffs(same) - 1 == lane) atomicAdd(&hist[bin], __popc(same));
++                }
+             }
+         }
+         __syncthreads();
+-        if (threadIdx.x < 32) fn_qsa_bin_cut(hist, need, cut, shift, &cut_s, &need_s);
++        fn_qsa_bin_cut_wide(hist, nbins, need, cut, shift, &cut_s, &need_s, warp_sums);
+         __syncthreads();
+         cut = cut_s;
+         need = need_s;
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 045cd0b..d8bfe34 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -128,6 +128,8 @@ pub fn Pass(comptime Tri: type) type {
+         lanes_attn: bool = false,
+         /// TF_FLASHNEXT_PROFILE=1: time (ns) per stage of the last chunk (prof_names) and the mark the next one counts from.
+         prof: [prof_names.len]u64 = @splat(0),
++        prof_attn: [6]u64 = @splat(0), // prep, pool, score, select, core, gate
++        prof_exp: [2]u64 = @splat(0), // routed_4bit, shared_6bit
+         prof_last: i96 = 0,
+         prof_on: bool = false,
+ 
+@@ -406,7 +408,9 @@ pub fn Pass(comptime Tri: type) type {
+                 }
+             } else try self.attnRows(lw, ai, pa, n, .{ .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao });
+             const gated = if (keep.gated != 0) keep.gated else s.gated;
++            const t_gate0 = if (self.prof_on) self.syncNow() else 0;
+             try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, pn, h.q, head_dim);
++            if (self.prof_on) self.prof_attn[5] += @intCast(self.syncNow() - t_gate0);
+             self.mark(5);
+             self.out_slices = try split_lane.out(self, gated, s.gxs_attn, lw);
+             self.mark(6);
+@@ -425,9 +429,13 @@ pub fn Pass(comptime Tri: type) type {
+             const ikc = self.seq.ikc[ai].ptr;
+             const pooled = self.seq.pooled[ai].ptr;
+             const pg = self.seq.pg;
++            const t_p0 = if (self.prof_on) self.syncNow() else 0;
+             if (self.seq.media) |m| try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n, h, pg) else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0, h, pg);
++            const t_p1 = if (self.prof_on) self.syncNow() else 0;
++            if (self.prof_on) self.prof_attn[0] += @intCast(t_p1 - t_p0);
+             // attention.qsa_pool for the blocks these rows complete, then each block of rows' scores and attention
+             if (self.seq.media) |m| try m.pooled(self.stream, ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n, pg) else try self.tri.qsaPool(ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n, pg);
++            if (self.prof_on) self.prof_attn[1] += @intCast(self.syncNow() - t_p1);
+             const nb = scoreStride(self.seq.cap);
+             // prompt rows: selections for up to fused_rows rows, then one fused launch (chunks merged in the program)
+             const fused = n > att_rows and self.tri.fusedAttentionOwned();
+@@ -444,7 +452,10 @@ pub fn Pass(comptime Tri: type) type {
+                     const iq = at.iq + r0 * index_heads * index_dim * 2;
+                     const sel = r0 - g0; // this block's rows in the selection buffers
+                     // rows past `top` complete blocks score theirs; _scores leaves the rest, so skip it when none is
++                    const t_s0 = if (self.prof_on) self.syncNow() else 0;
+                     if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)), pg);
++                    const t_s1 = if (self.prof_on) self.syncNow() else 0;
++                    if (self.prof_on) self.prof_attn[2] += @intCast(t_s1 - t_s0);
+                     var a: cuda.Args = .{};
+                     a.add(self.seq.scores);
+                     a.add(pos);
+@@ -456,13 +467,20 @@ pub fn Pass(comptime Tri: type) type {
+                     a.add(cint(top));
+                     a.add(cint(ratio));
+                     try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
++                    const t_s2 = if (self.prof_on) self.syncNow() else 0;
++                    if (self.prof_on) self.prof_attn[3] += @intCast(t_s2 - t_s1);
+                     if (!fused) {
+                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
+                         try self.tri.attnChunks(at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, h, chunks, true, pg);
+                         try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * qr, s.qnk, s.qspr, m, h, true);
++                        if (self.prof_on) self.prof_attn[4] += @intCast(self.syncNow() - t_s2);
+                     }
+                 }
+-                if (fused) try self.tri.attnFused(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);
++                if (fused) {
++                    const t_f0 = if (self.prof_on) self.syncNow() else 0;
++                    try self.tri.attnFused(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);
++                    if (self.prof_on) self.prof_attn[4] += @intCast(self.syncNow() - t_f0);
++                }
+             }
+         }
+ 
+@@ -532,12 +550,16 @@ pub fn Pass(comptime Tri: type) type {
+             const t0 = std.Io.Clock.awake.now(self.io).toNanoseconds();
+             self.prof_on = Kernels.profile();
+             self.prof = @splat(0);
++            self.prof_attn = @splat(0);
++            self.prof_exp = @splat(0);
+             self.prof_last = t0;
+             defer if (self.prof_on) {
+                 self.complete() catch {};
+                 std.debug.print("batch: {d} rows at {d} in {d:.1} ms\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
+                 inline for (prof_names, 0..) |name, i| std.debug.print("  {s} {d:.1}", .{ name, @as(f64, @floatFromInt(self.prof[i])) / 1e6 });
+                 std.debug.print("\n", .{});
++                std.debug.print("  attn_sub: prep {d:.1} pool {d:.1} score {d:.1} select {d:.1} core {d:.1} gate {d:.1}\n", .{ @as(f64, @floatFromInt(self.prof_attn[0])) / 1e6, @as(f64, @floatFromInt(self.prof_attn[1])) / 1e6, @as(f64, @floatFromInt(self.prof_attn[2])) / 1e6, @as(f64, @floatFromInt(self.prof_attn[3])) / 1e6, @as(f64, @floatFromInt(self.prof_attn[4])) / 1e6, @as(f64, @floatFromInt(self.prof_attn[5])) / 1e6 });
++                if (self.prof_exp[0] != 0 or self.prof_exp[1] != 0) std.debug.print("  exp_prompt: routed4 {d:.1} shared6 {d:.1}\n", .{ @as(f64, @floatFromInt(self.prof_exp[0])) / 1e6, @as(f64, @floatFromInt(self.prof_exp[1])) / 1e6 });
+                 if (self.k.exl3) |kit| {
+                     const g = &kit.grouped;
+                     std.debug.print("  experts: up rot {d:.1} gemm {d:.1} fin {d:.1} | down rot {d:.1} gemm {d:.1} fin {d:.1}\n", .{ @as(f64, @floatFromInt(g.prof_ns[0])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[1])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[2])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[3])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[4])) / 1e6, @as(f64, @floatFromInt(g.prof_ns[5])) / 1e6 });
+@@ -629,6 +651,11 @@ pub fn Pass(comptime Tri: type) type {
+ 
+         pub const prof_names = [_][]const u8{ "hc_attn", "gdn_proj", "gdn_core", "gdn_out", "attn_proj", "attn_core", "attn_out", "hc_mlp", "route", "experts", "ple", "head", "embed" };
+ 
++        pub fn syncNow(self: *Self) i96 {
++            self.stream.synchronize() catch {};
++            return std.Io.Clock.awake.now(self.io).toNanoseconds();
++        }
++
+         /// With TF_FLASHNEXT_PROFILE=1: the stream drained, the time since the last mark added to stage `id`.
+         pub fn mark(self: *Self, id: usize) void {
+             if (!self.prof_on) return;
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 98a979d..f4269ee 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -581,10 +581,49 @@ pub const Gather = struct {
+     /// A round's rows, each gathered after its own stream's history (empty: every row after `history`).
+     lanes: []const Lane = &.{},
+ 
++    fn worker(ngram: *const ple.Ngram, hist_init: [2]i64, ids: []const u32, emb: []u16, xs: []f32, out_err: *?anyerror) void {
++        var h = hist_init;
++        ngram.rows(h[0..], ids, emb, xs) catch |err| {
++            out_err.* = err;
++        };
++    }
++
+     pub fn main(g: *Gather) void {
+         const t0 = std.Io.Clock.awake.now(g.io).toNanoseconds();
+         defer g.ns = std.Io.Clock.awake.now(g.io).toNanoseconds() - t0;
+         if (g.lanes.len == 0) {
++            if (g.ids.len >= 512) {
++                const nw: usize = 8;
++                const step = (g.ids.len + nw - 1) / nw;
++                var threads: [nw - 1]?std.Thread = @splat(null);
++                var errs: [nw]?anyerror = @splat(null);
++                var spawned: usize = 0;
++                for (1..nw) |w| {
++                    const a = w * step;
++                    if (a >= g.ids.len) break;
++                    const b = @min(a + step, g.ids.len);
++                    const h_init: [2]i64 = .{
++                        if (a >= 2) @intCast(g.ids[a - 2]) else g.history[a],
++                        if (a >= 1) @intCast(g.ids[a - 1]) else g.history[1],
++                    };
++                    threads[w - 1] = std.Thread.spawn(.{}, worker, .{ g.ngram, h_init, g.ids[a..b], g.emb[a * dims .. b * dims], g.xs[a * (dims / 32) .. b * (dims / 32)], &errs[w] }) catch null;
++                    if (threads[w - 1] == null) {
++                        worker(g.ngram, h_init, g.ids[a..b], g.emb[a * dims .. b * dims], g.xs[a * (dims / 32) .. b * (dims / 32)], &errs[w]);
++                    } else spawned += 1;
++                }
++                const b0 = @min(step, g.ids.len);
++                const h0_init: [2]i64 = .{ g.history[0], g.history[1] };
++                worker(g.ngram, h0_init, g.ids[0..b0], g.emb[0 .. b0 * dims], g.xs[0 .. b0 * (dims / 32)], &errs[0]);
++                for (threads) |th| if (th) |t| t.join();
++                for (errs) |e| if (e) |err| {
++                    g.failed = err;
++                    return;
++                };
++                // Advance history to the last 2 token ids (exact match to single-threaded ngram.rows).
++                g.history[0] = @intCast(g.ids[g.ids.len - 2]);
++                g.history[1] = @intCast(g.ids[g.ids.len - 1]);
++                return;
++            }
+             g.ngram.rows(g.history, g.ids, g.emb, g.xs) catch |err| {
+                 g.failed = err;
+             };

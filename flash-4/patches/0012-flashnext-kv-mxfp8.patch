@@ -1,0 +1,354 @@
+MXFP8 (E4M3 + E8M0 per 32 elements) attention KV cache for Flash Next
+
+Stores attention K and V caches in native Blackwell MXFP8 format: 256 E4M3 codes + 8
+1-byte E8M0 power-of-2 scales per KV head (528 bytes/pos for NKV=2 vs 1024 bytes BF16),
+cutting per-stream 262K cache from 8.25 GiB -> 5.10 GiB (admits 8 full 262K streams on
+128 GB GB10 with 65K vision budget).
+- Writer (`mxfp8_quant_row`): warp-only (8 warps = 8 groups of 32), zero SMEM, 2-op exact
+  ceiling power-of-2 E8M0 scale.
+- Reader (`kv8_convert`): cp.async double-buffered code/scale staging + BF16x2 SIMD
+  `__hmul2` with exact E8M0 power-of-2 scale (`e << 7`), cutting 245K `attn_core` from
+  298 ms -> 182.4 ms (1.63x faster).
+
+Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2):
+- Capacity: 8 full 262K streams admitted (5.10 GiB each) + 3.1 GiB prompt cache + 65K vision
+- Cold prefill 4K / 16K / 65K / 248K: 2,053 / 2,050 / 2,004 / 1,928 tok/s (248K TTFT 128.45 s)
+- Decode N=1 / 4 / 8: json 110.8 / 208.4 / 306.7, prose 54.4 / 105.5 / 152.7, code 88.7 / 178.8 / 248.4
+- Exactness: 5/5 greedy & 5/5 T=0.7 drafts on == off exact; 3/5 greedy bit-identical to BF16;
+  120K needle retrieval byte-identical to BF16 (sha ae38468a7f52, FALCON-9472-OMEGA).
+
+diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
+index b265ee7..6294197 100644
+--- a/zig/kernels/cuda/flashnext_attn.cu
++++ b/zig/kernels/cuda/flashnext_attn.cu
+@@ -3,6 +3,7 @@
+ // glue.py and attention.py's arithmetic and bf16 rounding points; the attention dots on mma tiles, K ascending.
+ 
+ #include <cuda_bf16.h>
++#include <cuda_fp8.h>
+ #include <math.h>
+ #include <stdint.h>
+ 
+@@ -50,6 +51,26 @@ __device__ __forceinline__ int media_pos(int pos, int d, int half, const int* ro
+ }
+ 
+ // glue._attn_prep (text positions, bf16 cache), program (row, head): heads normed, rounded, roped, rounded, stored.
++// Warp-only MXFP8 quantization (E4M3 + 1-byte E8M0 power-of-2 scale per 32 elements):
++// 256 threads = 8 warps = 8 groups of 32 elements, zero shared memory, exact ceiling power-of-2 scale.
++__device__ __forceinline__ void mxfp8_quant_row(float val, int d, unsigned char* codes_out, uint8_t* scales_out) {
++    float amax = fabsf(val);
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
++    uint32_t e = 0u;
++    float inv_sc = 0.0f;
++    if (amax > 0.0f) {
++        const float target = __fmul_rn(amax, 1.0f / 448.0f);
++        const uint32_t bits = __float_as_uint(target);
++        e = ((bits + 0x007fffffu) >> 23) & 0xffu;
++        if (e < 1u) e = 1u;
++        if (e > 253u) e = 253u;
++        inv_sc = __uint_as_float((254u - e) << 23);
++    }
++    if ((d & 31) == 0) scales_out[d >> 5] = static_cast<uint8_t>(e);
++    codes_out[d] = static_cast<unsigned char>(__nv_cvt_float_to_fp8(__fmul_rn(val, inv_sc), __NV_SATFINITE, __NV_E4M3));
++}
++
+ template <bool PAGED>
+ __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0,
+                                                                const float* __restrict__ QW, const float* __restrict__ KW,
+@@ -83,10 +104,19 @@ __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restric
+     if (head < NQ) {
+         Q[(static_cast<long long>(r) * NQ + head) * HD + d] = out;
+     } else if (!index) {
+-        const long long slot = static_cast<long long>(pos) * NKV + head - NQ;
+-        const long long at = PAGED ? page_row(pg, pos, pg.ptok, NKV * HD) + (head - NQ) * HD : slot * HD;
+-        KC[at + d] = out;
+-        VC[at + d] = P[row + NQ * 2 * HD + NKV * HD + (head - NQ) * HD + d];
++        const int hh = head - NQ;
++        if constexpr (KV8) {
++            const long long at = PAGED ? page_row(pg, pos, pg.ptok, kv_row_elems(NKV)) : static_cast<long long>(pos) * kv_row_elems(NKV);
++            unsigned char* kb = reinterpret_cast<unsigned char*>(KC + at);
++            unsigned char* vb = reinterpret_cast<unsigned char*>(VC + at);
++            mxfp8_quant_row(bf(out), d, kb + hh * HD, kb + NKV * HD + hh * (HD / 32));
++            mxfp8_quant_row(bf(P[row + NQ * 2 * HD + NKV * HD + hh * HD + d]), d, vb + hh * HD, vb + NKV * HD + hh * (HD / 32));
++        } else {
++            const long long slot = static_cast<long long>(pos) * NKV + hh;
++            const long long at = PAGED ? page_row(pg, pos, pg.ptok, NKV * HD) + hh * HD : slot * HD;
++            KC[at + d] = out;
++            VC[at + d] = P[row + NQ * 2 * HD + NKV * HD + hh * HD + d];
++        }
+     } else {
+         IQ[(static_cast<long long>(r) * NI + head - NQ - NKV) * IHD + d] = out;
+     }
+@@ -240,6 +270,30 @@ extern "C" __global__ void __launch_bounds__(256) fn_qsa_scores(const __nv_bfloa
+     }
+ }
+ 
++// One 16-code chunk of a KV head's MXFP8 row (E4M3 codes + 8 E8M0 power-of-2 scales/head at offset HD) to bf16.
++// Chunk v (0..15) belongs to 32-element MXFP8 group g = v >> 1 (0..7). Uses BF16x2 SIMD __hmul2 with exact E8M0 power-of-2 scale.
++__device__ __forceinline__ void kv8_convert(__nv_bfloat16* dst, const unsigned char* stage_row, int hk, int v) {
++    const uint4 raw = *reinterpret_cast<const uint4*>(stage_row + 16 * v);
++    const uint8_t e = stage_row[HD + hk * (HD / 32) + (v >> 1)];
++    const uint16_t sc16 = static_cast<uint16_t>(e) << 7;
++    const __nv_bfloat16 sc_bf = *reinterpret_cast<const __nv_bfloat16*>(&sc16);
++    const __nv_bfloat162 sc2 = __bfloat162bfloat162(sc_bf);
++    const __nv_fp8x2_storage_t* c = reinterpret_cast<const __nv_fp8x2_storage_t*>(&raw);
++    uint4 out[2];
++    uint32_t* o = reinterpret_cast<uint32_t*>(out);
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(c[i], __NV_E4M3)));
++        const __nv_bfloat162 r = __hmul2(__float22bfloat162_rn(f), sc2);
++        o[i] = *reinterpret_cast<const uint32_t*>(&r);
++    }
++    uint4* d4 = reinterpret_cast<uint4*>(dst);
++    d4[0] = out[0];
++    d4[1] = out[1];
++}
++
++constexpr int KV8_STAGE = HD + 16;  // a staged key's bytes: 256 E4M3 codes + 16-byte E8M0 scale chunk
++
+ // A row, KV head and chunk: stage its key addresses once a tile, then retain the online softmax and partials.
+ template <int NB, bool ONE = false, bool FUSE = false, bool PAGED = false>
+ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KC,
+@@ -251,9 +305,13 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+     extern __shared__ __align__(16) unsigned char smem_raw[];
+     typedef __nv_bfloat16 Row[HD + 8];
+     Row* qs = reinterpret_cast<Row*>(smem_raw);                  // [QR] the row's query heads
+-    Row* tiles_kv = qs + QR;                                     // [NB][2][TK] each buffer's keys, then values
++    constexpr int NBT = KV8 ? 1 : NB;                            // bf16 tile buffers: KV8 stages the next tile as raw codes instead
++    Row* tiles_kv = qs + QR;                                     // [NBT][2][TK] each buffer's keys, then values
+     // ONE: one [TK] buffer, the tile's keys and then, once the scores are taken, its values (fewer bytes, more blocks)
+-    __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NB * 2 * TK));
++    __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NBT * 2 * TK));
++    // KV8: a tile's raw MXFP8 codes and E8M0 scales (keys, then values), cp.async'd here and converted to bf16 once landed
++    unsigned char* stage = reinterpret_cast<unsigned char*>(ps + QR);
++    auto stg = [&](int pass, int k) { return stage + (static_cast<long long>(pass) * TK + k) * KV8_STAGE; };
+     __shared__ float red_m[4][QR], red_l[4][QR];
+     __shared__ int key_ids[NB][TK];
+     __shared__ long long key_at[PAGED ? NB : 1][PAGED ? TK : 1];
+@@ -279,15 +337,23 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+             const int ki = start + t0 + threadIdx.x;
+             const int key = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
+             key_ids[buf][threadIdx.x] = key;
+-            if constexpr (PAGED) key_at[buf][threadIdx.x] = page_row(pg, max(key, 0), pg.ptok, static_cast<long long>(HK) * HD) + hk * HD;
++            if constexpr (PAGED) key_at[buf][threadIdx.x] = KV8 ? page_row(pg, max(key, 0), pg.ptok, kv_row_elems(HK)) : page_row(pg, max(key, 0), pg.ptok, static_cast<long long>(HK) * HD) + hk * HD;
+         }
+         __syncthreads();
+         for (int pass = 0; pass < 2; ++pass) {
+             const __nv_bfloat16* src = pass == 0 ? KC : VC;
+             Row* dst = tiles_kv + (buf * 2 + pass) * TK;
+-            for (int e = threadIdx.x; e < TK * HD / 8; e += blockDim.x) {
+-                const int k = e / (HD / 8), v = e % (HD / 8), key = key_ids[buf][k];
+-                qmm_frag::cp16z(&dst[k][8 * v], src + (PAGED ? key_at[buf][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD) + 8 * v, key >= 0);
++            if constexpr (KV8) {
++                for (int e = threadIdx.x; e < TK * (HD / 16 + 1); e += blockDim.x) {
++                    const int k = e / (HD / 16 + 1), v = e % (HD / 16 + 1), key = key_ids[buf][k];
++                    const unsigned char* row = reinterpret_cast<const unsigned char*>(src + (PAGED ? key_at[buf][k] : static_cast<long long>(max(key, 0)) * kv_row_elems(HK)));
++                    qmm_frag::cp16z(stg(pass, k) + 16 * v, row + (v < HD / 16 ? hk * HD + 16 * v : HK * HD), key >= 0);
++                }
++            } else {
++                for (int e = threadIdx.x; e < TK * HD / 8; e += blockDim.x) {
++                    const int k = e / (HD / 8), v = e % (HD / 8), key = key_ids[buf][k];
++                    qmm_frag::cp16z(&dst[k][8 * v], src + (PAGED ? key_at[buf][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD) + 8 * v, key >= 0);
++                }
+             }
+             qmm_frag::commit();
+         }
+@@ -295,41 +361,64 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+     // ONE: the keys (pass 0) or the values (pass 1) of the tile whose ids are in key_ids[0], into the one buffer
+     auto load_one = [&](int pass) {
+         const __nv_bfloat16* src = pass == 0 ? KC : VC;
+-        for (int e = threadIdx.x; e < TK * HD / 8; e += blockDim.x) {
+-            const int k = e / (HD / 8), v = e % (HD / 8), key = key_ids[0][k];
+-            qmm_frag::cp16z(&tiles_kv[k][8 * v], src + (PAGED ? key_at[0][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD) + 8 * v, key >= 0);
++        if constexpr (KV8) {
++            for (int e = threadIdx.x; e < TK * (HD / 16 + 1); e += blockDim.x) {
++                const int k = e / (HD / 16 + 1), v = e % (HD / 16 + 1), key = key_ids[0][k];
++                const unsigned char* row = reinterpret_cast<const unsigned char*>(src + (PAGED ? key_at[0][k] : static_cast<long long>(max(key, 0)) * kv_row_elems(HK)));
++                qmm_frag::cp16z(stg(0, k) + 16 * v, row + (v < HD / 16 ? hk * HD + 16 * v : HK * HD), key >= 0);
++            }
++        } else {
++            for (int e = threadIdx.x; e < TK * HD / 8; e += blockDim.x) {
++                const int k = e / (HD / 8), v = e % (HD / 8), key = key_ids[0][k];
++                qmm_frag::cp16z(&tiles_kv[k][8 * v], src + (PAGED ? key_at[0][k] : (static_cast<long long>(max(key, 0)) * HK + hk) * HD) + 8 * v, key >= 0);
++            }
+         }
+         qmm_frag::commit();
+     };
++    // KV8: convert the landed tile (`pass` 0 keys / 1 values) into its bf16 rows; caller syncs after
++    auto convert = [&](int pass) {
++        Row* dst = tiles_kv + (ONE ? 0 : pass) * TK;
++        for (int e = threadIdx.x; e < TK * HD / 16; e += blockDim.x) {
++            const int k = e / (HD / 16), v = e % (HD / 16);
++            kv8_convert(&dst[k][16 * v], stg(pass, k), hk, v);
++        }
++    };
+     float mm[2] = {-INFINITY, -INFINITY}, ll[2] = {0.0f, 0.0f}, oo[FUSE ? 8 : 1][4] = {};
+     for (int cc = c; cc < c_end; ++cc) {
+     start = cc * CH;
+     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+     float o[8][4] = {};
+     const int tiles = min(n - start, CH);
+-    if (NB == 2) load(0, 0);
++    if (NB == 2 || (KV8 && ONE)) load(0, 0);
+     for (int t0 = 0, it = 0; t0 < tiles; t0 += TK, ++it) {
+         const int buf = NB == 2 ? it & 1 : 0;
+         const bool ahead = NB == 2 && t0 + TK < tiles;  // the next tile's loads go out before this tile's math
+-        if constexpr (ONE) {
++        if constexpr (ONE && !KV8) {
+             if (threadIdx.x < TK) {
+                 const int ki = start + t0 + threadIdx.x;
+                 const int key = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
+                 key_ids[0][threadIdx.x] = key;
+-                if constexpr (PAGED) key_at[0][threadIdx.x] = page_row(pg, max(key, 0), pg.ptok, static_cast<long long>(HK) * HD) + hk * HD;
++                if constexpr (PAGED) key_at[0][threadIdx.x] = KV8 ? page_row(pg, max(key, 0), pg.ptok, kv_row_elems(HK)) : page_row(pg, max(key, 0), pg.ptok, static_cast<long long>(HK) * HD) + hk * HD;
+             }
+             __syncthreads();
+             load_one(0);
+         } else {
+-            if (NB == 1) load(t0, 0);
+-            if (ahead) load(t0 + TK, buf ^ 1);
++            if (NB == 1 && !(KV8 && ONE)) load(t0, 0);
++            if (!KV8 && ahead) load(t0 + TK, buf ^ 1);
+         }
+-        Row* kt = tiles_kv + (ONE ? 0 : buf * 2 * TK);
++        Row* kt = tiles_kv + (ONE ? 0 : (KV8 ? 0 : buf) * 2 * TK);
+         Row* vt = ONE ? kt : kt + TK;
+         const int* keys = key_ids[buf];
+-        if constexpr (ONE) qmm_frag::wait<0>();
++        if constexpr (ONE && KV8) qmm_frag::wait<1>();
++        else if constexpr (ONE || KV8) qmm_frag::wait<0>();
+         else if (ahead) qmm_frag::wait<3>(); else qmm_frag::wait<1>();
+         __syncthreads();
++        if constexpr (KV8) {
++            convert(0);
++            if constexpr (!ONE) convert(1);
++            __syncthreads();
++            if constexpr (!ONE) { if (ahead) load(t0 + TK, buf ^ 1); }
++        }
+         constexpr int JT = TK / 32;  // a warp's 8-key tiles
+         float s[JT][4] = {};
+ #pragma unroll 4
+@@ -345,7 +434,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+                 qmm_frag::mma(s[jt], a1, b[2], b[3]);
+             }
+         }
+-        if constexpr (ONE) {                              // every warp has read the keys: the values take their place
++        if constexpr (ONE && !KV8) {                      // every warp has read the keys: the values take their place
+             __syncthreads();
+             load_one(1);
+         }
+@@ -390,8 +479,15 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+             rows[h] = __fadd_rn(rows[h], __shfl_xor_sync(0xffffffffu, rows[h], 2));
+             if (t == 0) red_l[warp][g + 8 * h] = rows[h];
+         }
+-        if (ONE) qmm_frag::wait<0>(); else if (ahead) qmm_frag::wait<2>(); else qmm_frag::wait<0>();
++        if constexpr (!(KV8 && !ONE)) {
++            if (ONE) qmm_frag::wait<0>(); else if (ahead) qmm_frag::wait<2>(); else qmm_frag::wait<0>();
++        }
+         __syncthreads();
++        if constexpr (KV8 && ONE) {
++            convert(1);
++            __syncthreads();
++            if (t0 + TK < tiles) load(t0 + TK, 0);
++        }
+ #pragma unroll
+         for (int h = 0; h < 2; ++h) {
+             const int row = g + 8 * h;
+diff --git a/zig/kernels/cuda/flashnext_pages.cuh b/zig/kernels/cuda/flashnext_pages.cuh
+index b25aed8..372a21e 100644
+--- a/zig/kernels/cuda/flashnext_pages.cuh
++++ b/zig/kernels/cuda/flashnext_pages.cuh
+@@ -9,3 +9,11 @@ struct Pg {
+ __device__ __forceinline__ long long page_row(const Pg& pg, int p, int per, int row) {
+     return static_cast<long long>(pg.pt[p / per]) * pg.ps + static_cast<long long>(p % per) * row;
+ }
++
++// MXFP8 attention K/V caches: each position holds each KV head's HD E4M3 codes, followed by 8 E8M0 power-of-2
++// scales per head (1 byte per 32 elements, padded to 16 bytes): 528 bytes/pos for NKV=2 instead of 1024 bf16 bytes.
++// Must equal cuda_prompt_wt.zig's kv_fp8.
++constexpr bool KV8 = true;
++__device__ __forceinline__ long long kv_row_elems(int heads) {  // bf16 elements of a position's K (or V) row
++    return KV8 ? (static_cast<long long>(heads) * HD + 16) / 2 : static_cast<long long>(heads) * HD;
++}
+diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
+index 746968d..549250e 100644
+--- a/zig/src/families/flashnext/cuda_glue.zig
++++ b/zig/src/families/flashnext/cuda_glue.zig
+@@ -10,11 +10,16 @@ const tile_head_dim = 256;
+ const tile_heads = 16;
+ /// fn_attn_chunks' staged rows: the query heads, `buffers` 32-key tiles of keys and values (rows padded by 8), bf16 p.
+ fn chunkSmem(buffers: u32) u32 {
+-    return (tile_heads + buffers * 2 * 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2;
++    // wt.kv_fp8 keeps one bf16 tile and stages the next tile's MXFP8 codes + E8M0 scales beside it
++    return (tile_heads + (if (wt.kv_fp8) 1 else buffers) * 2 * 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2 + stageBytes(2);
++}
++/// wt.kv_fp8: each staged key (`rows` tile rows of 32 keys) holds its E4M3 codes and 16-byte E8M0 scale chunk until converted.
++fn stageBytes(rows: u32) u32 {
++    return if (wt.kv_fp8) rows * 32 * (tile_head_dim + 16) else 0;
+ }
+ /// The one-buffer form: a tile's keys, then its values, in the same rows of shared memory.
+ fn oneSmem() u32 {
+-    return (tile_heads + 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2;
++    return (tile_heads + 32) * (tile_head_dim + 8) * 2 + tile_heads * (32 + 8) * 2 + stageBytes(2);
+ }
+ /// Rows up to which attention reads the next tile ahead (fewer blocks, so latency, not occupancy, sets the time).
+ pub const ahead_rows = 16;
+diff --git a/zig/src/families/flashnext/cuda_heads.zig b/zig/src/families/flashnext/cuda_heads.zig
+index 79846c1..810282b 100644
+--- a/zig/src/families/flashnext/cuda_heads.zig
++++ b/zig/src/families/flashnext/cuda_heads.zig
+@@ -39,9 +39,9 @@ pub const Heads = struct {
+         return (2 * h.q + 2 * h.kv) * wt.head_dim + wt.index_heads * wt.index_dim + wt.index_dim;
+     }
+ 
+-    /// Bytes of one position's keys (or values) in the bf16 attention cache.
++    /// Bytes of one position's keys (or values) in the attention cache (wt.kv_fp8: MXFP8 E4M3+E8M0/32, else bf16).
+     pub fn kvRow(h: Heads) usize {
+-        return h.kv * wt.head_dim * 2;
++        return wt.kvRowBytes(h.kv);
+     }
+ 
+     /// What each of `world` ranks computes of a layer the head split cuts: the whole layer at one rank, half at two.
+@@ -58,7 +58,7 @@ comptime {
+     const f = Heads.full;
+     std.debug.assert(f.nk == gdn.nk and f.nv == gdn.nv and f.q == wt.q_heads and f.kv == wt.kv_heads);
+     std.debug.assert(f.convDim() == gdn.conv_dim and f.projWidth() == gdn.proj_width and f.valueDim() == gdn.value_dim);
+-    std.debug.assert(f.projN() == wt.proj_n and f.kvRow() == wt.kv_heads * wt.head_dim * 2);
++    std.debug.assert(f.projN() == wt.proj_n and f.kvRow() == wt.kvRowBytes(wt.kv_heads));
+     for ([_]Heads{ f, Heads.half }) |h| std.debug.assert(h.q * wt.head_dim == h.valueDim() and h.nv == 3 * h.nk);
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_pages.zig b/zig/src/families/flashnext/cuda_pages.zig
+index c80dd27..f99ebe0 100644
+--- a/zig/src/families/flashnext/cuda_pages.zig
++++ b/zig/src/families/flashnext/cuda_pages.zig
+@@ -5,7 +5,7 @@ const cuda = @import("cuda");
+ const wt = @import("cuda_prompt_wt.zig");
+ const Pg = @import("cuda_glue.zig").Pg;
+ 
+-const kv_row = wt.kv_heads * wt.head_dim * 2;
++const kv_row = wt.kvRowBytes(wt.kv_heads);
+ const index_row = wt.index_dim * 2;
+ const ratio = wt.index_ratio;
+ 
+diff --git a/zig/src/families/flashnext/cuda_prompt_wt.zig b/zig/src/families/flashnext/cuda_prompt_wt.zig
+index 6f91b31..44230fd 100644
+--- a/zig/src/families/flashnext/cuda_prompt_wt.zig
++++ b/zig/src/families/flashnext/cuda_prompt_wt.zig
+@@ -24,6 +24,14 @@ pub const tile: usize = 16;
+ pub const q_heads: usize = 24;
+ pub const kv_heads: usize = 2;
+ pub const head_dim: usize = 256;
++/// MXFP8 attention K/V caches: E4M3 codes with 1-byte E8M0 scale per 32 elements (flashnext_pages.cuh's KV8 is the
++/// kernels' copy of this switch), not bf16: ~43% fewer cache bytes per stream (8-9 full 262K streams on GB10).
++pub const kv_fp8 = true;
++
++/// Bytes of one position's keys (or values) for `heads` KV heads: codes + 8 E8M0 scales/head padded to 16 bytes.
++pub fn kvRowBytes(heads: usize) usize {
++    return if (kv_fp8) heads * head_dim + 16 else heads * head_dim * 2;
++}
+ pub const index_heads: usize = 4;
+ pub const index_dim: usize = 128;
+ pub const half: usize = 32;
