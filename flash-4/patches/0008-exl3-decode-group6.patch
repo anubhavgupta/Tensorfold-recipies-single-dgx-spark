@@ -1,0 +1,133 @@
+6-bit EXL3 decodeGroup for stitched Flash Next projections (in_proj_qkv+z, q+k+v)
+
+Extends TensorFold's EXL3 projection-group kernel (`tf_exl3_group`) from 4-bit
+(`halves == 8`) to 6-bit `mul1` (`halves == 12`, `tf_exl3_group_12_2_{4,8}`),
+and batches stitched 6-bit decode projections in `cuda_exl3_lane.zig` into one
+Hadamard rotation + one GEMM launch (gated by `TF_EXL3_DECODE_GROUP`, default 1).
+
+Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2):
+- 1-stream decode: +2.3% to +3.4% (code 106.6 -> 109.0, prose 52.2 -> 54.0, json 101.8 -> 104.4 tok/s)
+- 4-stream decode: +1.5% prose (107.0 -> 108.6 steady), +0.5% json
+- Exactness: 5/5 greedy and 5/5 T=0.7 token_sha256 identical to stock, drafts on == drafts off.
+
+diff --git a/zig/kernels/cuda/exl3_linear.cu b/zig/kernels/cuda/exl3_linear.cu
+index 956d409..027c440 100644
+--- a/zig/kernels/cuda/exl3_linear.cu
++++ b/zig/kernels/cuda/exl3_linear.cu
+@@ -472,6 +472,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_group_8_2_8(tf_exl3::G
+     const int b = blockIdx.x, i = group_member(g, b);
+     tf_exl3::linear_body<8, 2, 8>(g.l[i], b - (i ? g.ends[i - 1] : 0));
+ }
++extern "C" __global__ void __launch_bounds__(128) tf_exl3_group_12_2_4(tf_exl3::GroupArgs g) {
++    const int b = blockIdx.x, i = group_member(g, b);
++    tf_exl3::linear_body<12, 2, 4>(g.l[i], b - (i ? g.ends[i - 1] : 0));
++}
++extern "C" __global__ void __launch_bounds__(256) tf_exl3_group_12_2_8(tf_exl3::GroupArgs g) {
++    const int b = blockIdx.x, i = group_member(g, b);
++    tf_exl3::linear_body<12, 2, 8>(g.l[i], b - (i ? g.ends[i - 1] : 0));
++}
+ #undef TF_EXL3_CODEBOOK
+ #undef TF_EXL3_WIDTHS
+ }  // namespace tf_exl3
+diff --git a/zig/src/cuda/exl3.zig b/zig/src/cuda/exl3.zig
+index 3def1bf..472a002 100644
+--- a/zig/src/cuda/exl3.zig
++++ b/zig/src/cuda/exl3.zig
+@@ -171,6 +171,7 @@ pub const Linear = struct {
+     rot_in: Function,
+     mpg: [mpg_variants.len]Function = undefined,
+     group: [2]Function = undefined, // tf_exl3_group_8_2_{4,8}: projection groups of 4-bit mul1 layers
++    group6: [2]Function = undefined, // tf_exl3_group_12_2_{4,8}: projection groups of 6-bit mul1 layers
+     rot_group: Function = undefined,
+     wc: [wc_variants.len]Function = undefined,
+     /// 17-128 rows of 4- and 6-bit mul1 layers on linear_wc (false: the mid-M kernels; the same bits either way).
+@@ -198,6 +199,7 @@ pub const Linear = struct {
+             try l.wc[i].allowDynamicShared(wcShared(v));
+         }
+         l.group = .{ try l.mod.function("tf_exl3_group_8_2_4"), try l.mod.function("tf_exl3_group_8_2_8") };
++        l.group6 = .{ try l.mod.function("tf_exl3_group_12_2_4"), try l.mod.function("tf_exl3_group_12_2_8") };
+         l.rot_group = try l.mod.function("tf_exl3_rot_group");
+         l.pdl = dependentLaunches(d); // sm_90 and newer; the kernels' waits compile to nothing below
+         if (platform.c.getenv("TF_EXL3_PDL")) |v| l.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+@@ -319,17 +321,20 @@ pub const Linear = struct {
+         var ga: launch_.Args = .{};
+         ga.add(g);
+         const wk = planOf(ws[0]).wk;
+-        try launch_.launch(l.group[if (wk == 4) 0 else 1], .{ .grid = .{ .x = @intCast(end), .y = 1, .z = 1 }, .block = .{ .x = wk * 32, .y = 1, .z = 1 }, .shared = sharedBytes(ws[0], m), .pdl = l.pdl }, s, &ga);
++        const gfn = if (ws[0].halves == 12) l.group6[if (wk == 4) 0 else 1] else l.group[if (wk == 4) 0 else 1];
++        try launch_.launch(gfn, .{ .grid = .{ .x = @intCast(end), .y = 1, .z = 1 }, .block = .{ .x = wk * 32, .y = 1, .z = 1 }, .shared = sharedBytes(ws[0], m), .pdl = l.pdl }, s, &ga);
+     }
+ };
+ 
+-/// Members one group launch takes: 2 or 3 4-bit mul1 layers of one K and one warp count, at 1 to 16 rows.
++/// Members one group launch takes: 2 or 3 4- or 6-bit mul1 layers of one width, K and warp count, at 1 to 16 rows.
+ pub fn groupable(ws: []const Weight, m: usize) bool {
+     if (ws.len < 2 or ws.len > 3 or m < 1 or m > 16) return false;
++    const h0 = ws[0].halves;
++    if (h0 != 8 and h0 != 12) return false;
+     const wk = planOf(ws[0]).wk;
+     if (wk != 4 and wk != 8) return false;
+     for (ws) |w| {
+-        if (w.halves != 8 or w.codebook != .mul1 or w.k != ws[0].k or planOf(w).wk != wk) return false;
++        if (w.halves != h0 or w.codebook != .mul1 or w.k != ws[0].k or planOf(w).wk != wk) return false;
+         if (w.k % 128 != 0 or w.n % 128 != 0 or (w.k / 16) % (planOf(w).sk * wk) != 0) return false;
+     }
+     return true;
+diff --git a/zig/src/families/flashnext/cuda_exl3_lane.zig b/zig/src/families/flashnext/cuda_exl3_lane.zig
+index 4a34c0b..827c9b6 100644
+--- a/zig/src/families/flashnext/cuda_exl3_lane.zig
++++ b/zig/src/families/flashnext/cuda_exl3_lane.zig
+@@ -30,16 +30,52 @@ pub fn run(self: anytype, g: *const grp.Group, x: u64, out: u64, part: u64, m: u
+     if (sk != 1 or out == 0) return error.UnexpectedTensor;
+     const tmp = self.s.exl3_tmp;
+     if (tmp == 0) return error.UnexpectedTensor;
++    const use_group = if (std.c.getenv("TF_EXL3_DECODE_GROUP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+     var r0: usize = 0;
+     while (r0 < m) : (r0 += block_rows) {
+         const rows = @min(block_rows, m - r0);
+         const xr = x + r0 * g.k * 2;
+-        for (g.parts[0..g.count]) |p| {
++        var pi: usize = 0;
++        while (pi < g.count) {
++            if (use_group and rows <= 16 and g.parts[pi].kind == .trellis) {
++                var ws: [3]cuda.exl3.Weight = undefined;
++                var ys: [3]u64 = undefined;
++                var cnt: usize = 0;
++                var off: usize = 0;
++                while (pi + cnt < g.count and cnt < 3 and g.parts[pi + cnt].kind == .trellis) {
++                    const p = g.parts[pi + cnt];
++                    ws[cnt] = p.w;
++                    ys[cnt] = tmp + off;
++                    off += rows * p.n * 2;
++                    cnt += 1;
++                }
++                if (cnt >= 2 and cuda.exl3.groupable(ws[0..cnt], rows)) {
++                    try kit.dense.decodeGroup(stream, ws[0..cnt], xr, .bf16, rows, ys[0..cnt], .bf16);
++                    for (0..cnt) |j| {
++                        const p = g.parts[pi + j];
++                        try ops.copyCols(self.k, stream, ys[j], p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                    }
++                    pi += cnt;
++                    continue;
++                }
++                // Try first 2 if 3 weren't groupable (e.g. different wk)
++                if (cnt == 3 and cuda.exl3.groupable(ws[0..2], rows)) {
++                    try kit.dense.decodeGroup(stream, ws[0..2], xr, .bf16, rows, ys[0..2], .bf16);
++                    for (0..2) |j| {
++                        const p = g.parts[pi + j];
++                        try ops.copyCols(self.k, stream, ys[j], p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                    }
++                    pi += 2;
++                    continue;
++                }
++            }
++            const p = g.parts[pi];
+             switch (p.kind) {
+                 .trellis => try decodeRows(kit, stream, p.w, xr, rows, tmp, .bf16),
+                 .plain => try self.k.nativeMatmul(stream, xr, g.k, rows, p.plain, tmp, self.s.native_part, .bf16),
+             }
+             try ops.copyCols(self.k, stream, tmp, p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++            pi += 1;
+         }
+     }
+     return 1;

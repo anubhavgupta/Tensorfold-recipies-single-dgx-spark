@@ -33,8 +33,8 @@ client, greedy, thinking off, 256-token replies**, server with `--context 131072
 Sampled (T=0.7, 4 / 9 clients): flash-4 code 179.5 / 269.1, prose 105.6 / 152.5 (`DRAFTER=mtp` earlier build: code 173.6 / 230.3,
 prose 96.4 / 144.4). Not measured on flash-3.
 
-**Prefill** (one prompt, cold, tok/s): flash-3 1054 / 1037 / 1020 at 4K / 16K / 65K; **flash-4 1954 / 1971 / 1919 (+85–90 % over flash-3)** and **1640 tok/s at 248K (151.0 s vs 229.7 s before patch 0007)**.
-Patch 0007 enables TensorFold's 3-stage `cp.async` transposed EXL3 prompt expert kernels (`exl3_prompt.cuh`) for `mul1`, running all 512 4-bit routed experts across the full 3,072-row chunk in one pass with no split-K fp32 partials, and `start.sh` enables `TF_FLASHNEXT_READOUT_FUSED=1` (fused BF16 hyper-connection read-out, bit-identical). Earlier flash-4 (before patch 0007, 1,024-row `grouped_body_mtl`) ran 1314 / 1294 / 1261 tok/s.
+**Prefill** (one prompt, cold, tok/s): flash-3 1054 / 1037 / 1020 at 4K / 16K / 65K; **flash-4 1954 / 1971 / 1927 (+85–90 % over flash-3)** and **1748 tok/s at 248K (141.6 s vs 229.7 s before patches 0007–0009)**.
+Patch 0007 enables TensorFold's 3-stage `cp.async` transposed EXL3 prompt expert kernels (`exl3_prompt.cuh`) for `mul1`, running all 512 4-bit routed experts across the full 3,072-row chunk in one pass with no split-K fp32 partials; patch 0009 switches long-context QSA indexer scoring (`qsa_score`) to BF16 Tensor Cores (`mma16816` with FP32 accumulators, cutting 248K TTFT by a further 5.8 s with byte-identical 120K needle retrieval); and `start.sh` enables `TF_FLASHNEXT_READOUT_FUSED=1` (fused BF16 hyper-connection read-out) and `TF_QMMF_HALF_BELOW=0` (64-col BF16 decode tiles: 1 exact wave of 48 SMs on GB10 for HC `[324, 10240]`, +0.8–1.5 % 1-stream decode, bit-exact). Patch 0008 extends EXL3 `decodeGroup` to 6-bit `mul1` stitched projections (`in_proj_qkv+z`, `q+k+v`), adding +2.3–3.4 % 1-stream decode and +1.5 % 4-stream prose with 100 % identical greedy and sampled token hashes. Earlier flash-4 (before patch 0007, 1,024-row `grouped_body_mtl`) ran 1314 / 1294 / 1261 tok/s.
 
 **Decode** is level with flash-3: better on code and json at 9 clients, 5-12 % lower on prose with one client and 3-5 % lower at
 4 clients. It is bound by expert-weight bandwidth (a verify window costs ~33 ms plus ~2.9 ms a row), so gains can only come from
@@ -150,6 +150,8 @@ Not carried over: int8 KV, the 9-stream default, `TENSORFOLD_KEEP_MAX` elastic k
 | `0005-vision-budget` | shared image budget up to 65,536 rows |
 | `0006-flashnext-dflash2` | DFlash2 drafter: taps after layers 5/15/25/35/45, 5-layer drafter at 4 bits, block of 7, selector. Knobs `TF_FLASHNEXT_DFLASH_{DRAFTS,CONFIDENCE,COPIES,TIMING}` |
 | `0007-exl3-prompt-experts` | Transposed 3-stage `cp.async` EXL3 prompt experts (`exl3_prompt.cuh`) for `mul1` 4-bit routed experts in one 3,072-row pass (no split-K `z` partials); shared 6-bit expert (512) via `skip = -514`. Knob `TF_EXL3_PROMPT_FAST` (default 1) |
+| `0008-exl3-decode-group6` | Extends EXL3 `decodeGroup` (`tf_exl3_group_12_2_{4,8}`) to 6-bit `mul1` stitched projections (`in_proj_qkv+z`, `q+k+v`), fusing rotation + GEMM into one launch (+2.3–3.4 % 1-stream decode, bit-exact). Knob `TF_EXL3_DECODE_GROUP` (default 1) |
+| `0009-qsa-score-tc` | BF16 Tensor-Core (`mma16816` + FP32 accumulators) QSA indexer scores (`fn_qsa_scores_tc` / `_paged`) for prompt chunks (`rows >= 16`), cutting 248K prefill by 5.8 s (147.4 → 141.6 s, 1,748 tok/s, byte-identical 120K needle). Knob `TF_FLASHNEXT_QSA_TC` (default 1) |
 
 Verified: applying them in order to the pristine tag gives the tree that was built and tested.
 
