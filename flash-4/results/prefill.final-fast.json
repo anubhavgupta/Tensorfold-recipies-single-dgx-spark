@@ -1,0 +1,29 @@
+{
+ "model": "Qwen3.8-Flash-Next",
+ "base": "http://127.0.0.1:8888/v1",
+ "chars_per_token": 3.987,
+ "4096": {
+  "prompt_tokens": 4101,
+  "ttft_s": 2.1,
+  "prefill_tok_s": 1953.9,
+  "err": null
+ },
+ "16384": {
+  "prompt_tokens": 16408,
+  "ttft_s": 8.32,
+  "prefill_tok_s": 1970.9,
+  "err": null
+ },
+ "65536": {
+  "prompt_tokens": 65245,
+  "ttft_s": 34.01,
+  "prefill_tok_s": 1918.6,
+  "err": null
+ },
+ "248000": {
+  "prompt_tokens": 247619,
+  "ttft_s": 151.04,
+  "prefill_tok_s": 1639.5,
+  "err": null
+ }
+}

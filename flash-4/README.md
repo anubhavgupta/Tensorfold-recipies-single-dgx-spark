@@ -33,8 +33,8 @@ client, greedy, thinking off, 256-token replies**, server with `--context 131072
 Sampled (T=0.7, 4 / 9 clients): flash-4 code 179.5 / 269.1, prose 105.6 / 152.5 (`DRAFTER=mtp` earlier build: code 173.6 / 230.3,
 prose 96.4 / 144.4). Not measured on flash-3.
 
-**Prefill** (one prompt, cold, tok/s): flash-3 1054 / 1037 / 1020 at 4K / 16K / 65K; **flash-4 1314 / 1294 / 1261 (+25 %)**.
-A 3072-row prefill chunk went 2.5 s -> 2.3 s from multi-tile expert kernels (patch 0002); experts are ~60 % of it.
+**Prefill** (one prompt, cold, tok/s): flash-3 1054 / 1037 / 1020 at 4K / 16K / 65K; **flash-4 1954 / 1971 / 1919 (+85–90 % over flash-3)** and **1640 tok/s at 248K (151.0 s vs 229.7 s before patch 0007)**.
+Patch 0007 enables TensorFold's 3-stage `cp.async` transposed EXL3 prompt expert kernels (`exl3_prompt.cuh`) for `mul1`, running all 512 4-bit routed experts across the full 3,072-row chunk in one pass with no split-K fp32 partials, and `start.sh` enables `TF_FLASHNEXT_READOUT_FUSED=1` (fused BF16 hyper-connection read-out, bit-identical). Earlier flash-4 (before patch 0007, 1,024-row `grouped_body_mtl`) ran 1314 / 1294 / 1261 tok/s.
 
 **Decode** is level with flash-3: better on code and json at 9 clients, 5-12 % lower on prose with one client and 3-5 % lower at
 4 clients. It is bound by expert-weight bandwidth (a verify window costs ~33 ms plus ~2.9 ms a row), so gains can only come from
@@ -149,6 +149,7 @@ Not carried over: int8 KV, the 9-stream default, `TENSORFOLD_KEEP_MAX` elastic k
 | `0004-media-limits` | request/image/video limits |
 | `0005-vision-budget` | shared image budget up to 65,536 rows |
 | `0006-flashnext-dflash2` | DFlash2 drafter: taps after layers 5/15/25/35/45, 5-layer drafter at 4 bits, block of 7, selector. Knobs `TF_FLASHNEXT_DFLASH_{DRAFTS,CONFIDENCE,COPIES,TIMING}` |
+| `0007-exl3-prompt-experts` | Transposed 3-stage `cp.async` EXL3 prompt experts (`exl3_prompt.cuh`) for `mul1` 4-bit routed experts in one 3,072-row pass (no split-K `z` partials); shared 6-bit expert (512) via `skip = -514`. Knob `TF_EXL3_PROMPT_FAST` (default 1) |
 
 Verified: applying them in order to the pristine tag gives the tree that was built and tested.
 

@@ -41,6 +41,8 @@ case "$DRAFTER" in
 esac
 # DFlash2 context copies: 0 is best on the content suite; 1 makes copy-heavy (echo) replies ~2.4x faster
 export TF_FLASHNEXT_DFLASH_COPIES="${TF_FLASHNEXT_DFLASH_COPIES:-0}"
+# Fused BF16 hyper-connection read-out on prompt passes >= 768 rows (bit-identical, +3-4% prefill)
+export TF_FLASHNEXT_READOUT_FUSED="${TF_FLASHNEXT_READOUT_FUSED:-1}"
 [[ "$KV_PAGES" != 0 ]] && export TF_FLASHNEXT_KV_PAGES="$KV_PAGES"
 
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
