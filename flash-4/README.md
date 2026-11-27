@@ -111,6 +111,24 @@ tile across both 16-row tiles. In a separate greedy A/B/A at 98,304 context with
 268 / 169 / 307 tok/s, within or below the two stock runs' ranges of 268-270 / 165-172 / 301-309. At four clients,
 the change did not beat both stock runs on any workload either. The original grouping remains the default.
 
+### Mixed prefill + decode interleaving
+
+On a single GB10, TensorFold time-slices prefill chunks and decode rounds (`TENSORFOLD_PREFILL_SHARE=1` starves active
+decoders during long prefills). Measured with 2 concurrent streaming decoders (code + prose, 900 tokens each) beside a
+cold 65K prefill, plus a solo 65K prefill check:
+
+| Config | Solo 65K prefill | Mixed 65K prefill | Decode during 65K prefill (code + prose) | Worst decode stall |
+|---|---:|---:|---:|---:|
+| Stock (`share=1, chunk=3072`) | `33.5 s` (`1,952 tok/s`) | `36.1 s` (`1,808 tok/s`) | `~4.8 agg tok/s` (`2.8 + 2.0`, starved) | `2.28 s` |
+| **Default** (`share=0.85, chunk=3072, solo=3072`) | `33.8 s` (`1,932 tok/s`) | **`40.4 s` (`1,615 tok/s`)** | **`~19.3 agg tok/s`** (`11.0 + 8.3`, **4.0×**) | `3.04 s` |
+| Low-stall (`share=0.85, chunk=1536, solo=3072`) | `33.2 s` (`1,969 tok/s`) | `46.0 s` (`1,417 tok/s`) | `~19.9 agg tok/s` (`11.3 + 8.6`, **4.1×**) | **`1.46 s`** |
+| Decode-favored (`share=0.75, chunk=1536, solo=3072`) | `32.7 s` (`1,999 tok/s`) | `49.2 s` (`1,326 tok/s`) | `~13.1 tok/s` (1 active stream) | **`1.00 s`** |
+
+`start.sh` defaults to `TENSORFOLD_PREFILL_SHARE=0.85`, `TF_FLASHNEXT_CHUNK=3072`, `TF_FLASHNEXT_CHUNK_SOLO=3072` (best
+overall throughput). For smoother interactive streaming during long prefills, override `TF_FLASHNEXT_CHUNK=1536` (halves
+worst decode stall to `1.46 s` with zero solo-prefill penalty); set `TENSORFOLD_PREFILL_SHARE=1` to restore prefill-first
+stock scheduling.
+
 ### Parallel full 262K streams
 
 Full 262,144-token window, bf16 KV (the native engine has no int8/fp8 KV): **7.9-8.1 GiB per stream**; the model takes 67.3 GiB, so
