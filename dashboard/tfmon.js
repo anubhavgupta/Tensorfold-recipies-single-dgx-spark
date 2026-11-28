@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // tfmon — TensorFold engine dashboard for Node.js (zero dependencies).
 //
-// Polls GET /health (default http://localhost:8888/health, 1 Hz) and renders
+// Polls GET /health (default http://localhost:8888/health, 1 Hz; plus /metrics on TensorFold 1.x) and renders
 // an htop-style dashboard: throughput sparkline, decode/spec stats, cache
 // gauge, stream utilization, lifetime counters, and a running cost total
 // persisted across runs in cost.json. Single-server scope.
 //
 // Usage:
-//   tfmon [--url URL] [--interval MS] [--theme dark|light] [--model NAME] [--cli] [--help]
+//   tfmon [--url URL] [--metrics URL] [--interval MS] [--theme dark|light] [--model NAME] [--cli] [--help]
 //
 // Keys (TUI mode): q quit · h help · g graphs · t theme
 
@@ -37,6 +37,7 @@ const HELP = `tfmon — TensorFold engine dashboard
 
 Options:
   --url URL        health endpoint        (default: ${DEFAULTS.url})
+  --metrics URL    Prometheus endpoint of TensorFold 1.x (default: /metrics beside --url; older engines need neither)
   --interval MS    poll period, ms        (default: 1000)
   --theme NAME     auto|dark|light        (default: auto - asks the terminal for its background colour)
   --model NAME     label override for the header
@@ -59,6 +60,7 @@ function parseArgs(argv) {
     };
     switch (a) {
       case '--url': cfg.url = val(); break;
+      case '--metrics': cfg.metrics = val(); break;
       case '--interval': {
         const ms = Number(val());
         if (!Number.isFinite(ms) || ms < 50) throw new Error('--interval must be ms >= 50');
@@ -83,6 +85,10 @@ function parseArgs(argv) {
         throw new Error(`unknown flag: ${a} (see --help)`);
     }
   }
+  // current TensorFold keeps its counters on /metrics and the context window on /v1/models, beside /health
+  const beside = (path) => { try { return new URL(path, cfg.url).href; } catch { return path; } };
+  cfg.metrics ||= beside('/metrics');
+  cfg.models = beside('/v1/models');
   return cfg;
 }
 
@@ -163,9 +169,11 @@ function diff(prev, cur) {
   const ph = prev.h;
   const d = (a, b) => Math.max(0, b - a); // counters are monotonic; be defensive
   const dComp = d(ph.completionTotal, ch.completionTotal);
+  const dOut = d(ph.outLive, ch.outLive); // tokens decoded in the window (live on current engines, per finished request on older ones)
   const dPrompt = d(ph.promptTotal, ch.promptTotal);
   const dCached = d(ph.cachedTotal, ch.cachedTotal);
   const dPrefillS = d(ph.prefillS, ch.prefillS);
+  const dPrefillTok = d(ph.prefillTok, ch.prefillTok);
   const dDecodeS = d(ph.decodeS, ch.decodeS);
   const dRounds = d(ph.rounds, ch.rounds);
   const dDrafted = d(ph.drafted, ch.drafted);
@@ -173,8 +181,8 @@ function diff(prev, cur) {
   const dReq = d(ph.requestsTotal, ch.requestsTotal);
   out.hasWindow = true;
   out.dt = dt;
-  out.outTps = dComp / dt;
-  out.prefillTps = Math.max(0, dPrompt - dCached) / Math.max(EPS, dPrefillS);
+  out.outTps = dOut / dt;
+  out.prefillTps = dPrefillTok / Math.max(EPS, dPrefillS);
   out.cacheHit = clamp01(dCached / Math.max(EPS, dPrompt));
   out.accRate = dDrafted > 0 ? clamp01(dAccepted / dDrafted) : 0;
   out.tokPerRound = dAccepted / Math.max(EPS, dRounds);
@@ -246,29 +254,78 @@ function saveCostState(force = false) {
 
 // ------------------------------------------------------------------ health
 
-function parseHealth(json) {
-  if (typeof json !== 'object' || json === null || !('ok' in json)) return null;
+const num = (v, dflt = 0) => (Number.isFinite(+v) ? +v : dflt);
+
+// Older TensorFold: /health carries the lifetime counters itself ("ok" field).
+function parseLegacyHealth(json) {
   const s = json.streams || {};
-  const num = (v, dflt = 0) => (Number.isFinite(+v) ? +v : dflt);
+  const promptTotal = num(json.prompt_tokens_total);
+  const cachedTotal = num(json.cached_tokens_total);
+  const completionTotal = num(json.completion_tokens_total);
   return {
     ok: !!json.ok,
     busy: !!json.busy,
+    model: '',
     requestsRunning: num(json.requests_running),
     requestsTotal: num(json.requests_total),
-    promptTotal: num(json.prompt_tokens_total),
-    completionTotal: num(json.completion_tokens_total),
+    promptTotal,
+    completionTotal,
     prefillS: num(json.prefill_seconds_total),
     decodeS: num(json.decode_seconds_total),
-    cachedTotal: num(json.cached_tokens_total),
+    cachedTotal,
     rounds: num(json.rounds_total),
     drafted: num(json.drafted_total),
     accepted: num(json.accepted_total),
+    outLive: completionTotal,
+    prefillTok: Math.max(0, promptTotal - cachedTotal),
     streams: {
       decoding: num(s.decoding),
       prefilling: num(s.prefilling),
       max: num(s.max, 8),
     },
     ctx: num(json.context_length),
+  };
+}
+
+// Prometheus text -> { 'name{labels}': value }, the "tensorfold:" prefix dropped.
+function parseMetrics(text) {
+  const m = {};
+  for (const line of text.split('\n')) {
+    if (!line || line[0] === '#') continue;
+    const sp = line.lastIndexOf(' ');
+    if (sp < 0) continue;
+    const key = line.slice(0, sp).replace(/^tensorfold:/, '');
+    m[key] = +line.slice(sp + 1);
+  }
+  return m;
+}
+
+// TensorFold 1.x: /health is a status document and the counters live on /metrics.
+// Token and request counters there only move when a request finishes, except the
+// scheduler counters, which are live: they feed the Decode and Prefill rates.
+function parseCurrentHealth(json, m, ctx) {
+  const g = (k) => num(m[k]);
+  const running = g('requests_running');
+  const lanes = g('lanes') || num(json.max_batch_size, 8);
+  const prefilling = g('filling_prompt_tokens_left') > 0 ? Math.min(1, running) : 0;
+  return {
+    ok: json.status === 'ok' && !json.warming,
+    busy: running > 0,
+    model: typeof json.model === 'string' ? json.model : '',
+    requestsRunning: running,
+    requestsTotal: g('request_latency_seconds_count'),
+    promptTotal: g('prompt_tokens_total'),
+    completionTotal: g('generation_tokens_total'),
+    prefillS: g('prefill_busy_seconds_total'),
+    decodeS: g('request_decode_seconds_sum'),
+    cachedTotal: g('prompt_tokens_cached_total'),
+    rounds: g('decode_rounds_total'),
+    drafted: g('spec_decode_num_draft_tokens_total') || g('mtp_drafted_total'),
+    accepted: g('spec_decode_num_accepted_tokens_total') || g('mtp_accepted_total'),
+    outLive: g('scheduler_tokens_total{mode="decode"}'),
+    prefillTok: g('scheduler_tokens_total{mode="prefill_compute"}'),
+    streams: { decoding: Math.max(0, running - prefilling), prefilling, max: lanes },
+    ctx,
   };
 }
 
@@ -315,22 +372,51 @@ state.carried = Math.max(0, savedCostState.cost - savedCostState.engineCost);
 state.lastEngineCost = savedCostState.engineCost;
 state.costAccrual = savedCostState.cost; // running total as of the last save
 
+async function getText(url) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 3000);
+  try {
+    const res = await fetch(url, { signal: ac.signal, headers: { connection: 'close' } });
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function getJson(url) {
+  const text = await getText(url);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('not JSON');
+  }
+}
+// The window size is not on /health any more: read it once per served model from /v1/models.
+let ctxCache = { model: null, ctx: 0 };
+async function contextLength(model) {
+  if (ctxCache.model === model && ctxCache.ctx > 0) return ctxCache.ctx;
+  try {
+    const list = (await getJson(cfg.models)).data || [];
+    const e = list.find((x) => x.id === model) || list[0] || {};
+    ctxCache = { model, ctx: num(e.context_length ?? e.max_model_len) };
+  } catch { /* the Ctx field is cosmetic; keep the last value */ }
+  return ctxCache.ctx;
+}
+
 async function pollOnce() {
   const t0 = Date.now() / 1000;
   try {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 3000);
-    const res = await fetch(cfg.url, { signal: ac.signal, headers: { connection: 'close' } });
-    clearTimeout(timer);
-    if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
-    let json;
-    try {
-      json = JSON.parse(await res.text());
-    } catch {
-      throw new Error('not JSON');
+    const json = await getJson(cfg.url);
+    let h;
+    if (typeof json === 'object' && json !== null && 'ok' in json) {
+      h = parseLegacyHealth(json);
+    } else if (typeof json === 'object' && json !== null && 'status' in json) {
+      const m = parseMetrics(await getText(cfg.metrics));
+      if (!('requests_running' in m)) throw new Error(`no TensorFold counters at ${cfg.metrics}`);
+      h = parseCurrentHealth(json, m, await contextLength(json.model));
+    } else {
+      throw new Error('not a /health response (no "ok" or "status" field)');
     }
-    const h = parseHealth(json);
-    if (!h) throw new Error('not a /health response (no "ok" field)');
     if (state.sample) {
       const d = diff(state.sample, { t: t0, h });
       state.derived = d;
@@ -464,7 +550,8 @@ function frame() {
   }
   let host = cfg.url;
   try { host = new URL(cfg.url).host; } catch { /* keep raw url */ }
-  const title = cfg.model || P.model ? `TensorFold: ${cfg.model || P.model}` : `TensorFold @ ${host}`;
+  const label = cfg.model || h?.model || P.model;
+  const title = label ? `TensorFold: ${label}` : `TensorFold @ ${host}`;
   const mid = '─'.repeat(Math.max(1, W - 2 - vlen(` ${title} `) - vlen(status)));
   const head = `┌${paint(` ${title} `, t.accent)}${paint(mid, t.dim)}${status}┐`;
 

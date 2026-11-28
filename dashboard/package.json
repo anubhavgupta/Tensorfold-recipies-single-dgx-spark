@@ -1,7 +1,7 @@
 {
   "name": "tfmon",
   "version": "0.1.0",
-  "description": "TensorFold engine /health dashboard (zero-dependency Node.js CLI + TUI)",
+  "description": "TensorFold engine dashboard (/health + /metrics) (zero-dependency Node.js CLI + TUI)",
   "type": "module",
   "bin": { "tfmon": "tfmon.js" },
   "scripts": { "start": "node tfmon.js" },

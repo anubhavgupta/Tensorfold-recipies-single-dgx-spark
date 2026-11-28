@@ -1,7 +1,9 @@
 # tfmon
 
-Zero-dependency Node.js dashboard for the TensorFold engine. Polls
-`GET /health` (default `http://localhost:8888/health`, 1 Hz) and renders an
+Zero-dependency Node.js dashboard for the TensorFold engine, current (1.x, native)
+and older (0.x, counters on `/health`) releases alike. Polls
+`GET /health` (default `http://localhost:8888/health`, 1 Hz; plus `/metrics` and
+`/v1/models` on 1.x, see [Engine versions](#engine-versions)) and renders an
 htop-style view: throughput sparkline, decode/spec stats, cache gauge,
 stream utilization, lifetime counters. Below the three panels are
 full-width `Streams`, `Lifetime` and `Cost` boxes, then the key hints.
@@ -66,6 +68,7 @@ node tfmon.js --url http://host:port/health --interval 500 --model my-engine
 | Flag            | Meaning                                        |
 |-----------------|------------------------------------------------|
 | `--url URL`     | health endpoint (default `http://localhost:8888/health`) |
+| `--metrics URL` | Prometheus endpoint of TensorFold 1.x (default `/metrics` beside `--url`; older engines need none) |
 | `--interval MS` | poll period, ≥ 50 ms (default 1000)            |
 | `--theme NAME`  | `auto` \| `dark` \| `light` (default `auto`, see Themes) |
 | `--model NAME`  | header label override                          |
@@ -95,9 +98,30 @@ hand — in `light` the key hints say so, since that theme only makes sense
 on a light background. `--cli` never probes (its stdin is not in raw mode)
 and starts in `dark`.
 
+## Engine versions
+
+tfmon tells the two apart by the `/health` document and needs no flag:
+
+| | older (0.x) | current (1.x) |
+|---|---|---|
+| `/health` | `{"ok": …}` with the lifetime counters, `streams` and `context_length` | `{"status": "ok", "model", "max_batch_size", "live": …}` only |
+| counters | `/health` | `/metrics` (`tensorfold:*` Prometheus counters) |
+| context window | `/health` | `/v1/models` (`context_length`), read once |
+| header model | `--model`, else `pricing.json` | `--model`, else the served model, else `pricing.json` |
+
+On 1.x the token, request, round and draft counters only move when a request
+*finishes*, so `Cost`, `Cache`, `Spec Decode` and `Req` update per finished
+request (as they do on older engines). `Decode` and `Prefill` use the scheduler's
+live counters (`scheduler_tokens_total{mode="decode"|"prefill_compute"}` over
+`prefill_busy_seconds_total`), so they move while a reply is streaming.
+`Streams` comes from `lanes` and `requests_running`; 1.x does not report
+prefilling and decoding streams separately, so one prompt being filled
+(`filling_prompt_tokens_left > 0`) counts as the single prefilling stream and the
+other running requests as decoding. Output for older engines is unchanged.
+
 ## Cost tracking
 
-Cost is derived from the cumulative `/health` token counters:
+Cost is derived from the cumulative token counters (`/health` on older engines, `/metrics` on 1.x):
 window cost = (Δprompt − Δcached) × input + Δcached × cache +
 Δcompletion × output. The Cache panel shows `Spend/sec` (window
 cost normalized to 1 s, so it is a true rate at any poll interval).
