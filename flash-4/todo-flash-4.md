@@ -31,8 +31,11 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 ## 2. Long-Context Prefill (245K) — QSA + MXFP8 Attention (`318.3 ms` = 19.5% of chunk)
 
 - [ ] **SMEM-Compacted 2-Pass `fn_qsa_select` (`64.8 ms` @ 245K)**
-  - **Root cause:** Patch `0011` cut radix passes from 4 → 3 (`69.4 → 64.8 ms`), but `fn_qsa_select_body` still performs **5 full global reads** over `9.03 GB` of `SC[3072, 61250]` (3 radix + count + write).
-  - **Goal:** After pass 0 (11-bit `shift = 21`), compact only the `< 2,000` candidates with `(k >> 21) >= (cut >> 21)` into SMEM so passes 1–2 and output writing never re-read global memory.
+  - **Root cause:** Patch `0011` cut radix passes from 4 → 3 (`69.4 → 64.8 ms`), but `fn_qsa_select_body` still performs **5 full global reads** over `9.03 GB` of `SC[3072, 61250]` (`45.1 GB` total: 3 radix + count + write).
+  - **How to fix (100% bit-exact):**
+    1. **Global Pass 1:** Run the 11-bit top histogram (`shift = 21`, `2,048` bins, `__match_any_sync`) to find boundary bin `top11` and `cnt_eq`.
+    2. **Global Pass 2:** Stream `row` once more, compacting only the `< 4,096` candidates with `(k >> 21) >= top11` into **40 KiB SMEM** (`sh_k[4096]` + `sh_b[4096]`, keeping fallback to global passes if `> 4,096`).
+    3. **SMEM-only finish:** Run radix passes 1–2 (`shift = 10, 0`), exact tie-breaking (smallest block IDs for `== cut`), and a 512-element bitonic sort in SMEM to emit ascending block IDs with zero further global reads (cuts DRAM traffic `45.1 GB → 18.1 GB`).
   - **Est. gain:** `-20 to -30 ms/chunk` (**-2.0 s** off 248K TTFT), 100% bit-exact.
 
 - [ ] **Native Blackwell `mma.sync.aligned.kind::mxf8f6f4.block_scale` in `attn_core` (`182.4 ms` @ 245K)**
