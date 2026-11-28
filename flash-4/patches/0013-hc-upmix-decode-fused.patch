@@ -15,3 +15,87 @@ Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2 + MXFP8 KV, A/B back
   json +7.9% (195.6->211.1 tok/s)
 - Exactness: 4/4 greedy & 4/4 T=0.7 SHAs 100% byte-identical, drafts on == drafts off.
 
+diff --git a/zig/kernels/cuda/flashnext_hcn.cu b/zig/kernels/cuda/flashnext_hcn.cu
+index 70c2be9..d28e92e 100644
+--- a/zig/kernels/cuda/flashnext_hcn.cu
++++ b/zig/kernels/cuda/flashnext_hcn.cu
+@@ -13,6 +13,13 @@ HCN_DOWN(fn_hcn_down2, 2)
+ HCN_DOWN(fn_hcn_down3, 3)
+ HCN_DOWN(fn_hcn_down4, 4)
+ 
++extern "C" __global__ void __launch_bounds__(256) fn_hcn_up1(const __nv_bfloat16* __restrict__ ACT, const uint2* __restrict__ W,
++                                                             const __nv_bfloat16* __restrict__ H, const float* __restrict__ PSS,
++                                                             const float* __restrict__ SCALE, __nv_bfloat16* __restrict__ MIXED,
++                                                             float* __restrict__ XSM, int M, int D, int NC, float eps) {
++    hcn::upmix_body<1, 5>(ACT, W, H, PSS, SCALE, MIXED, XSM, M, D, NC, eps);
++}
++
+ extern "C" __global__ void __launch_bounds__(256) fn_hcn_up3(const __nv_bfloat16* __restrict__ ACT, const uint2* __restrict__ W,
+                                                              const __nv_bfloat16* __restrict__ H, const float* __restrict__ PSS,
+                                                              const float* __restrict__ SCALE, __nv_bfloat16* __restrict__ MIXED,
+diff --git a/zig/src/families/flashnext/cuda_batch_hc.zig b/zig/src/families/flashnext/cuda_batch_hc.zig
+index 4d81fad..ef4949a 100644
+--- a/zig/src/families/flashnext/cuda_batch_hc.zig
++++ b/zig/src/families/flashnext/cuda_batch_hc.zig
+@@ -62,6 +62,12 @@ pub fn readoutNative(pass: anytype, hc_w: wt.HcW, r0: usize, n: usize) !void {
+     try pass.k.nativeMatmul(pass.stream, norm, wide, n, down, s.hc_part, s.native_part, .f32);
+     const inj_ptr = if (hc_w.has_inj == 1) inj else act;
+     try pass.tri.hcReduceAct(s.hc_part, act, xs_act, inj_ptr, 1, n, streams, low, hc_w.n_down, hc_w.has_inj);
++    const use_upmix_fused = if (std.c.getenv("TF_FLASHNEXT_HC_UPMIX_FUSED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++    if (use_upmix_fused and up.mode == .bf16 and dims == 2560 and streams == 4 and n <= 64) {
++        const h = s.h + r0 * wide * 2;
++        const pss = s.pss + r0 * pss_n * 4;
++        return tiles.fusedUpMixDecode(pass.k, pass.stream, act, up, h, pss, hc_w.scale.ptr, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4, n, eps);
++    }
+     try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, s.native_part, .bf16);
+     try pass.tri.hcDenseMix(s.hc_up, norm, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4, n, dims, streams);
+ }
+diff --git a/zig/src/families/flashnext/cuda_tile_kernels.zig b/zig/src/families/flashnext/cuda_tile_kernels.zig
+index 4ebebc6..7e9ce88 100644
+--- a/zig/src/families/flashnext/cuda_tile_kernels.zig
++++ b/zig/src/families/flashnext/cuda_tile_kernels.zig
+@@ -18,6 +18,7 @@ pub const fact_smem: u32 = 3 * (2 * 64 * 64 + 2 * 128 * 16 + 2 * 2 * 128 * 2 + 2
+ /// The BF16 read-out's fused prompt tiles (flashnext_hcn.cu): the down in CTAs of 16 * mt rows, the up+mix at mt 3.
+ pub const hcn_down_names = [_][:0]const u8{ "fn_hcn_down2", "fn_hcn_down3", "fn_hcn_down4" };
+ pub const hcn_down_mt = [_]usize{ 2, 3, 4 };
++pub const hcn_up1_name: [:0]const u8 = "fn_hcn_up1";
+ pub const hcn_up_name: [:0]const u8 = "fn_hcn_up3";
+ pub const hcn_up_mt: usize = 3;
+ 
+@@ -40,6 +41,7 @@ pub const TileKernels = struct {
+     hcf_up: cuda.Function,
+     hcn_mod: cuda.Module,
+     hcn_down: [hcn_down_names.len]cuda.Function,
++    hcn_up1: cuda.Function,
+     hcn_up: cuda.Function,
+     /// The device's SMs, over which the fused read-out picks its down tile.
+     sms: usize,
+@@ -73,6 +75,8 @@ pub const TileKernels = struct {
+             f.* = try k.hcn_mod.function(sym);
+             try f.allowDynamicShared(hcnDownSmem(mt));
+         }
++        k.hcn_up1 = try k.hcn_mod.function(hcn_up1_name);
++        try k.hcn_up1.allowDynamicShared(hcnUpSmem(1));
+         k.hcn_up = try k.hcn_mod.function(hcn_up_name);
+         try k.hcn_up.allowDynamicShared(hcnUpSmem(hcn_up_mt));
+         var dev: c_int = 0;
+diff --git a/zig/src/families/flashnext/cuda_tiles.zig b/zig/src/families/flashnext/cuda_tiles.zig
+index bd51719..18a91e7 100644
+--- a/zig/src/families/flashnext/cuda_tiles.zig
++++ b/zig/src/families/flashnext/cuda_tiles.zig
+@@ -135,6 +135,15 @@ pub fn fusedUpMix(f: cuda.Function, stream: cuda.Stream, act: u64, up: cuda.qmmf
+     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(cdiv(n, 16 * mt) * (dims / 32)) }, .block = .{ .x = 256 }, .shared = tk.hcnUpSmem(mt) }, stream, &b);
+ }
+ 
++/// Decode-sized fused BF16 up-projection + dense stream mix (fn_hcn_up1, mt=1, 16 rows/CTA, 80 CTAs at n<=16).
++pub fn fusedUpMixDecode(k: *const Kernels, stream: cuda.Stream, act: u64, up: cuda.qmmf.Weight, h: u64, pss: u64, scale: u64, mixed: u64, xsm: u64, n: usize, e: f32) !void {
++    var b: cuda.Args = .{};
++    for ([_]u64{ act, up.codes, h, pss, scale, mixed, xsm }) |v| b.add(v);
++    for ([_]usize{ n, dims, dims / 256 }) |v| b.add(cint(v));
++    b.add(e);
++    try cuda.launch.launch(k.tiles.hcn_up1, .{ .grid = .{ .x = @intCast(cdiv(n, 16) * (dims / 32)) }, .block = .{ .x = 256 }, .shared = tk.hcnUpSmem(1) }, stream, &b);
++}
++
+ /// Rows [r0, r0 + n) of the BF16 read-out in three launches with the five launches' bytes; no normed rows in memory.
+ pub fn readoutFused(tri: anytype, k: *const Kernels, stream: cuda.Stream, s: *Scratch, hc_w: HcW, r0: usize, n: usize) !void {
+     const down = hc_w.down.native orelse return error.UnexpectedTensor;
