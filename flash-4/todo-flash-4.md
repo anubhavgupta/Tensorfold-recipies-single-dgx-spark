@@ -54,6 +54,11 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **Goal:** Pass `y_stride = g.n` and `y_ptr = out + p.col * 2` directly into `LinearArgs` / `tf_exl3_group_12_2`, eliminating all 108 `copyCols` launches and `exl3_tmp` DRAM traffic.
   - **Est. gain:** `-0.8 to -1.5 ms/round` (**+2–3% N=1 decode**), 100% bit-exact.
 
+- [ ] **Fuse EXL3 `rot_in` (`suh * FWHT128`) into `gdn_norm` (`GDN Out`, 36×)**
+  - **Root cause:** `gdn_core` writes `gated_v [n, 6144]` BF16, then `gdn_out` launches a separate `tf_exl3_rot_in` kernel (`36` extra launches + `gated_v` roundtrip per pass) to rotate it into FP16 `xh`.
+  - **Goal:** Fuse `suh * FWHT128` directly into the end of `gdn_norm` so `gdn_out` consumes pre-rotated FP16 `xh` immediately (same pattern can also fuse `attn_gate` + `rot_in` for `attn_out`).
+  - **Est. gain:** `-0.3 to -0.5 ms/round` in N=1 decode and `~-5 ms/chunk` in prefill, 100% bit-exact.
+
 ---
 
 ## 4. MoE Routed 512×4-bit EXL3 (`453 ms` prefill / `16.5 ms` N=1 decode)
