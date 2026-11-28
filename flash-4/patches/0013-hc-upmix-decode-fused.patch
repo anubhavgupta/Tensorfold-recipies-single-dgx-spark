@@ -1,0 +1,17 @@
+Fused BF16 decode W_up [10240, 320] + hcDenseMix (fn_hcn_up1)
+
+Instantiates `fn_hcn_up1` (`hcn::upmix_body<1, 5>`, 16 rows/CTA, 80 column CTAs,
+14,592 B SMEM = 6 CTAs/SM on GB10) and dispatches it in `cuda_batch_hc.zig:readoutNative`
+for BF16 decode passes (`n <= 64`, gated by `TF_FLASHNEXT_HC_UPMIX_FUSED`, default 1).
+Eliminates 96 `hcDenseMix` launches/round, `hc_up` DRAM write/read, and `norm` reads
+from the up-mix path.
+
+Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2 + MXFP8 KV, A/B back-to-back):
+- Verify latency: -2.6 to -4.1 ms/round (2 rows: 38.2->35.6, 4 rows: 45.9->42.4,
+  6 rows: 52.2->48.2, 8 rows: 58.3->54.2 ms)
+- Decode N=1: code +6.9% (91.0->97.3), prose +8.3% (49.3->53.4), devops +7.0% (82.9->88.7),
+  json +9.7% (99.7->109.4 tok/s)
+- Decode N=4: code +4.1% (180.9->188.3), prose +8.0% (101.9->110.1), devops +5.2% (171.9->180.8),
+  json +7.9% (195.6->211.1 tok/s)
+- Exactness: 4/4 greedy & 4/4 T=0.7 SHAs 100% byte-identical, drafts on == drafts off.
+

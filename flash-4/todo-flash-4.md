@@ -10,15 +10,11 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 
 ## 1. Decode (N=1) — Hyper-Connections (`hc_attn + hc_mlp`: `9.9 ms` = 20% of round, ~128 GB/s)
 
-- [ ] **100% Exact BF16 Fused Decode `W_up [10240, 320] + hcDenseMix` Kernel**
-  - **Root cause:** Prefill already uses `readoutFused`, but decode (`n <= 16`) still runs `W_up` through `qmmf`'s 4-stage `cp.async` pipeline for only 5 K-steps (`320 / 64`), writes `hc_up [n, 10240]` to DRAM, and launches a separate `hcDenseMix` kernel (96× per round).
-  - **Goal:** Stream `W_up` with coalesced `uint4` loads, keep `act [n, 320]` in SMEM (~10 KB), fuse `hcDenseMix` in registers, and write `mixed [n, 2560] + xsm` directly.
-  - **Est. gain:** `-1.5 to -2.5 ms/round` (**+4–6% N=1 decode** across `prose`, `code`, `devops`, `json`), 100% bit-exact BF16.
+- [x] **100% Exact BF16 Fused Decode `W_up [10240, 320] + hcDenseMix` Kernel — SHIPPED in Patch `0013`**
+  - **Verified:** Instantiated `fn_hcn_up1` (`hcn::upmix_body<1, 5>`, 80 CTAs, 14.2 KiB SMEM) in `readoutNative` (`TF_FLASHNEXT_HC_UPMIX_FUSED=1`). Saved **`-2.6 to -4.1 ms/round`** across 2–8 row windows, boosting N=1 decode **+6.9% to +9.7%** (`code 91.0→97.3`, `prose 49.3→53.4`, `devops 82.9→88.7`, `json 99.7→109.4` tok/s) and N=4 decode **+4.1% to +8.0%** (`prose 101.9→110.1`, `json 195.6→211.1` tok/s). 4/4 greedy & T=0.7 SHAs 100% byte-identical.
 
-- [ ] **Column-Parallel Fused `hcWriteback + hcNormalize` for Decode (`n < 64`)**
-  - **Root cause:** Stock's fused `hcWritebackNorm` launches only **1 CTA per row**, which under-utilizes GB10's 48 SMs when `n = 1..8` (which is why stock gates it to `n >= 64` and why forcing `n >= 1` regressed decode by `-1.5–3%`). As a result, `HC MLP` + `HC Attn` run separate `hcWriteback` (including FP32 `s.part` reduction on `HC MLP`) and `hcNormalize` kernels (`96` extra launches + `h [n, 10240]` roundtrip).
-  - **Goal:** Split the 10,240 columns across multiple CTAs per row (with a tiny block/grid RMS reduction) so decode (`n < 64`) gets both kernel fusion and full 48-SM occupancy.
-  - **Est. gain:** `-0.5 to -0.8 ms/round` (**+1–2% N=1 decode**), 100% bit-exact BF16.
+- [x] **Column-Parallel Fused `hcWriteback + hcNormalize` for Decode (`n < 64`) — ANALYZED & CLOSED**
+  - **Finding:** `hcWriteback` runs column-parallel (`10` CTAs/row) to compute partial sums `pss[10]`, while `hcNormalize` requires the sum across all 10 column blocks before normalizing — so single-launch column-parallel fusion requires a grid sync (not faster than `fn_hc_normalize_cols`, which is already column-parallel at `0.7 ms` total). Patch `0013` (`fn_hcn_up1`) also eliminated `norm` reads from `W_up + hcDenseMix`.
 
 ---
 
