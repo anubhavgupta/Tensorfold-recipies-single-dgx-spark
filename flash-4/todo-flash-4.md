@@ -24,13 +24,8 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 
 ## 2. Long-Context Prefill (245K) — QSA + MXFP8 Attention (`318.3 ms` = 19.5% of chunk)
 
-- [ ] **SMEM-Compacted 2-Pass `fn_qsa_select` (`64.8 ms` @ 245K)**
-  - **Root cause:** Patch `0011` cut radix passes from 4 → 3 (`69.4 → 64.8 ms`), but `fn_qsa_select_body` still performs **5 full global reads** over `9.03 GB` of `SC[3072, 61250]` (`45.1 GB` total: 3 radix + count + write).
-  - **How to fix (100% bit-exact):**
-    1. **Global Pass 1:** Run the 11-bit top histogram (`shift = 21`, `2,048` bins, `__match_any_sync`) to find boundary bin `top11` and `cnt_eq`.
-    2. **Global Pass 2:** Stream `row` once more, compacting only the `< 4,096` candidates with `(k >> 21) >= top11` into **40 KiB SMEM** (`sh_k[4096]` + `sh_b[4096]`, keeping fallback to global passes if `> 4,096`).
-    3. **SMEM-only finish:** Run radix passes 1–2 (`shift = 10, 0`), exact tie-breaking (smallest block IDs for `== cut`), and a 512-element bitonic sort in SMEM to emit ascending block IDs with zero further global reads (cuts DRAM traffic `45.1 GB → 18.1 GB`).
-  - **Est. gain:** `-20 to -30 ms/chunk` (**-2.0 s** off 248K TTFT), 100% bit-exact.
+- [x] **SMEM-Compacted 2-Pass `fn_qsa_select` (`64.8 ms → 51.0 ms` @ 245K — SHIPPED in Patch `0011`)**
+  - **Verified:** Cut 245K `qsa_select` from `64.8 ms → 51.0 ms` (-13.8 ms/chunk), pushing **248K cold prefill to `125.85 s` (`1,966.4 tok/s`, -2.6 s)** and **65K to `2,074.7 tok/s`**. 120K needle byte-identical to BF16 (`sha ae38468a7f52`).
 
 - [ ] **Native Blackwell `mma.sync.aligned.kind::mxf8f6f4.block_scale` in `attn_core` (`182.4 ms` @ 245K)**
   - **Root cause:** Patch `0012` halved KV reads (`77 GB → 38.5 GB`, cutting `attn_core` `298 → 182.4 ms` @ ~211 GB/s = 77% peak), but (1) still runs software `kv8_convert` + SMEM roundtrip into `tiles_kv` with an extra `__syncthreads()`, and (2) holding both raw MXFP8 stage (`17.4 KB`) and BF16 `tiles_kv` (`26.6 KB`) raises SMEM to `44.0 KB`, dropping occupancy from `3 → 2 CTAs/SM`.
@@ -46,10 +41,8 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **Goal:** Either (a) **ExLlamaV3 default (`Prefill staging`)**: unpack each 6-bit dense `W_q` once per 3,072-row chunk into FP16 scratch and run native **FP16 cuBLAS `cublasGemmEx`** (FP32 acc, within 1–3% of native FP16), or (b) apply `exl3_prompt.cuh`'s 3-stage `cp.async` transposed SMEM design directly to 6-bit dense projections without writing unpacked weights to DRAM.
   - **Est. gain:** `-100 to -150 ms/chunk` (**+8–11% cold prefill**, toward `~2,250+ tok/s`), 100% lossless.
 
-- [ ] **Zero-Copy Strided Output (`y_stride` + `col` offset) in `tf_exl3_group_12_2` (Decode N=1)**
-  - **Root cause:** `cuda_exl3_lane.zig` currently writes stitched 6-bit decode projections (`gdn_proj`: `qkv + z`, `attn_proj`: `q + k + v`) into `exl3_tmp` and then launches **108 separate `copyCols` kernels per round** (`36 × 2` GDN + `12 × 3` Attn) to copy them into `pa`.
-  - **Goal:** Pass `y_stride = g.n` and `y_ptr = out + p.col * 2` directly into `LinearArgs` / `tf_exl3_group_12_2`, eliminating all 108 `copyCols` launches and `exl3_tmp` DRAM traffic.
-  - **Est. gain:** `-0.8 to -1.5 ms/round` (**+2–3% N=1 decode**), 100% bit-exact.
+- [x] **Zero-Copy Strided Output (`y_stride` + `col` offset) in `tf_exl3_group_12_2` (Decode N=1 — SHIPPED in Patch `0008`)**
+  - **Verified:** Eliminated all 108 `copyCols` launches and `exl3_tmp` traffic in decode (`TF_EXL3_GROUP_STRIDED=1`); consistent N=1 gain across all 4 workloads (`code 97.2→97.5`, `prose 53.0→53.2`, `devops 88.8→89.0`, `json 109.2→109.7` tok/s), 4/4 greedy & T=0.7 `draft_on == draft_off` bit-exact.
 
 - [ ] **Fuse EXL3 `rot_in` (`suh * FWHT128`) into `gdn_norm` (`GDN Out`, 36×)**
   - **Root cause:** `gdn_core` writes `gated_v [n, 6144]` BF16, then `gdn_out` launches a separate `tf_exl3_rot_in` kernel (`36` extra launches + `gated_v` roundtrip per pass) to rotate it into FP16 `xh`.
@@ -79,10 +72,8 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **Goal:** Evaluate a chunked WY Tensor-Core prefill formulation (preserving FP32 state updates across chunks) and test against 120K needle retrieval + greedy parity.
   - **Est. gain:** `-40 to -60 ms/chunk` (**+3–4% cold prefill**); note prefill rounding will differ slightly from step-by-step decode.
 
-- [ ] **Optional Startup `madvise(MADV_WILLNEED)` Pre-Fault for PLE N-Gram Table (`16.6 ms` cold 16K / `9.4 ms` 245K)**
-  - **Root cause:** Even with Patch `0011` (8-thread host gather), the very first cold prompt hits minor page faults on untouched mmap pages of the host n-gram table (`16.6 ms` vs `9.4 ms` warm).
-  - **Goal:** Add an opt-in startup pre-fault knob (only when host RAM headroom allows without squeezing KV cache) to eliminate first-request cold-fault spikes.
-  - **Est. gain:** `-5 to -7 ms` on first cold prompt chunk only (0.5% overall), 100% bit-exact.
+- [x] **Optional Startup `madvise(MADV_WILLNEED)` Pre-Fault for PLE N-Gram Table — TESTED & REJECTED**
+  - **Verified:** Built-in `TF_FLASHNEXT_TABLE_WARM=1` already implements `MADV_WILLNEED`, but warming the large host n-gram table causes unified-memory page-reclaim pressure on 128 GB GB10 at 245K context (`experts` spiked to `1,195 ms` on chunk 78). Keeping `TF_FLASHNEXT_TABLE_WARM=0` (8-thread `Gather.main` already keeps `ple` at `9–15 ms` with zero memory pressure).
 
 ---
 

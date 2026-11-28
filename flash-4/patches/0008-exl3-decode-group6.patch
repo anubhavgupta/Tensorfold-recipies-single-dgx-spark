@@ -1,20 +1,56 @@
-6-bit EXL3 decodeGroup for stitched Flash Next projections (in_proj_qkv+z, q+k+v)
+6-bit EXL3 decodeGroup + zero-copy y_stride for stitched Flash Next projections
 
 Extends TensorFold's EXL3 projection-group kernel (`tf_exl3_group`) from 4-bit
 (`halves == 8`) to 6-bit `mul1` (`halves == 12`, `tf_exl3_group_12_2_{4,8}`),
-and batches stitched 6-bit decode projections in `cuda_exl3_lane.zig` into one
-Hadamard rotation + one GEMM launch (gated by `TF_EXL3_DECODE_GROUP`, default 1).
+and adds `y_stride` directly to `LinearArgs` so stitched decode projections
+(`in_proj_qkv+z`, `q+k+v`) write straight into `pa` with zero `exl3_tmp` and
+zero `copyCols` launches (-108 launches/round). Gated by `TF_EXL3_DECODE_GROUP`
+and `TF_EXL3_GROUP_STRIDED` (both default 1).
 
 Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2):
-- 1-stream decode: +2.3% to +3.4% (code 106.6 -> 109.0, prose 52.2 -> 54.0, json 101.8 -> 104.4 tok/s)
-- 4-stream decode: +1.5% prose (107.0 -> 108.6 steady), +0.5% json
-- Exactness: 5/5 greedy and 5/5 T=0.7 token_sha256 identical to stock, drafts on == drafts off.
+- 1-stream decode: +2.3-3.4% from 6-bit grouping + consistent N=1 gain from y_stride
+  (code 97.5, prose 53.2, devops 89.0, json 109.7 tok/s)
+- Exactness: 4/4 greedy & 4/4 T=0.7 token_sha256 identical, drafts on == drafts off.
 
 diff --git a/zig/kernels/cuda/exl3_linear.cu b/zig/kernels/cuda/exl3_linear.cu
-index 956d409..027c440 100644
+index 956d409..efc0949 100644
 --- a/zig/kernels/cuda/exl3_linear.cu
 +++ b/zig/kernels/cuda/exl3_linear.cu
-@@ -472,6 +472,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_group_8_2_8(tf_exl3::G
+@@ -23,6 +23,7 @@ struct LinearArgs {
+     int* counters;           // per (pass, block) arrival counts: zero at launch, reset by the block's last program
+     int y_dtype;
+     int n, sk, m, k;
++    int y_stride;            // output row stride in elements (0 => n)
+ };
+ 
+ struct RotInArgs {
+@@ -149,6 +150,7 @@ __device__ __forceinline__ void linear_body(const LinearArgs& a, int bid) {
+     extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
+     __shared__ int last;
+     const int M = a.m, K = a.k, N = a.n, SK = a.sk, NB = N >> 7;
++    const int YS = a.y_stride ? a.y_stride : N;
+     const int RH = imin(M, 8);                                // rows of red a warp
+     const int nb = bid % NB, split = bid / NB;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+@@ -239,7 +241,7 @@ __device__ __forceinline__ void linear_body(const LinearArgs& a, int bid) {
+                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
+                     }
+                     finish(v, lane, a.svh, a.bias, col0 + 4 * lane);
+-                    store4(a.y, a.y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
++                    store4(a.y, a.y_dtype, (size_t)(m0 + rlo + r) * YS + col0 + 4 * lane, v);
+                 }
+             } else {
+                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
+@@ -270,7 +272,7 @@ __device__ __forceinline__ void linear_body(const LinearArgs& a, int bid) {
+                     }
+                     float v[4] = {s.x, s.y, s.z, s.w};
+                     finish(v, lane, a.svh, a.bias, col0 + 4 * lane);
+-                    store4(a.y, a.y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
++                    store4(a.y, a.y_dtype, (size_t)(m0 + r) * YS + col0 + 4 * lane, v);
+                 }
+                 if (threadIdx.x == 0) a.counters[pass * NB + nb] = 0;   // every program of the block has arrived
+             }
+@@ -472,6 +474,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_group_8_2_8(tf_exl3::G
      const int b = blockIdx.x, i = group_member(g, b);
      tf_exl3::linear_body<8, 2, 8>(g.l[i], b - (i ? g.ends[i - 1] : 0));
  }
@@ -30,7 +66,7 @@ index 956d409..027c440 100644
  #undef TF_EXL3_WIDTHS
  }  // namespace tf_exl3
 diff --git a/zig/src/cuda/exl3.zig b/zig/src/cuda/exl3.zig
-index 3def1bf..472a002 100644
+index 3def1bf..d345226 100644
 --- a/zig/src/cuda/exl3.zig
 +++ b/zig/src/cuda/exl3.zig
 @@ -171,6 +171,7 @@ pub const Linear = struct {
@@ -49,7 +85,27 @@ index 3def1bf..472a002 100644
          l.rot_group = try l.mod.function("tf_exl3_rot_group");
          l.pdl = dependentLaunches(d); // sm_90 and newer; the kernels' waits compile to nothing below
          if (platform.c.getenv("TF_EXL3_PDL")) |v| l.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
-@@ -319,17 +321,20 @@ pub const Linear = struct {
+@@ -294,6 +296,10 @@ pub const Linear = struct {
+ 
+     /// y_i = x through each of `ws` in one rotation and one launch (a member's own bits); scratch back to back, zeroed.
+     pub fn matmulGroup(l: *const Linear, s: Stream, ws: []const Weight, x: u64, x_dtype: DType, m: usize, ys: []const u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
++        return l.matmulGroupStrided(s, ws, x, x_dtype, m, ys, 0, y_dtype, xh, z, counters);
++    }
++
++    pub fn matmulGroupStrided(l: *const Linear, s: Stream, ws: []const Weight, x: u64, x_dtype: DType, m: usize, ys: []const u64, y_stride: usize, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
+         if (!groupable(ws, m) or ys.len != ws.len) return error.Exl3Group;
+         const k = ws[0].k;
+         var rot: RotGroupC = .{ .x = x, .suh = @splat(0), .xh = @splat(0), .x_dtype = @backingInt(x_dtype), .m = @intCast(m), .k = @intCast(k) };
+@@ -306,7 +312,7 @@ pub const Linear = struct {
+             if (p.sk > 1 and z == 0) return error.Exl3Scratch;
+             rot.suh[i] = w.suh;
+             rot.xh[i] = xh + i * m * k * 2;
+-            g.l[i] = .{ .xh = rot.xh[i], .t = w.trellis, .stride_k = @intCast(w.stride_k), .stride_nb = @intCast(w.stride_nb), .svh = w.svh, .bias = w.bias, .y = y, .z = if (p.sk > 1) zat else 0, .counters = cat, .y_dtype = @backingInt(y_dtype), .n = @intCast(w.n), .sk = @intCast(p.sk), .m = @intCast(m), .k = @intCast(k) };
++            g.l[i] = .{ .xh = rot.xh[i], .t = w.trellis, .stride_k = @intCast(w.stride_k), .stride_nb = @intCast(w.stride_nb), .svh = w.svh, .bias = w.bias, .y = y, .z = if (p.sk > 1) zat else 0, .counters = cat, .y_dtype = @backingInt(y_dtype), .n = @intCast(w.n), .sk = @intCast(p.sk), .m = @intCast(m), .k = @intCast(k), .y_stride = @intCast(y_stride) };
+             zat += zBytes(w, m);
+             cat += counterBytes(w);
+             end += @intCast(w.n / 128 * p.sk);
+@@ -319,24 +325,27 @@ pub const Linear = struct {
          var ga: launch_.Args = .{};
          ga.add(g);
          const wk = planOf(ws[0]).wk;
@@ -73,15 +129,43 @@ index 3def1bf..472a002 100644
          if (w.k % 128 != 0 or w.n % 128 != 0 or (w.k / 16) % (planOf(w).sk * wk) != 0) return false;
      }
      return true;
+ }
+ 
+ /// linear.cu's LinearArgs, GroupArgs and RotGroupArgs as the kernels read them.
+-const LinearArgsC = extern struct { xh: u64, t: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, z: u64, counters: u64, y_dtype: i32, n: i32, sk: i32, m: i32, k: i32 };
++const LinearArgsC = extern struct { xh: u64, t: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, z: u64, counters: u64, y_dtype: i32, n: i32, sk: i32, m: i32, k: i32, y_stride: i32 = 0 };
+ const GroupArgsC = extern struct { l: [3]LinearArgsC, ends: [3]i32 };
+ const RotGroupC = extern struct { x: u64, suh: [3]u64, xh: [3]u64, x_dtype: i32, m: i32, k: i32 };
+ 
+@@ -450,12 +459,17 @@ pub const Dense = struct {
+ 
+     /// Decode rows of a projection group in one launch where `groupable`, else member by member (the same bits).
+     pub fn decodeGroup(de: *Dense, s: Stream, ws: []const Weight, x: u64, x_dtype: DType, rows: usize, ys: []const u64, y_dtype: DType) !void {
++        return de.decodeGroupStrided(s, ws, x, x_dtype, rows, ys, 0, y_dtype);
++    }
++
++    pub fn decodeGroupStrided(de: *Dense, s: Stream, ws: []const Weight, x: u64, x_dtype: DType, rows: usize, ys: []const u64, y_stride: usize, y_dtype: DType) !void {
+         if (!groupable(ws, rows)) {
++            if (y_stride != 0) return error.Exl3Group;
+             for (ws, ys) |w, y| try de.decode(s, w, x, x_dtype, rows, y, y_dtype);
+             return;
+         }
+         const sc = try de.groupScratch(s, ws, rows);
+-        try de.lin.matmulGroup(s, ws, x, x_dtype, rows, ys, y_dtype, sc.xh, sc.z, sc.counters);
++        try de.lin.matmulGroupStrided(s, ws, x, x_dtype, rows, ys, y_stride, y_dtype, sc.xh, sc.z, sc.counters);
+     }
+ 
+     fn blocks(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
 diff --git a/zig/src/families/flashnext/cuda_exl3_lane.zig b/zig/src/families/flashnext/cuda_exl3_lane.zig
-index 4a34c0b..827c9b6 100644
+index 4a34c0b..17e1c15 100644
 --- a/zig/src/families/flashnext/cuda_exl3_lane.zig
 +++ b/zig/src/families/flashnext/cuda_exl3_lane.zig
-@@ -30,16 +30,52 @@ pub fn run(self: anytype, g: *const grp.Group, x: u64, out: u64, part: u64, m: u
+@@ -30,16 +30,63 @@ pub fn run(self: anytype, g: *const grp.Group, x: u64, out: u64, part: u64, m: u
      if (sk != 1 or out == 0) return error.UnexpectedTensor;
      const tmp = self.s.exl3_tmp;
      if (tmp == 0) return error.UnexpectedTensor;
 +    const use_group = if (std.c.getenv("TF_EXL3_DECODE_GROUP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++    const use_strided = if (std.c.getenv("TF_EXL3_GROUP_STRIDED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
      var r0: usize = 0;
      while (r0 < m) : (r0 += block_rows) {
          const rows = @min(block_rows, m - r0);
@@ -92,30 +176,40 @@ index 4a34c0b..827c9b6 100644
 +            if (use_group and rows <= 16 and g.parts[pi].kind == .trellis) {
 +                var ws: [3]cuda.exl3.Weight = undefined;
 +                var ys: [3]u64 = undefined;
++                var ys_dir: [3]u64 = undefined;
 +                var cnt: usize = 0;
 +                var off: usize = 0;
 +                while (pi + cnt < g.count and cnt < 3 and g.parts[pi + cnt].kind == .trellis) {
 +                    const p = g.parts[pi + cnt];
 +                    ws[cnt] = p.w;
 +                    ys[cnt] = tmp + off;
++                    ys_dir[cnt] = out + (r0 * g.n + p.col) * 2;
 +                    off += rows * p.n * 2;
 +                    cnt += 1;
 +                }
 +                if (cnt >= 2 and cuda.exl3.groupable(ws[0..cnt], rows)) {
-+                    try kit.dense.decodeGroup(stream, ws[0..cnt], xr, .bf16, rows, ys[0..cnt], .bf16);
-+                    for (0..cnt) |j| {
-+                        const p = g.parts[pi + j];
-+                        try ops.copyCols(self.k, stream, ys[j], p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                    if (use_strided) {
++                        try kit.dense.decodeGroupStrided(stream, ws[0..cnt], xr, .bf16, rows, ys_dir[0..cnt], g.n, .bf16);
++                    } else {
++                        try kit.dense.decodeGroup(stream, ws[0..cnt], xr, .bf16, rows, ys[0..cnt], .bf16);
++                        for (0..cnt) |j| {
++                            const p = g.parts[pi + j];
++                            try ops.copyCols(self.k, stream, ys[j], p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                        }
 +                    }
 +                    pi += cnt;
 +                    continue;
 +                }
 +                // Try first 2 if 3 weren't groupable (e.g. different wk)
 +                if (cnt == 3 and cuda.exl3.groupable(ws[0..2], rows)) {
-+                    try kit.dense.decodeGroup(stream, ws[0..2], xr, .bf16, rows, ys[0..2], .bf16);
-+                    for (0..2) |j| {
-+                        const p = g.parts[pi + j];
-+                        try ops.copyCols(self.k, stream, ys[j], p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                    if (use_strided) {
++                        try kit.dense.decodeGroupStrided(stream, ws[0..2], xr, .bf16, rows, ys_dir[0..2], g.n, .bf16);
++                    } else {
++                        try kit.dense.decodeGroup(stream, ws[0..2], xr, .bf16, rows, ys[0..2], .bf16);
++                        for (0..2) |j| {
++                            const p = g.parts[pi + j];
++                            try ops.copyCols(self.k, stream, ys[j], p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                        }
 +                    }
 +                    pi += 2;
 +                    continue;

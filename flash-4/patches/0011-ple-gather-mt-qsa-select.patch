@@ -1,19 +1,20 @@
-Multi-threaded PLE n-gram gather, 3-pass QSA select, and granular profile markers
+Multi-threaded PLE n-gram gather, 2-pass SMEM-compacted QSA select, and granular profile markers
 
 1. Parallelizes host PLE n-gram gather (`Gather.main` in `cuda_batch_state.zig`) across
    8 CPU threads for prompt chunks >= 512 rows, cutting `ple` GPU stall from 155.7 ms ->
    16.6 ms on 16K prefill and 35.2 ms -> 9.3 ms on 245K prefill (100% bit-exact).
-2. Upgrades `fn_qsa_select_body` (`flashnext_batch.cu`) from 4-pass 8-bit radix to 3-pass
-   11+11+10-bit radix with `__match_any_sync` warp-aggregated SMEM atomics, cutting 245K
-   `qsa_select` from 69.4 ms -> 64.5 ms (100% bit-exact).
+2. Upgrades `fn_qsa_select_body` (`flashnext_batch.cu`) to 2-global-pass SMEM-compacted
+   radix select (11-bit top pass + compact <=4096 candidates into 40 KiB SMEM + SMEM
+   passes 1-2 + exact tie-breaking + 512-element bitonic sort), cutting 245K `qsa_select`
+   from 69.4 ms -> 51.0 ms and 248K cold prefill from 128.45s -> 125.85s (1,966.4 tok/s).
 3. Adds granular `attn_sub` (prep/pool/score/select/core/gate) and `exp_prompt`
    (routed4/shared6) timing lines under `TF_FLASHNEXT_PROFILE=1`.
 
 diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
-index c52f183..e3d1bbc 100644
+index c52f183..689673f 100644
 --- a/zig/kernels/cuda/flashnext_batch.cu
 +++ b/zig/kernels/cuda/flashnext_batch.cu
-@@ -451,11 +451,60 @@ __device__ __forceinline__ void fn_qsa_bin_cut(const int* hist, int need, uint32
+@@ -451,11 +451,63 @@ __device__ __forceinline__ void fn_qsa_bin_cut(const int* hist, int need, uint32
      }
  }
  
@@ -67,44 +68,230 @@ index c52f183..e3d1bbc 100644
 +    }
 +}
 +
-+// attention._select and _select_tiles, a row a block: 3-pass (11+11+10 bit) radix with warp-aggregated atomics.
++// attention._select and _select_tiles, a row a block: 2-global-pass SMEM-compacted radix select (100% bit-exact).
  __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc, const int* __restrict__ pos0,
                                                     int* __restrict__ ids, int* __restrict__ nkr, int* __restrict__ spr,
                                                     int nb, int idw, int top, int ratio) {
 -    __shared__ int hist[256];
++    constexpr int MAX_CAND = 4096;
 +    __shared__ int hist[2048];
++    __shared__ uint32_t sh_k[MAX_CAND];
++    __shared__ int sh_b[MAX_CAND];
      __shared__ int warp_sums[32];
      __shared__ uint32_t cut_s;
      __shared__ int need_s;
-@@ -474,11 +523,18 @@ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc,
-     uint32_t cut = 0;
-     int need = top;
+@@ -471,14 +523,199 @@ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc,
+     }
+     const float* row = sc + static_cast<long long>(r) * nb;
+     int* out = ids + static_cast<long long>(r) * idw;
+-    uint32_t cut = 0;
+-    int need = top;
      const int lane = threadIdx.x & 31;
 -    for (int p = 0; p < 4; ++p) {
 -        const int shift = 24 - 8 * p;
 -        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
-+    constexpr int shifts[3] = {21, 10, 0};
-+    constexpr int nbins_arr[3] = {2048, 2048, 1024};
-+    constexpr uint32_t masks[3] = {0x7FFu, 0x7FFu, 0x3FFu};
-+    constexpr int pref_shifts[3] = {32, 21, 10};
-+    for (int p = 0; p < 3; ++p) {
-+        const int shift = shifts[p];
-+        const int nbins = nbins_arr[p];
++    const int warps = static_cast<int>(blockDim.x) >> 5, warp = threadIdx.x >> 5;
++    const unsigned below = (1u << lane) - 1u;
++
++    // Global Pass 1: 11-bit top radix (bits 31..21, 2048 bins) with warp-aggregated atomics.
++    for (int i = threadIdx.x; i < 2048; i += blockDim.x) hist[i] = 0;
++    __syncthreads();
++    constexpr int U = 8;
++    for (int b0 = 0; b0 < complete; b0 += U * blockDim.x) {
++        float v[U];
++#pragma unroll
++        for (int u = 0; u < U; ++u) {
++            const int b = b0 + u * blockDim.x + threadIdx.x;
++            v[u] = b < complete ? row[b] : 0.0f;
++        }
++#pragma unroll
++        for (int u = 0; u < U; ++u) {
++            const int b = b0 + u * blockDim.x + threadIdx.x;
++            const bool active = b < complete;
++            const unsigned amask = __ballot_sync(0xffffffffu, active);
++            if (active) {
++                const uint32_t bin = fn_qsa_key(v[u]) >> 21;
++                const unsigned same = __match_any_sync(amask, bin);
++                if (__ffs(same) - 1 == lane) atomicAdd(&hist[bin], __popc(same));
++            }
++        }
++    }
++    __syncthreads();
++    fn_qsa_bin_cut_wide(hist, 2048, top, 0u, 21, &cut_s, &need_s, warp_sums);
++    __syncthreads();
++    uint32_t cut = cut_s;
++    int need = need_s;
++    const uint32_t top11 = cut >> 21;
++    const int cnt_eq = hist[top11];
++    const int cnt_above = top - need;
++    __syncthreads();
++
++    // Fast path: if all candidates with (k >> 21) >= top11 fit in SMEM (<= 4096), compact in ONE global pass!
++    if (cnt_above + cnt_eq <= MAX_CAND) {
++        if (threadIdx.x == 0) hist[0] = 0;
++        __syncthreads();
++        for (int b0 = 0; b0 < complete; b0 += U * blockDim.x) {
++            float v[U];
++#pragma unroll
++            for (int u = 0; u < U; ++u) {
++                const int b = b0 + u * blockDim.x + threadIdx.x;
++                v[u] = b < complete ? row[b] : 0.0f;
++            }
++#pragma unroll
++            for (int u = 0; u < U; ++u) {
++                const int b = b0 + u * blockDim.x + threadIdx.x;
++                const uint32_t k = b < complete ? fn_qsa_key(v[u]) : 0u;
++                const bool keep = b < complete && (k >> 21) >= top11;
++                const unsigned mask = __ballot_sync(0xffffffffu, keep);
++                if (mask) {
++                    int base = 0;
++                    if (lane == 0) base = atomicAdd(&hist[0], __popc(mask));
++                    base = __shfl_sync(0xffffffffu, base, 0);
++                    if (keep) {
++                        const int idx = base + __popc(mask & below);
++                        sh_k[idx] = k;
++                        sh_b[idx] = b;
++                    }
++                }
++            }
++        }
++        __syncthreads();
++        const int n_cand = hist[0];
++        constexpr int shifts2[2] = {10, 0};
++        constexpr int nbins2[2] = {2048, 1024};
++        constexpr uint32_t masks2[2] = {0x7FFu, 0x3FFu};
++        constexpr int pshifts2[2] = {21, 10};
++        for (int p = 0; p < 2; ++p) {
++            const int shift = shifts2[p], nbins = nbins2[p], pshift = pshifts2[p];
++            const uint32_t mask = masks2[p];
++            for (int i = threadIdx.x; i < nbins; i += blockDim.x) hist[i] = 0;
++            __syncthreads();
++            for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
++                const uint32_t k = sh_k[i];
++                if ((k >> pshift) == (cut >> pshift)) atomicAdd(&hist[(k >> shift) & mask], 1);
++            }
++            __syncthreads();
++            fn_qsa_bin_cut_wide(hist, nbins, need, cut, shift, &cut_s, &need_s, warp_sums);
++            __syncthreads();
++            cut = cut_s;
++            need = need_s;
++            __syncthreads();
++        }
++        if (threadIdx.x == 0) { hist[1024] = 0; hist[1025] = 0; }
++        __syncthreads();
++        for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
++            const uint32_t k = sh_k[i];
++            if (k > cut) {
++                const int pos = atomicAdd(&hist[1024], 1);
++                hist[pos] = sh_b[i];
++                sh_k[i] = 0u;
++            } else if (k == cut) {
++                atomicAdd(&hist[1025], 1);
++                sh_k[i] = 1u;
++            } else {
++                sh_k[i] = 0u;
++            }
++        }
++        __syncthreads();
++        const int n_gt = hist[1024];
++        const int n_eq_all = hist[1025];
++        if (n_eq_all <= need) {
++            for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
++                if (sh_k[i] == 1u) {
++                    const int pos = atomicAdd(&hist[1024], 1);
++                    hist[pos] = sh_b[i];
++                }
++            }
++        } else {
++            if (threadIdx.x == 0) hist[1026] = 0;
++            __syncthreads();
++            int my_b[4];
++            int my_c = 0;
++            for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
++                if (sh_k[i] == 1u) my_b[my_c++] = sh_b[i];
++            }
++            __syncthreads();
++            for (int c = 0; c < my_c; ++c) {
++                const int pos = atomicAdd(&hist[1026], 1);
++                sh_k[pos] = static_cast<uint32_t>(my_b[c]);
++            }
++            __syncthreads();
++            int pow2 = 1;
++            while (pow2 < n_eq_all) pow2 <<= 1;
++            for (int i = n_eq_all + threadIdx.x; i < pow2; i += blockDim.x) sh_k[i] = 0x7fffffffu;
++            __syncthreads();
++            for (int k = 2; k <= pow2; k <<= 1) {
++                for (int j = k >> 1; j > 0; j >>= 1) {
++                    for (int i = threadIdx.x; i < pow2; i += blockDim.x) {
++                        const int ixj = i ^ j;
++                        if (ixj > i) {
++                            const uint32_t a = sh_k[i], b = sh_k[ixj];
++                            if (((i & k) == 0 && a > b) || ((i & k) != 0 && a < b)) {
++                                sh_k[i] = b;
++                                sh_k[ixj] = a;
++                            }
++                        }
++                    }
++                    __syncthreads();
++                }
++            }
++            for (int i = threadIdx.x; i < need; i += blockDim.x) hist[n_gt + i] = static_cast<int>(sh_k[i]);
++        }
++        __syncthreads();
++        int tpow2 = 1;
++        while (tpow2 < top) tpow2 <<= 1;
++        for (int i = top + threadIdx.x; i < tpow2; i += blockDim.x) hist[i] = 0x7fffffff;
++        __syncthreads();
++        for (int k = 2; k <= tpow2; k <<= 1) {
++            for (int j = k >> 1; j > 0; j >>= 1) {
++                for (int i = threadIdx.x; i < tpow2; i += blockDim.x) {
++                    const int ixj = i ^ j;
++                    if (ixj > i) {
++                        const int a = hist[i], b = hist[ixj];
++                        if (((i & k) == 0 && a > b) || ((i & k) != 0 && a < b)) {
++                            hist[i] = b;
++                            hist[ixj] = a;
++                        }
++                    }
++                }
++                __syncthreads();
++            }
++        }
++        for (int i = threadIdx.x; i < top; i += blockDim.x) {
++            const int b = hist[i];
++            for (int j = 0; j < ratio; ++j) out[i * ratio + j] = b * ratio + j;
++        }
++        if (threadIdx.x < ratio) {
++            const int tail = ratio * complete + threadIdx.x;
++            if (tail < end) out[top * ratio + threadIdx.x] = tail;
++        }
++        if (threadIdx.x == 0) {
++            nkr[r] = top * ratio + end - ratio * complete;
++            spr[r] = 1;
++        }
++        return;
++    }
++
++    // Fallback when > 4096 items fall in the boundary 11-bit bin.
++    constexpr int shifts[2] = {10, 0};
++    constexpr int nbins_arr[2] = {2048, 1024};
++    constexpr uint32_t masks[2] = {0x7FFu, 0x3FFu};
++    constexpr int pref_shifts[2] = {21, 10};
++    for (int p = 0; p < 2; ++p) {
++        const int shift = shifts[p], nbins = nbins_arr[p], pshift = pref_shifts[p];
 +        const uint32_t mask = masks[p];
-+        const int pshift = pref_shifts[p];
 +        for (int i = threadIdx.x; i < nbins; i += blockDim.x) hist[i] = 0;
          __syncthreads();
 -        constexpr int U = 8;  // a thread's keys in flight before their adds (one L2 wait a key was the pass's time)
-+        constexpr int U = 8;
          for (int b0 = 0; b0 < complete; b0 += U * blockDim.x) {
              float v[U];
  #pragma unroll
-@@ -490,11 +546,17 @@ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc,
+@@ -490,21 +727,25 @@ __device__ __forceinline__ void fn_qsa_select_body(const float* __restrict__ sc,
              for (int u = 0; u < U; ++u) {
                  const int b = b0 + u * blockDim.x + threadIdx.x;
                  const uint32_t k = fn_qsa_key(v[u]);
 -                if (b < complete && (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8)))) atomicAdd(&hist[(k >> shift) & 0xFF], 1);
-+                const bool active = b < complete && (p == 0 || (k >> pshift) == (cut >> pshift));
++                const bool active = b < complete && (k >> pshift) == (cut >> pshift);
 +                const unsigned amask = __ballot_sync(0xffffffffu, active);
 +                if (active) {
 +                    const uint32_t bin = (k >> shift) & mask;
@@ -119,6 +306,16 @@ index c52f183..e3d1bbc 100644
          __syncthreads();
          cut = cut_s;
          need = need_s;
+         __syncthreads();
+     }
+     // keys above the cut, then the first `need` equal ones in block order: a warp a run, ballots and two block scans
+-    const int warps = static_cast<int>(blockDim.x) >> 5, warp = threadIdx.x >> 5;
+     const int steps = (complete + 32 * warps - 1) / (32 * warps);
+     const int w0 = warp * steps * 32;
+-    const unsigned below = (1u << lane) - 1u;
+     int na = 0, ne = 0;
+     for (int st = 0; st < steps; ++st) {
+         const int b = w0 + st * 32 + lane;
 diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
 index 045cd0b..d8bfe34 100644
 --- a/zig/src/families/flashnext/cuda_batch.zig
