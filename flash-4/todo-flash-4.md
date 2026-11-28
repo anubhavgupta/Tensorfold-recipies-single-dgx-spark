@@ -37,12 +37,17 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 
 ---
 
-## 3. Short & Long Prefill — Dense 6-bit EXL3 (`432 ms` = 26–30% of chunk)
+## 3. Dense 6-bit EXL3 (`gdn_proj` + `gdn_out` + `attn_proj` + `attn_out`: `432 ms` prefill / `11.7 ms` N=1 decode)
 
-- [ ] **Custom 3-Stage `cp.async` Transposed 6-bit Dense Prompt Kernel (`gdn_proj` + `gdn_out` + `attn_proj` + `attn_out`)**
+- [ ] **Custom 3-Stage `cp.async` Transposed 6-bit Dense Prompt Kernel (Prefill)**
   - **Root cause:** `exl3_linear_wc` runs in 128-row blocks (24× weight re-reads per 3,072-row chunk, ALU-bound on 6-bit trellis decode). Unpacking to DRAM BF16 + `qmmf` was slower (`-3%` to `-7%`) due to 5.4 GB unpacked DRAM traffic.
-  - **Goal:** Apply the same transposed 3-stage `cp.async` SMEM design as `exl3_prompt.cuh` (Patch `0007`/`0010`) directly to 6-bit dense projections so each 6-bit weight tile is decoded once in SMEM/registers across 64+ rows without ever writing unpacked weights to DRAM.
-  - **Est. gain:** `-100 to -150 ms/chunk` (**+8–11% cold prefill**, toward `~2,250+ tok/s`).
+  - **Goal:** Apply the same transposed 3-stage `cp.async` SMEM design as `exl3_prompt.cuh` (Patch `0007`/`0010`) directly to 6-bit dense projections so each 6-bit weight tile is decoded once in SMEM/registers across 64–128 rows without ever writing unpacked weights to DRAM, and write directly into stitched output columns.
+  - **Est. gain:** `-100 to -150 ms/chunk` (**+8–11% cold prefill**, toward `~2,250+ tok/s`), 100% lossless.
+
+- [ ] **Zero-Copy Strided Output (`y_stride` + `col` offset) in `tf_exl3_group_12_2` (Decode N=1)**
+  - **Root cause:** `cuda_exl3_lane.zig` currently writes stitched 6-bit decode projections (`gdn_proj`: `qkv + z`, `attn_proj`: `q + k + v`) into `exl3_tmp` and then launches **108 separate `copyCols` kernels per round** (`36 × 2` GDN + `12 × 3` Attn) to copy them into `pa`.
+  - **Goal:** Pass `y_stride = g.n` and `y_ptr = out + p.col * 2` directly into `LinearArgs` / `tf_exl3_group_12_2`, eliminating all 108 `copyCols` launches and `exl3_tmp` DRAM traffic.
+  - **Est. gain:** `-0.8 to -1.5 ms/round` (**+2–3% N=1 decode**), 100% bit-exact.
 
 ---
 
