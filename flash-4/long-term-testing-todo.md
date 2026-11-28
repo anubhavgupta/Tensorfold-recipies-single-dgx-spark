@@ -11,3 +11,9 @@ Items moved here carry a potential quality tradeoff and require extended long-co
   - **Rationale:** 96 HCs read `1.27 GB` of BF16 weights on every decode round. Earlier 8-bit MXFP8 HC (`E4M3`, 3-bit mantissa) saved **-4.5 ms/round (+8–18% N=1 decode)**, proving bandwidth is the lever, but 3-bit mantissa across 96 residual-mixing steps broke 120K needle retrieval.
   - **Goal:** Prototype symmetric INT8 (7-bit mantissa = 16× finer precision than E4M3) with per-channel or group-32 FP32 scales, cutting `1.27 GB → 0.64 GB` (est. `-3.0 to -4.0 ms/round` / **+8–10% N=1 decode**).
   - **Validation gate:** **Must pass 120K & 248K needle retrieval (`FALCON-9472-OMEGA`)**, 5/5 greedy & T=0.7 `draft_on == draft_off` exactness, and zero prefill regression.
+
+- [ ] **Native Blackwell `mma.sync.aligned.kind::mxf8f6f4.block_scale` in `attn_core` (`182.4 ms` @ 245K)**
+  - **Rationale:** Quantizes `Q` to MXFP8 once per CTA and executes native `sm_121` block-scaled FP8 MMA directly on staged KV tiles (drops SMEM `44.0 KB → ~26 KB`, restoring 3 CTAs/SM, est. `-25 to -35 ms/chunk`). Requires custom PTX beyond `qmm_frag.cuh` and adds low-risk Q-side quantization.
+
+- [ ] **Chunked WY Tensor-Core `gdn_core` Prefill (`100.0 ms` @ 245K)**
+  - **Rationale:** Replaces step-by-step FP32 GDN prefill recurrence with chunked WY Tensor-Core form (est. `-40 to -60 ms/chunk`), altering prefill rounding vs decode.

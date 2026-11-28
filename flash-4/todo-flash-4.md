@@ -23,50 +23,39 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 - [x] **SMEM-Compacted 2-Pass `fn_qsa_select` (`64.8 ms → 51.0 ms` @ 245K — SHIPPED in Patch `0011`)**
   - **Verified:** Cut 245K `qsa_select` from `64.8 ms → 51.0 ms` (-13.8 ms/chunk), pushing **248K cold prefill to `125.85 s` (`1,966.4 tok/s`, -2.6 s)** and **65K to `2,074.7 tok/s`**. 120K needle byte-identical to BF16 (`sha ae38468a7f52`).
 
-- [ ] **Native Blackwell `mma.sync.aligned.kind::mxf8f6f4.block_scale` in `attn_core` (`182.4 ms` @ 245K)**
-  - **Root cause:** Patch `0012` halved KV reads (`77 GB → 38.5 GB`, cutting `attn_core` `298 → 182.4 ms` @ ~211 GB/s = 77% peak), but (1) still runs software `kv8_convert` + SMEM roundtrip into `tiles_kv` with an extra `__syncthreads()`, and (2) holding both raw MXFP8 stage (`17.4 KB`) and BF16 `tiles_kv` (`26.6 KB`) raises SMEM to `44.0 KB`, dropping occupancy from `3 → 2 CTAs/SM`.
-  - **How to fix:** Quantize the CTA's small `Q` tile to MXFP8 once at CTA start, and execute `mma.sync.aligned.kind::mxf8f6f4.block_scale` directly on staged `E4M3 + E8M0/32` KV tiles — eliminating `kv8_convert` and `tiles_kv`, dropping SMEM to `~26 KB` (restoring **3 CTAs/SM**), and doubling TC throughput.
-  - **Est. gain:** `-25 to -35 ms/chunk` (`182.4 → ~145–155 ms`, **-2.5 s** off 248K TTFT, >90% GB10 BW ceiling).
+- [x] **Native Blackwell `mma.sync.aligned.kind::mxf8f6f4.block_scale` in `attn_core` — MOVED TO `long-term-testing-todo.md`**
+  - **Finding:** TensorFold v1.3.5's PTX layer (`qmm_frag.cuh`) only exposes FP16/BF16 `mma16816`, and quantizing `Q` to MXFP8 adds low-risk Q-rounding for ~1.5% 248K gain now that 248K is already `119.78 s` (`2,067 tok/s`). Moved to `long-term-testing-todo.md`.
 
 ---
 
 ## 3. Dense 6-bit EXL3 (`gdn_proj` + `gdn_out` + `attn_proj` + `attn_out`: `432 ms` prefill / `11.7 ms` N=1 decode)
 
-- [ ] **ExLlamaV3-Style Dense Prefill Staging (`FP16 Unpack + cuBLAS` for `M = 3,072`) — OR Custom 3-Stage `cp.async` Transposed 6-bit Dense Prompt Kernel (Prefill)**
-  - **Root cause:** `exl3_linear_wc` runs in 128-row blocks (24× weight re-reads per 3,072-row chunk, ALU-bound on 6-bit trellis decode). Earlier Wave-3 `unpack + BF16 qmmf` was slower due to 1,024-row blocks and a layout mismatch.
-  - **Goal:** Either (a) **ExLlamaV3 default (`Prefill staging`)**: unpack each 6-bit dense `W_q` once per 3,072-row chunk into FP16 scratch and run native **FP16 cuBLAS `cublasGemmEx`** (FP32 acc, within 1–3% of native FP16), or (b) apply `exl3_prompt.cuh`'s 3-stage `cp.async` transposed SMEM design directly to 6-bit dense projections without writing unpacked weights to DRAM.
-  - **Est. gain:** `-100 to -150 ms/chunk` (**+8–11% cold prefill**, toward `~2,250+ tok/s`), 100% lossless.
+- [x] **ExLlamaV3-Style Dense Prefill Staging (`FP16 Unpack + cuBLASLt` for `M >= 256`) — SHIPPED in Patch `0014`**
+  - **Verified:** Unpacks `W_q` once per chunk into row-major FP16 (`tf_exl3_unpack_f16_nk_{12,8}_2`), runs cuBLASLt FP16→FP32 GEMM, and applies strided `tf_exl3_rot_out` directly into output columns (`TF_EXL3_PREFILL_CUBLAS=1`).
+  - **Results:** Cold prefill 4K / 16K / 65K / 248K jumped **`2,064 / 2,123 / 2,086 / 2,067 tok/s`** (**248K TTFT `126.95 s → 119.78 s`**, **-7.17 s / +6.0%**, cumulative **-110.0 s** vs pre-Wave-1 `229.7 s`!). **120K needle (`ae38468a7f52`) & 4K long prompt (`3ac5af9f7e45`) 100% byte-identical to BF16**, 4/4 greedy & T=0.7 `draft_on == draft_off` exact.
 
 - [x] **Zero-Copy Strided Output (`y_stride` + `col` offset) in `tf_exl3_group_12_2` (Decode N=1 — SHIPPED in Patch `0008`)**
   - **Verified:** Eliminated all 108 `copyCols` launches and `exl3_tmp` traffic in decode (`TF_EXL3_GROUP_STRIDED=1`); consistent N=1 gain across all 4 workloads (`code 97.2→97.5`, `prose 53.0→53.2`, `devops 88.8→89.0`, `json 109.2→109.7` tok/s), 4/4 greedy & T=0.7 `draft_on == draft_off` bit-exact.
 
-- [ ] **Fuse EXL3 `rot_in` (`suh * FWHT128`) into `gdn_norm` (`GDN Out`, 36×)**
-  - **Root cause:** `gdn_core` writes `gated_v [n, 6144]` BF16, then `gdn_out` launches a separate `tf_exl3_rot_in` kernel (`36` extra launches + `gated_v` roundtrip per pass) to rotate it into FP16 `xh`.
-  - **Goal:** Fuse `suh * FWHT128` directly into the end of `gdn_norm` so `gdn_out` consumes pre-rotated FP16 `xh` immediately (same pattern can also fuse `attn_gate` + `rot_in` for `attn_out`).
-  - **Est. gain:** `-0.3 to -0.5 ms/round` in N=1 decode and `~-5 ms/chunk` in prefill, 100% bit-exact.
+- [x] **Fuse EXL3 `rot_in` (`suh * FWHT128`) into `gdn_norm` (`GDN Out`, 36×) — ANALYZED & CLOSED**
+  - **Finding:** Decode already uses TensorFold's fused `flashnext_gdn_fused.cuh` chain (not standalone `fn_gdn_norm`), and in prefill `rot_in` is `< 0.2%` of chunk time after Patch `0014`.
 
 ---
 
 ## 4. MoE Routed 512×4-bit EXL3 (`453 ms` prefill / `16.5 ms` N=1 decode)
 
-- [ ] **Eliminate Split-K `z` Partials / Fuse `up` Finish + SwiGLU + `down rot_in` on Decode (`n <= 16`)**
-  - **Root cause:** In N=1 decode (`16.5 ms` @ ~185–200 GB/s vs N=4's 236 GB/s), `~2.8 ms` (17% of experts) is spent in 4 separate small rotation & split-K finish launches per layer (`192` launches/round) plus fp32 `z` partial write/read.
-  - **Goal:** Eliminate split-K `z` partials via in-block/cluster reduction and fuse `up` finish + SwiGLU + `down rot_in` directly on decode (`n <= 16`).
-  - **Est. gain:** `-1.5 to -2.5 ms/round` (**+3–5% N=1 decode**), 100% bit-exact.
+- [x] **Eliminate Split-K `z` Partials / Fuse `up` Finish + SwiGLU + `down rot_in` on Decode (`n <= 16`) — ANALYZED & CLOSED**
+  - **Finding:** `exl3_grouped.zig` already uses `plan_finish_after` on decode; N=4 `experts` is at **236 GB/s (86% peak)** and N=1 is dominated by weight reads.
 
-- [ ] **EXL3 `exl3_prompt.cuh` Instruction-Scheduling & Fusion Tuning (Prefill, Stay on EXL3)**
-  - **Root cause:** Without leaving EXL3 4.05 bpw (avoiding double-quantization), `exl3_prompt.cuh` (`453 ms` @ 245K) runs at `~48 eff. TFLOPS` where 4-bit trellis bit-unpacking + `mul1` `__dp4a` codebook ALU shares cycles with FP16 MMA.
-  - **Goal:** Profile and tune inner-loop `mul1` decode instruction scheduling / `rot_in` fusion in `exl3_prompt.cuh` while staying 100% on EXL3.
-  - **Est. gain:** Modest `~5–10%` on `routed4` (`-20 to -45 ms/chunk`), 100% bit-exact.
+- [x] **EXL3 `exl3_prompt.cuh` Instruction-Scheduling & Fusion Tuning (Prefill, Stay on EXL3) — ANALYZED & CLOSED**
+  - **Finding:** Confirmed via `Zeuss5/cuda-exl3` Blackwell benchmarks that `exl3_prompt.cuh` (3-stage `cp.async`, 64-pair tiles, Patch `0007`+`0010`) is already EXL3 state-of-the-art, limited by EXL3's ~74-instruction/8-weight trellis math.
 
 ---
 
 ## 5. Lower-Priority / Exploratory Prefill Items (from `architecture-3d.html`)
 
-- [ ] **Chunked WY Tensor-Core `gdn_core` Prefill (`100.0 ms` = 6.1% @ 245K / 7.0% @ 16K)**
-  - **Root cause:** `gdn_prefill.cu` runs exact step-by-step FP32 recurrence across 3,072 rows (`2.77 ms/layer × 36 layers = 100 ms`) to match decode rounding bit-for-bit.
-  - **Goal:** Evaluate a chunked WY Tensor-Core prefill formulation (preserving FP32 state updates across chunks) and test against 120K needle retrieval + greedy parity.
-  - **Est. gain:** `-40 to -60 ms/chunk` (**+3–4% cold prefill**); note prefill rounding will differ slightly from step-by-step decode.
+- [x] **Chunked WY Tensor-Core `gdn_core` Prefill — MOVED TO `long-term-testing-todo.md`**
+  - **Finding:** Alters FP32 recurrence rounding vs step-by-step decode for ~3% prefill now that 248K is already `119.78 s` (`2,067 tok/s`). Moved to `long-term-testing-todo.md`.
 
 - [x] **Optional Startup `madvise(MADV_WILLNEED)` Pre-Fault for PLE N-Gram Table — TESTED & REJECTED**
   - **Verified:** Built-in `TF_FLASHNEXT_TABLE_WARM=1` already implements `MADV_WILLNEED`, but warming the large host n-gram table causes unified-memory page-reclaim pressure on 128 GB GB10 at 245K context (`experts` spiked to `1,195 ms` on chunk 78). Keeping `TF_FLASHNEXT_TABLE_WARM=0` (8-thread `Gather.main` already keeps `ple` at `9–15 ms` with zero memory pressure).

@@ -1,0 +1,356 @@
+ExLlamaV3-style FP16 prefill staging (unpack W_f16 once + cuBLASLt FP32-acc GEMM + strided rotOut)
+
+For dense 4- and 6-bit mul1 EXL3 projections on prefill chunks (m >= 256), unpacks
+`W_q` ONCE per chunk into row-major FP16 (`tf_exl3_unpack_f16_nk_{12,8}_2`), rotates
+inputs to FP16 (`tf_exl3_rot_in`), runs NVIDIA cuBLASLt FP16->FP32 GEMM (`cublaslt.Linear`),
+and applies `tf_exl3_rot_out` (`FWHT128 * HAD_SCALE * svh + bias` in FP32) writing directly
+into strided output columns (`y_stride = g.n`, eliminating `copyCols` on prefill too).
+Gated by `TF_EXL3_PREFILL_CUBLAS` (default 1; `0` restores `exl3_linear_wc`).
+
+Verified on GB10 (Qwen3.8-Flash-Next EXL3 4.05bpw + DFlash2 + MXFP8 KV):
+- Cold prefill 4K / 16K / 65K / 248K:
+  1,968 / 2,003 / 2,044 / 1,951 -> 2,064 / 2,123 / 2,086 / 2,067 tok/s
+  (248K TTFT 126.95 s -> 119.78 s, -7.17 s / +6.0%; cumulative -110.0 s vs pre-Wave-1 229.7 s!)
+- Exactness: 120K needle byte-identical to BF16 (sha ae38468a7f52, FALCON-9472-OMEGA),
+  4K long prompt byte-identical to BF16 stock (sha 3ac5af9f7e45), 4/4 greedy & T=0.7
+  drafts on == drafts off exact.
+
+diff --git a/zig/kernels/cuda/exl3_linear.cu b/zig/kernels/cuda/exl3_linear.cu
+index efc0949..e97ba07 100644
+--- a/zig/kernels/cuda/exl3_linear.cu
++++ b/zig/kernels/cuda/exl3_linear.cu
+@@ -482,6 +482,58 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_group_12_2_8(tf_exl3::
+     const int b = blockIdx.x, i = group_member(g, b);
+     tf_exl3::linear_body<12, 2, 8>(g.l[i], b - (i ? g.ends[i - 1] : 0));
+ }
++
++// ExLlamaV3-style prefill staging: unpack EXL3 trellis [K/16, N/16] into row-major W_f16 [N, K] for cuBLASLt FP16 GEMM.
++template <int K2, int CB>
++__device__ __forceinline__ void unpack_f16_nk_body(const uint32_t* __restrict__ t, long long stride_k, long long stride_nb,
++                                                   half* __restrict__ out, int K, int N) {
++    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
++    const int tn = blockIdx.x, tk = blockIdx.y, lane = threadIdx.x;
++    const int nb = tn >> 3, j_in_nb = tn & 7;
++    const uint32_t* tile = t + nb * stride_nb + (long long)tk * stride_k + j_in_nb * TW;
++    uint32_t w[LW];
++    ldg_lane_words<K2>(tile, lane, w);
++    uint32_t b0[2], b1[2];
++    decode_lane<K2, CB>(w, lane, b0, b1);
++    const half2 h0 = *reinterpret_cast<const half2*>(&b0[0]);
++    const half2 h1 = *reinterpret_cast<const half2*>(&b0[1]);
++    const half2 h2 = *reinterpret_cast<const half2*>(&b1[0]);
++    const half2 h3 = *reinterpret_cast<const half2*>(&b1[1]);
++    const half hv[8] = {__low2half(h0), __high2half(h0), __low2half(h1), __high2half(h1),
++                        __low2half(h2), __high2half(h2), __low2half(h3), __high2half(h3)};
++    __shared__ __align__(16) half sh[16][24];
++#pragma unroll
++    for (int j = 0; j < 8; ++j) sh[value_col(lane, j)][value_row(lane, j)] = hv[j];
++    __syncwarp();
++    const int r = lane >> 1, c8 = (lane & 1) * 8;
++    *reinterpret_cast<uint4*>(out + (size_t)(tn * 16 + r) * K + tk * 16 + c8) = *reinterpret_cast<const uint4*>(&sh[r][c8]);
++}
++
++extern "C" __global__ void __launch_bounds__(32)
++    tf_exl3_unpack_f16_nk_12_2(const uint32_t* __restrict__ t, long long stride_k, long long stride_nb,
++                               half* __restrict__ out, int K, int N) {
++    unpack_f16_nk_body<12, CB_MUL1>(t, stride_k, stride_nb, out, K, N);
++}
++
++extern "C" __global__ void __launch_bounds__(32)
++    tf_exl3_unpack_f16_nk_8_2(const uint32_t* __restrict__ t, long long stride_k, long long stride_nb,
++                              half* __restrict__ out, int K, int N) {
++    unpack_f16_nk_body<8, CB_MUL1>(t, stride_k, stride_nb, out, K, N);
++}
++
++// Post-rotation of Z [M, N] (fp32) by H / sqrt(128) * svh + bias -> Y [M, y_stride] (bf16 or fp32).
++extern "C" __global__ void __launch_bounds__(32)
++    tf_exl3_rot_out(const void* __restrict__ z, void* __restrict__ y, const half* __restrict__ svh,
++                    const half* __restrict__ bias, int in_dtype, int out_dtype, int m, int n, int y_stride) {
++    const int row = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
++    if (row >= m) return;
++    const int col = blk * 128 + 4 * lane;
++    const int ys = y_stride ? y_stride : n;
++    float v[4];
++    load4(z, in_dtype, (size_t)row * n + col, v);
++    finish(v, lane, svh, bias, col);
++    store4(y, out_dtype, (size_t)row * ys + col, v);
++}
+ #undef TF_EXL3_CODEBOOK
+ #undef TF_EXL3_WIDTHS
+ }  // namespace tf_exl3
+diff --git a/zig/src/cuda/exl3.zig b/zig/src/cuda/exl3.zig
+index d345226..c75cf55 100644
+--- a/zig/src/cuda/exl3.zig
++++ b/zig/src/cuda/exl3.zig
+@@ -173,6 +173,9 @@ pub const Linear = struct {
+     group: [2]Function = undefined, // tf_exl3_group_8_2_{4,8}: projection groups of 4-bit mul1 layers
+     group6: [2]Function = undefined, // tf_exl3_group_12_2_{4,8}: projection groups of 6-bit mul1 layers
+     rot_group: Function = undefined,
++    unpack12: Function = undefined, // tf_exl3_unpack_f16_nk_12_2
++    unpack8: Function = undefined, // tf_exl3_unpack_f16_nk_8_2
++    rot_out: Function = undefined, // tf_exl3_rot_out
+     wc: [wc_variants.len]Function = undefined,
+     /// 17-128 rows of 4- and 6-bit mul1 layers on linear_wc (false: the mid-M kernels; the same bits either way).
+     use_wc: bool = true,
+@@ -201,6 +204,9 @@ pub const Linear = struct {
+         l.group = .{ try l.mod.function("tf_exl3_group_8_2_4"), try l.mod.function("tf_exl3_group_8_2_8") };
+         l.group6 = .{ try l.mod.function("tf_exl3_group_12_2_4"), try l.mod.function("tf_exl3_group_12_2_8") };
+         l.rot_group = try l.mod.function("tf_exl3_rot_group");
++        l.unpack12 = try l.mod.function("tf_exl3_unpack_f16_nk_12_2");
++        l.unpack8 = try l.mod.function("tf_exl3_unpack_f16_nk_8_2");
++        l.rot_out = try l.mod.function("tf_exl3_rot_out");
+         l.pdl = dependentLaunches(d); // sm_90 and newer; the kernels' waits compile to nothing below
+         if (platform.c.getenv("TF_EXL3_PDL")) |v| l.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+         return l;
+@@ -419,6 +425,47 @@ pub const Dense = struct {
+         };
+     }
+ 
++    /// Unpack a 4- or 6-bit mul1 EXL3 weight into row-major W_f16 [n, k] for cuBLASLt FP16 prefill GEMM.
++    pub fn unpackToF16(de: *Dense, s: Stream, w: Weight, out_f16: u64) !void {
++        if (w.codebook != .mul1 or (w.halves != 12 and w.halves != 8)) return error.UnsupportedExl3Width;
++        var a: launch_.Args = .{};
++        a.add(w.trellis);
++        a.add(@as(i64, @intCast(w.stride_k)));
++        a.add(@as(i64, @intCast(w.stride_nb)));
++        a.add(out_f16);
++        a.add(@as(i32, @intCast(w.k)));
++        a.add(@as(i32, @intCast(w.n)));
++        const f = if (w.halves == 12) de.lin.unpack12 else de.lin.unpack8;
++        try launch_.launch(f, .{ .grid = .{ .x = w.n / 16, .y = w.k / 16, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++    }
++
++    /// Rotate x [m, k] by suh * H / sqrt(128) into xh [m, k] fp16 using tf_exl3_rot_in.
++    pub fn rotInF16(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, xh_f16: u64) !void {
++        var r: launch_.Args = .{};
++        r.add(x);
++        r.add(w.suh);
++        r.add(xh_f16);
++        r.add(@as(i32, @backingInt(x_dtype)));
++        r.add(@as(i32, @intCast(m)));
++        r.add(@as(i32, @intCast(w.k)));
++        try launch_.launch(de.lin.rot_in, .{ .grid = .{ .x = @intCast((w.k / 128 + 3) / 4), .y = @intCast(m), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &r);
++    }
++
++    /// In-place post-rotation of y [m, n] (in_dtype -> out_dtype) by H / sqrt(128) * svh + bias.
++    pub fn rotOut(de: *Dense, s: Stream, w: Weight, z: u64, y: u64, in_dtype: DType, out_dtype: DType, m: usize, y_stride: usize) !void {
++        var a: launch_.Args = .{};
++        a.add(z);
++        a.add(y);
++        a.add(w.svh);
++        a.add(w.bias);
++        a.add(@as(i32, @intCast(@backingInt(in_dtype))));
++        a.add(@as(i32, @intCast(@backingInt(out_dtype))));
++        a.add(@as(i32, @intCast(m)));
++        a.add(@as(i32, @intCast(w.n)));
++        a.add(@as(i32, @intCast(y_stride)));
++        try launch_.launch(de.lin.rot_out, .{ .grid = .{ .x = w.n / 128, .y = @intCast(m), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++    }
++
+     /// Decode rows: one call (the kernel takes 1..128), any count above in 128-row blocks.
+     pub fn decode(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
+         if (de.implementation == .tiles) return de.tiles(s, w, x, x_dtype, rows, y, y_dtype, false);
+diff --git a/zig/src/families/flashnext/cuda_exl3_kit.zig b/zig/src/families/flashnext/cuda_exl3_kit.zig
+index b939db9..d06785c 100644
+--- a/zig/src/families/flashnext/cuda_exl3_kit.zig
++++ b/zig/src/families/flashnext/cuda_exl3_kit.zig
+@@ -2,6 +2,14 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ 
++const PlanEntry = struct {
++    m: u64,
++    n: u64,
++    k: u64,
++    out_f32: bool,
++    plan: cuda.cublaslt.Linear,
++};
++
+ pub const Kit = struct {
+     gpa: std.mem.Allocator,
+     dense: cuda.exl3.Dense,
+@@ -9,6 +17,13 @@ pub const Kit = struct {
+     grouped: cuda.exl3_grouped.Grouped,
+     prompt_fast: bool = true,
+     prompt_shared: bool = true,
++    prefill_cublas: bool = true,
++    lt: ?cuda.cublaslt.Library = null,
++    lt_plans: std.ArrayList(PlanEntry) = .empty,
++    cublas_ws: ?cuda.DeviceBuffer = null,
++    unpack_w: ?cuda.DeviceBuffer = null,
++    unpack_x: ?cuda.DeviceBuffer = null,
++    unpack_z: ?cuda.DeviceBuffer = null,
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver) !*Kit {
+         const k = try gpa.create(Kit);
+@@ -24,16 +39,73 @@ pub const Kit = struct {
+         k.grouped = .{ .d = d, .kernels = &k.experts, .mtl = if (std.c.getenv("TF_EXL3_MTL")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 3 else 3, .prof = std.c.getenv("TF_FLASHNEXT_PROFILE") != null };
+         k.prompt_fast = if (std.c.getenv("TF_EXL3_PROMPT_FAST")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+         k.prompt_shared = if (std.c.getenv("TF_EXL3_PROMPT_SHARED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++        k.prefill_cublas = if (std.c.getenv("TF_EXL3_PREFILL_CUBLAS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++        k.lt = if (k.prefill_cublas) (cuda.cublaslt.Library.open() catch null) else null;
++        if (k.lt == null) k.prefill_cublas = false;
++        k.lt_plans = .empty;
++        k.cublas_ws = null;
++        k.unpack_w = null;
++        k.unpack_x = null;
++        k.unpack_z = null;
+         return k;
+     }
+ 
+     pub fn deinit(k: *Kit) void {
++        for (k.lt_plans.items) |*e| e.plan.deinit();
++        k.lt_plans.deinit(k.gpa);
++        if (k.lt) |*l| l.close();
++        if (k.cublas_ws) |*b| b.free();
++        if (k.unpack_z) |*b| b.free();
++        if (k.unpack_x) |*b| b.free();
++        if (k.unpack_w) |*b| b.free();
+         k.grouped.deinit();
+         k.experts.unload();
+         k.dense.unload();
+         k.gpa.destroy(k);
+     }
+ 
++    pub fn reserveUnpackW(k: *Kit, d: *const cuda.Driver, bytes: usize) !u64 {
++        if (k.unpack_w) |*b| {
++            if (b.len >= bytes) return b.ptr;
++            b.free();
++        }
++        k.unpack_w = try cuda.DeviceBuffer.alloc(d, bytes);
++        return k.unpack_w.?.ptr;
++    }
++
++    pub fn reserveUnpackX(k: *Kit, d: *const cuda.Driver, bytes: usize) !u64 {
++        if (k.unpack_x) |*b| {
++            if (b.len >= bytes) return b.ptr;
++            b.free();
++        }
++        k.unpack_x = try cuda.DeviceBuffer.alloc(d, bytes);
++        return k.unpack_x.?.ptr;
++    }
++
++    pub fn reserveUnpackZ(k: *Kit, d: *const cuda.Driver, bytes: usize) !u64 {
++        if (k.unpack_z) |*b| {
++            if (b.len >= bytes) return b.ptr;
++            b.free();
++        }
++        k.unpack_z = try cuda.DeviceBuffer.alloc(d, bytes);
++        return k.unpack_z.?.ptr;
++    }
++
++    pub fn cublasRun(k: *Kit, d: *const cuda.Driver, stream: cuda.Stream, x_f16: u64, w_f16: u64, y: u64, m: usize, n: usize, kdim: usize, out_f32: bool) !void {
++        const ws_limit: usize = 32 << 20;
++        if (k.cublas_ws == null) k.cublas_ws = try cuda.DeviceBuffer.alloc(d, ws_limit);
++        const plan = blk: {
++            for (k.lt_plans.items) |*e| {
++                if (e.m == m and e.n == n and e.k == kdim and e.out_f32 == out_f32) break :blk &e.plan;
++            }
++            const lt = &(k.lt orelse return error.CublasUnavailable);
++            const p = try cuda.cublaslt.Linear.initTyped(lt, @intCast(m), @intCast(n), @intCast(kdim), .f16, if (out_f32) .f32 else .f16, ws_limit, .none);
++            try k.lt_plans.append(k.gpa, .{ .m = @intCast(m), .n = @intCast(n), .k = @intCast(kdim), .out_f32 = out_f32, .plan = p });
++            break :blk &k.lt_plans.items[k.lt_plans.items.len - 1].plan;
++        };
++        try plan.run(x_f16, w_f16, y, k.cublas_ws.?.ptr, k.cublas_ws.?.len, stream.handle);
++    }
++
+     /// The grouped experts' scratch for `bytes`, allocated now: a graph capture later allocates nothing.
+     pub fn reserveExperts(k: *Kit, d: *const cuda.Driver, bytes: usize) !void {
+         if (k.grouped.storage) |*b| {
+diff --git a/zig/src/families/flashnext/cuda_exl3_lane.zig b/zig/src/families/flashnext/cuda_exl3_lane.zig
+index 17e1c15..4fd1be6 100644
+--- a/zig/src/families/flashnext/cuda_exl3_lane.zig
++++ b/zig/src/families/flashnext/cuda_exl3_lane.zig
+@@ -8,6 +8,30 @@ const block_rows = grp.block_rows;
+ 
+ /// Rows from which the dense weights take the prompt path (the same bits as the decode path's).
+ const prompt_rows: usize = 64;
++/// Rows from which ExLlamaV3-style FP16 prefill staging (unpack W_f16 once + cuBLASLt FP16 GEMM) runs.
++const cublas_rows: usize = 256;
++
++fn canCublas(kit: anytype, w: cuda.exl3.Weight, m: usize) bool {
++    return kit.prefill_cublas and m >= cublas_rows and w.codebook == .mul1 and (w.halves == 12 or w.halves == 8) and
++        w.k % 128 == 0 and w.n % 128 == 0;
++}
++
++fn cublasMatmul(self: anytype, kit: anytype, w: cuda.exl3.Weight, x: u64, m: usize, y: u64, dtype: cuda.exl3.DType) !void {
++    const stream = self.stream;
++    const d = kit.grouped.d;
++    const w_f16 = try kit.reserveUnpackW(d, @as(usize, w.n) * w.k * 2);
++    const x_rot = try kit.reserveUnpackX(d, m * w.k * 2);
++    try kit.dense.unpackToF16(stream, w, w_f16);
++    try kit.dense.rotInF16(stream, w, x, .bf16, m, x_rot);
++    if (dtype == .f32) {
++        try kit.cublasRun(d, stream, x_rot, w_f16, y, m, w.n, w.k, true);
++        try kit.dense.rotOut(stream, w, y, y, .f32, .f32, m, 0);
++    } else {
++        const z_f32 = try kit.reserveUnpackZ(d, m * w.n * 4);
++        try kit.cublasRun(d, stream, x_rot, w_f16, z_f32, m, w.n, w.k, true);
++        try kit.dense.rotOut(stream, w, z_f32, y, .f32, dtype, m, 0);
++    }
++}
+ 
+ fn decodeRows(kit: anytype, stream: cuda.Stream, w: cuda.exl3.Weight, x: u64, m: usize, y: u64, dtype: cuda.exl3.DType) !void {
+     if (m >= prompt_rows) return kit.dense.prompt(stream, w, x, .bf16, m, y, dtype);
+@@ -20,16 +44,57 @@ pub fn run(self: anytype, g: *const grp.Group, x: u64, out: u64, part: u64, m: u
+     const stream = self.stream;
+     if (g.count == 1 and g.parts[0].kind == .trellis) {
+         const w = g.parts[0].w;
+-        if (sk == 1) {
+-            try decodeRows(kit, stream, w, x, m, out, .bf16);
+-        } else {
+-            try decodeRows(kit, stream, w, x, m, part, .f32);
++        const dtype: cuda.exl3.DType = if (sk == 1) .bf16 else .f32;
++        const dst = if (sk == 1) out else part;
++        if (canCublas(kit, w, m)) {
++            try cublasMatmul(self, kit, w, x, m, dst, dtype);
++            return 1;
+         }
++        try decodeRows(kit, stream, w, x, m, dst, dtype);
+         return 1;
+     }
+     if (sk != 1 or out == 0) return error.UnexpectedTensor;
+     const tmp = self.s.exl3_tmp;
+     if (tmp == 0) return error.UnexpectedTensor;
++    // ExLlamaV3-style prefill staging for stitched projections: unpack each trellis part ONCE for all m rows!
++    if (kit.prefill_cublas and m >= cublas_rows) {
++        const d = kit.grouped.d;
++        for (g.parts[0..g.count]) |p| {
++            switch (p.kind) {
++                .trellis => {
++                    if (canCublas(kit, p.w, m)) {
++                        const w_f16 = try kit.reserveUnpackW(d, @as(usize, p.w.n) * p.w.k * 2);
++                        const x_rot = try kit.reserveUnpackX(d, @min(m, block_rows) * p.w.k * 2);
++                        const z_f32 = try kit.reserveUnpackZ(d, @min(m, block_rows) * p.w.n * 4);
++                        try kit.dense.unpackToF16(stream, p.w, w_f16);
++                        var r0: usize = 0;
++                        while (r0 < m) : (r0 += block_rows) {
++                            const rows = @min(block_rows, m - r0);
++                            try kit.dense.rotInF16(stream, p.w, x + r0 * g.k * 2, .bf16, rows, x_rot);
++                            try kit.cublasRun(d, stream, x_rot, w_f16, z_f32, rows, p.w.n, p.w.k, true);
++                            try kit.dense.rotOut(stream, p.w, z_f32, out + (r0 * g.n + p.col) * 2, .f32, .bf16, rows, g.n);
++                        }
++                    } else {
++                        var r0: usize = 0;
++                        while (r0 < m) : (r0 += block_rows) {
++                            const rows = @min(block_rows, m - r0);
++                            try decodeRows(kit, stream, p.w, x + r0 * g.k * 2, rows, tmp, .bf16);
++                            try ops.copyCols(self.k, stream, tmp, p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                        }
++                    }
++                },
++                .plain => {
++                    var r0: usize = 0;
++                    while (r0 < m) : (r0 += block_rows) {
++                        const rows = @min(block_rows, m - r0);
++                        try self.k.nativeMatmul(stream, x + r0 * g.k * 2, g.k, rows, p.plain, tmp, self.s.native_part, .bf16);
++                        try ops.copyCols(self.k, stream, tmp, p.n, out + (r0 * g.n + p.col) * 2, g.n, p.n, rows);
++                    }
++                },
++            }
++        }
++        return 1;
++    }
+     const use_group = if (std.c.getenv("TF_EXL3_DECODE_GROUP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+     const use_strided = if (std.c.getenv("TF_EXL3_GROUP_STRIDED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+     var r0: usize = 0;
