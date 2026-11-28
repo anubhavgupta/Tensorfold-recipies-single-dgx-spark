@@ -41,6 +41,17 @@
   .btn.active { background: rgba(56, 189, 248, 0.22); border-color: var(--accent); color: #7dd3fc; box-shadow: 0 0 12px rgba(56,189,248,0.25); }
   .btn.tour { background: rgba(167, 139, 250, 0.18); border-color: var(--purple); color: #ddd6fe; }
   .btn.tour.active { background: rgba(167, 139, 250, 0.35); box-shadow: 0 0 12px rgba(167,139,250,0.35); }
+  .btn.deep { background: rgba(52, 211, 153, 0.16); border-color: var(--green); color: #a7f3d0; }
+  .btn.deep.active { background: rgba(52, 211, 153, 0.32); box-shadow: 0 0 12px rgba(52,211,153,0.35); color: #fff; }
+  #sub-tabs {
+    position: fixed; top: 68px; left: 344px; right: 414px; z-index: 18;
+    display: none; justify-content: center; gap: 8px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 7px 12px; backdrop-filter: blur(10px);
+  }
+  #sub-tabs.show { display: flex; }
+  .card.why { border-color: rgba(56,189,248,0.35); background: rgba(8,47,73,0.28); }
+  .card.why h3 { color: #7dd3fc; }
 
   /* Left summary + stage list */
   #left-panel {
@@ -128,11 +139,20 @@
   <div class="mode-group">
     <button class="btn active" data-mode="prefill245">Prefill 245K (1,630 ms)</button>
     <button class="btn" data-mode="prefill16">Prefill 16K (1,409 ms)</button>
-    <button class="btn" data-mode="decode1">Decode N=1 (46.5 ms)</button>
-    <button class="btn" data-mode="decode4">Decode N=4 (93.2 ms)</button>
-    <button class="btn tour" id="btn-tour">&#9654; Guided Example Tour</button>
-    <button class="btn" id="btn-reset">Reset Camera</button>
+    <button class="btn" data-mode="decode1">Decode N=1 (49.6 ms)</button>
+    <button class="btn" data-mode="decode4">Decode N=4 (96.5 ms)</button>
+    <button class="btn deep" id="btn-deep">&#128269; Deep-Dive Inner View</button>
+    <button class="btn tour" id="btn-tour">&#9654; Guided Tour</button>
+    <button class="btn" id="btn-reset">Reset Cam</button>
   </div>
+</div>
+
+<div id="sub-tabs">
+  <span style="font-size:11px;color:#94a3b8;align-self:center;margin-right:4px;">Inner Architecture:</span>
+  <button class="btn active" data-deep="moe">MoE (512 Routed + Shared 512)</button>
+  <button class="btn" data-deep="attn">QSA + MXFP8 Attention</button>
+  <button class="btn" data-deep="hc">Hyper-Connections (4-Stream)</button>
+  <button class="btn" data-deep="dflash">DFlash2 Speculative Loop</button>
 </div>
 
 <div id="left-panel">
@@ -147,6 +167,7 @@
 <div id="right-panel">
   <h2 id="ins-title">Select any 3D stage</h2>
   <div class="meta-grid" id="ins-meta"></div>
+  <div class="card why" id="ins-why"></div>
   <div class="card" id="ins-what"></div>
   <div class="card" id="ins-sub" style="display:none;"></div>
   <div class="card example" id="ins-example"></div>
@@ -308,17 +329,24 @@ const MODES = {
         headroom: 'Saturated (0.94% of chunk).'
       },
       {
-        id: 'experts', name: '8. MoE Experts (48x)', ms: 483.2, status: 'med', pos: [10.6, 0, 0],
-        kernel: 'exl3_prompt.cuh 3-stage cp.async (0007 routed4 + 0010 shared6)',
-        shapes: '33,792 token-expert pairs -> 512x 4-bit routed + 1x 6-bit shared',
-        bw: 'Was 1,407 ms before Patches 0007+0010 (2.9x faster!); ~48 eff. TFLOPS w/ on-the-fly trellis decode',
-        what: 'Runs all 512 4-bit mul1 routed experts in ONE 3,072-row pass (zero split-K fp32 partials, fused SwiGLU+down-rotate), then runs 6-bit shared expert 512 in ONE pass reusing the same router & rotated inputs (48 KiB dynamic SMEM).',
-        subs: [
-          ['routed4 (512 x 4-bit mul1, Patch 0007)', 453.0, 27.79],
-          ['shared6 (expert 512 x 6-bit, Patch 0010)', 30.2, 1.85],
-        ],
-        example: 'Before Patch 0007: 3x 1,024-row passes on grouped_body_mtl took 1,407 ms! Now routed4 = 453 ms + shared6 = 30.2 ms = 483.2 ms (-924 ms saved per chunk!!).',
-        headroom: 'Largest single stage (29.6%), already 3-stage cp.async transposed. Only further lever is FP8/4-bit MMA or smaller bit-width.'
+        id: 'routed4', name: '8a. MoE Routed 512x4-bit (48x)', ms: 453.0, status: 'med', pos: [10.4, 0, -1.7], isMoEGrid: true,
+        kernel: 'exl3_prompt.cuh 3-stage cp.async (Patch 0007, 512 routed 4-bit mul1)',
+        shapes: '30,720 routed pairs (10/tok) -> 512x 4-bit gate+up+down',
+        bw: 'Was 1,250+ ms before Patch 0007 (~2.8x faster!); ~48 eff. TFLOPS w/ trellis decode',
+        why: '27.8% of 245K chunk because 48 layers x 512 routed experts = 24,576 matrices (~50 GB of 4-bit weights total, all ~512 experts active across 3,072 rows!). Executing ~20 TFLOPs of 4-bit trellis decode + FP16 MMA takes 453 ms (~9.4 ms/layer).',
+        what: 'Runs all 512 4-bit mul1 routed experts in ONE 3,072-row pass with zero split-K fp32 partials and fused SwiGLU+down-rotate. Visualized as a 3D bank of active expert tiles (each token activates top-10 of 512).',
+        example: 'Across 3,072 tokens, each of the 512 experts receives ~60 tokens; exl3_prompt.cuh groups them into 64-pair tiles and decodes each 4-bit weight tile once.',
+        headroom: 'Already 3-stage cp.async transposed (Patch 0007). Only lower bit-width or FP8/FP4 Tensor Core weights could reduce further.'
+      },
+      {
+        id: 'shared6', name: '8b. MoE Shared #512 (6-bit, 48x)', ms: 30.2, status: 'sat', pos: [10.4, 0, 2.0],
+        kernel: 'exl3_prompt.cuh k12_mul1 (Patch 0010, 48 KiB dynamic SMEM)',
+        shapes: '3,072 rows (ALWAYS active) -> 1x 6-bit gate[512]+up[512]+down[2560]',
+        bw: 'Was ~150 ms before Patch 0010 (5x faster! Zero extra router/rot_in)',
+        why: 'Only 1.85% of 245K chunk (30.2 ms across 48 layers = 0.63 ms/layer!) because Patch 0010 runs shared expert 512 in ONE 3,072-row pass reusing the routed pass\'s router output & rotated inputs.',
+        what: 'Dense shared expert (ID 512, 6-bit mul1) that runs on EVERY token in parallel with the 10 routed experts. Its fp32 output is written to slot 10 of s.y[pairs, 2560].',
+        example: 'Before Patch 0010: ran 3x 1,024-row grouped_body_mtl passes + 3 router calls (~150 ms). Patch 0010 cut 248K TTFT by -11.8 s!',
+        headroom: 'Saturated (1.85% of chunk).'
       },
       {
         id: 'head', name: '9. LM Head (last row)', ms: 0.0, status: 'sat', pos: [13.8, 0, 0],
@@ -353,7 +381,8 @@ const MODES = {
       { id: 'attn_out', name: '5c. Attn Out (12x)', ms: 32.9, status: 'sat', pos: [1.1, 0, 2.6], kernel: 'exl3_linear_wc (6-bit)', shapes: '12x [3072,6144]->[2560]', bw: '2.3% of chunk', what: 'Attention output projection.', example: '12 layers.', headroom: 'Small.' },
       { id: 'hc_mlp', name: '6. HC MLP (48x)', ms: 103.4, status: 'sat', pos: [4.4, 0, 0], kernel: 'readoutFused BF16 TC', shapes: '48x [3072,10240]', bw: '7.3% of chunk', what: '1-branch writeback + fused BF16 HC readout.', example: 'Feeds mixed[3072,2560] into MoE.', headroom: 'Saturated.' },
       { id: 'route', name: '7. MoE Router (48x)', ms: 14.9, status: 'sat', pos: [7.2, 0, 0], kernel: 'routerMany + topkMany', shapes: '3,072 x 512 logits', bw: '1.1% of chunk', what: 'Top-10 of 512 routing.', example: 'Selects 10 routed + 1 shared expert per token.', headroom: 'Saturated.' },
-      { id: 'experts', name: '8. MoE Experts (48x)', ms: 455.6, status: 'med', pos: [10.6, 0, 0], kernel: 'exl3_prompt.cuh (0007 + 0010)', shapes: '512x 4-bit + 1x 6-bit', bw: '32.3% of chunk (was 58.3%!)', what: '1-pass 3-stage cp.async transposed prompt experts.', subs: [['routed4 (Patch 0007)', 425.1, 30.17], ['shared6 (Patch 0010)', 30.5, 2.16]], example: '3.1x faster than stock flash-4!', headroom: 'Already 3-stage cp.async transposed.' },
+      { id: 'routed4', name: '8a. MoE Routed 512x4-bit (48x)', ms: 425.1, status: 'med', pos: [10.4, 0, -1.7], isMoEGrid: true, kernel: 'exl3_prompt.cuh routed4 (Patch 0007)', shapes: '512x 4-bit routed experts (10/tok)', bw: '30.2% of chunk (was 54%!)', why: '30.2% of 16K chunk: reading & trellis-decoding all 512 active 4-bit experts across 48 layers for 3,072 tokens (~20 TFLOPs).', what: '1-pass 3-stage cp.async transposed prompt kernel across all 512 routed experts.', example: '3.1x faster than stock flash-4!', headroom: 'Already 3-stage cp.async transposed.' },
+      { id: 'shared6', name: '8b. MoE Shared #512 (6-bit, 48x)', ms: 30.5, status: 'sat', pos: [10.4, 0, 2.0], kernel: 'exl3_prompt.cuh k12_mul1 (Patch 0010)', shapes: '1x 6-bit shared expert (all 3,072 rows)', bw: '2.2% of chunk', why: 'Only 2.2% of chunk (0.63 ms/layer) thanks to Patch 0010 reusing routed scratch with 48 KiB dynamic SMEM.', what: 'Always-active 6-bit shared expert 512.', example: 'Runs in 1 pass right after routed4.', headroom: 'Saturated.' },
       { id: 'head', name: '9. LM Head', ms: 0.0, status: 'sat', pos: [13.8, 0, 0], kernel: 'exl3_linear (final chunk only)', shapes: '1 row on last chunk', bw: '0%', what: 'Only runs on final chunk (2.3 ms).', example: 'Skipped on intermediate chunks.', headroom: 'Zero.' },
     ],
   },
@@ -378,7 +407,8 @@ const MODES = {
       { id: 'attn_out', name: '3c. Attn Out (12x)', ms: 0.8, status: 'sat', pos: [0.8, 0, 2.6], kernel: 'tf_exl3_linear_12_2 (6-bit)', shapes: '12x [2560, 6144] = 142 MB', bw: '~177 GB/s', what: '12-layer attention output projection.', example: '142 MB read.', headroom: 'Zero (1.6%).' },
       { id: 'hc_mlp', name: '4. HC MLP (48x)', ms: 5.3, status: 'hot', pos: [4.2, 0, 0], kernel: 'hcWriteback + hcNorm + qmmf BF16', shapes: '48x (W_down + W_up) = 633 MB BF16', bw: '~119 GB/s (44% of GB10 273 GB/s peak!)', what: 'Second 633 MB BF16 Hyper-Connection pass per layer (feeding MoE).', example: 'Combined with hc_attn, HC takes 9.9 ms (20% of entire N=1 decode round!) for 1.27 GB BF16.', headroom: 'HIGH LEVER: Custom fused BF16 W_up+hcDenseMix kernel or INT8 (7-bit) HC weights (must pass 120K needle!).' },
       { id: 'route', name: '5. MoE Router (48x)', ms: 1.5, status: 'sat', pos: [7.2, 0, 0], kernel: 'routerMany + topkMany', shapes: '4 rows x 512 logits x 48 layers', bw: '3.0% of round', what: 'Selects top-10 routed experts + shared 512 for each verify row.', example: '4 verify rows typically activate ~25-35 distinct experts/layer.', headroom: 'Saturated.' },
-      { id: 'experts', name: '6. MoE Experts (48x)', ms: 18.8, status: 'med', pos: [10.5, 0, 0], kernel: 'exl3_grouped (4-bit routed + 6-bit shared)', shapes: '~2.8–3.5 GB distinct experts read across 48 layers', bw: '~180–200 GB/s (each extra draft row adds ~+3.0 ms!)', what: 'Reads & decodes all distinct routed experts picked by the 4-6 verify rows plus shared expert 512.', subs: [['up rot + gemm + fin', 11.7, 23.6], ['down rot + gemm + fin', 7.1, 14.3]], example: 'Verify cost curve: 2 rows = 35.6 ms, 4 rows = 43.1 ms, 8 rows = 54.4 ms (+3.0 ms/row purely from reading more distinct experts!).', headroom: 'Bandwidth-bound (37.9% of round). Hot-expert caching cannot help (all weights already in unified RAM; 24 MiB L2 is 6x too small).' },
+      { id: 'routed4', name: '6a. MoE Routed 512x4-bit (48x)', ms: 16.5, status: 'med', pos: [10.4, 0, -1.7], isMoEGrid: true, kernel: 'exl3_grouped (4-bit routed, top-10/tok)', shapes: '~25-35 distinct routed experts/layer (~2.6-3.2 GB read)', bw: '~185-200 GB/s (+3.0 ms per extra draft row!)', why: '33.3% of N=1 round: 4 verify rows pick ~30 distinct 4-bit experts per layer x 48 layers = ~2.8 GB read from LPDDR5X (2.8 GB / 185 GB/s = 15-16.5 ms). Every extra draft token activates ~5-8 new experts = +3.0 ms!', what: 'Grouped decode kernel reads only the active routed experts picked by the 4-6 verify rows (out of 512 total per layer).', subs: [['up rot + gemm + fin', 10.3, 20.8], ['down rot + gemm + fin', 6.2, 12.5]], example: 'Verify cost curve: 2 rows = 35.6 ms, 4 rows = 43.1 ms, 8 rows = 54.4 ms (+3.0 ms/row purely from reading more distinct experts!).', headroom: 'Bandwidth-bound. Hot-expert caching cannot help on GB10 (all weights already in unified RAM; 24 MiB L2 is 6x too small).' },
+      { id: 'shared6', name: '6b. MoE Shared #512 (6-bit, 48x)', ms: 2.3, status: 'sat', pos: [10.4, 0, 2.0], kernel: 'exl3_grouped (expert 512, 6-bit mul1)', shapes: '48 x 2.95 MB = 141 MB read every round', bw: '~61-100 GB/s (tiny 2.3 ms across 48 layers)', why: '4.6% of N=1 round: shared expert 512 is 6-bit (2.95 MB/layer = 141 MB total) and fires on every single token regardless of routing.', what: 'Always-active shared expert 512 evaluated for all verify rows.', example: '48 layers x 2.95 MB = 141 MB — 6x larger than GB10\'s 24 MiB L2 cache, so it streams from LPDDR5X each round.', headroom: 'Small (4.6%).' },
       { id: 'head', name: '7. LM Head + PLE', ms: 2.6, status: 'sat', pos: [13.8, 0, 0], kernel: 'exl3_linear (lm_head 2.2 ms) + ple (0.4 ms)', shapes: '4 rows x 248,320 vocab (6-bit = 477 MB)', bw: '~217 GB/s (80% peak!)', what: 'Projects all 4 verify rows to 248,320 vocab logits to verify DFlash2 drafts in parallel.', example: 'Compares target greedy/sampled tokens against DFlash2 drafts -> accepts prefix + 1 bonus token.', headroom: 'Saturated (80% LPDDR5X peak).' },
     ],
   },
@@ -403,9 +433,108 @@ const MODES = {
       { id: 'attn_out', name: '3c. Attn Out (12x)', ms: 1.0, status: 'sat', pos: [0.8, 0, 2.6], kernel: 'exl3_linear_wc', shapes: '142 MB shared', bw: '1.0% of round', what: 'Shared attention output projection.', example: 'Amortized.', headroom: 'Saturated.' },
       { id: 'hc_mlp', name: '4. HC MLP (48x)', ms: 6.9, status: 'sat', pos: [4.2, 0, 0], kernel: 'qmmf BF16 (24 rows)', shapes: '633 MB BF16 shared', bw: '7.2% of round', what: 'Shared HC MLP readout across 4 streams.', example: 'Amortized.', headroom: 'Small.' },
       { id: 'route', name: '5. MoE Router (48x)', ms: 1.9, status: 'sat', pos: [7.2, 0, 0], kernel: 'routerMany + topkMany', shapes: '24 rows x 512', bw: '2.0% of round', what: 'Routes ~24 verify rows across 4 streams.', example: 'Produces ~264 token-expert pairs/layer.', headroom: 'Saturated.' },
-      { id: 'experts', name: '6. MoE Experts (48x)', ms: 55.0, status: 'sat', pos: [10.5, 0, 0], kernel: 'exl3_grouped (grouped batch reuse)', shapes: '11.94 GB distinct experts read across 48 layers', bw: '236 GB/s = 86% OF GB10 273 GB/s PEAK!', what: 'Groups all tokens from all 4 streams picking the same expert and decodes each expert once. Hits 236 GB/s effective LPDDR5X bandwidth — right at hardware saturation!', subs: [['up rot + gemm + fin', 35.8, 37.1], ['down rot + gemm + fin', 19.2, 19.9]], example: 'With 24 verify rows across 4 streams, ~125 distinct experts fire per layer = 11.94 GB/round @ 236 GB/s = 55.0 ms.', headroom: 'AT HARDWARE CEILING (86% of 273 GB/s LPDDR5X peak). Only higher draft acceptance can raise N=4/N=8 throughput further.' },
+      { id: 'routed4', name: '6a. MoE Routed 512x4-bit (48x)', ms: 52.5, status: 'sat', pos: [10.4, 0, -1.7], isMoEGrid: true, kernel: 'exl3_grouped (grouped batch reuse across 4 streams)', shapes: '11.8 GB distinct routed experts (~125/512 active/layer)', bw: '236 GB/s = 86% OF GB10 273 GB/s PEAK!', why: '54.4% of N=4 round because 24 verify rows across 4 streams activate ~125 distinct experts/layer x 48 layers = 11.8 GB! Reading 11.8 GB at 236 GB/s (86% of GB10 peak) physically takes 50-52.5 ms.', what: 'Groups all tokens from all 4 streams picking the same expert and decodes each expert once.', subs: [['up rot + gemm + fin', 34.2, 35.4], ['down rot + gemm + fin', 18.3, 19.0]], example: '125 distinct experts/layer x 1.97 MB x 48 = 11.8 GB read at 236 GB/s!', headroom: 'AT HARDWARE CEILING (86% of 273 GB/s LPDDR5X peak).' },
+      { id: 'shared6', name: '6b. MoE Shared #512 (6-bit, 48x)', ms: 2.5, status: 'sat', pos: [10.4, 0, 2.0], kernel: 'exl3_grouped (expert 512, shared by 24 rows)', shapes: '141 MB amortized across all 4 streams', bw: '2.6% of round', why: 'Only 2.6% of N=4 round: the 141 MB shared expert weight read is amortized across all 24 rows of 4 streams.', what: 'Shared expert 512 evaluated for all 24 rows.', example: 'Same 141 MB read as N=1, serving 4x the users!', headroom: 'Saturated.' },
       { id: 'head', name: '7. LM Head + PLE', ms: 1.7, status: 'sat', pos: [13.8, 0, 0], kernel: 'exl3_linear + ple', shapes: '24 rows x 248,320 vocab', bw: '1.8% of round', what: 'Verifies all 4 streams\' draft tokens.', example: '4 streams verified simultaneously.', headroom: 'Saturated.' },
     ],
+  }
+};
+
+// ============================================================================
+// DEEP-DIVE INNER ARCHITECTURE VIEWS (Micro-stage 3D pipelines)
+// ============================================================================
+const DEEP_MODES = {
+  moe: {
+    title: 'Deep-Dive: MoE Layer Inner Flow (512 Routed 4-bit + Shared 6-bit, 48x)',
+    totalMs: 498.5,
+    kpis: [
+      { lbl: '245K MoE Total', val: '498.5 ms', sub: 'route 15.3 + routed4 453 + shared6 30.2' },
+      { lbl: 'N=1 / N=4 Decode', val: '18.8 / 55.0 ms', sub: 'N=4 hits 236 GB/s (86% peak!)' },
+      { lbl: 'Experts / Layer', val: '512 + 1 Shared', sub: '24,576 routed + 48 shared total' },
+      { lbl: 'Patch 0007+0010 Gain', val: '2.9x Faster', sub: '1,407 ms -> 483.2 ms (-924 ms/chunk)' },
+    ],
+    stages: [
+      { id: 'd_in', name: '1. mixed[M, 2560]', ms: 0.5, status: 'sat', pos: [-13, 0, 0], kernel: 'HC MLP readout output (bf16)', shapes: '[3072, 2560] bf16 (15.7 MB)', bw: 'L2 resident', why: '0.1%: input hidden states already in L2 from HC MLP readout.', what: 'Feeds both the MoE Router and the EXL3 Hadamard input rotation.', example: '3,072 token vectors in prefill (or 4-24 verify rows in decode).', headroom: 'None.' },
+      { id: 'd_router', name: '2. Router + Top-10', ms: 15.3, status: 'sat', pos: [-9.5, 0, 0], kernel: 'routerMany + topkMany + grouped.route', shapes: 'mixed[3072,2560] x W_r[512,2560] -> picks[3072, 11]', bw: '3.1% of MoE', why: '3.1% (15.3 ms / 48 layers = 0.32 ms/layer): computes 512 logits/token, selects top-10 routed experts + shared 512, and bins 33,792 pairs into 64-pair tiles.', what: 'Produces items[], counts[], members[] once — reused by BOTH routed4 (Patch 0007) AND shared6 (Patch 0010)!', example: 'Token #42 ("def") picks experts [17, 88, 104, 211, 259, 302, 344, 401, 455, 498] + shared #512.', headroom: 'Saturated.' },
+      { id: 'd_rot', name: '3. Hadamard rot_in', ms: 28.0, status: 'sat', pos: [-5.8, 0, 0], kernel: 'tf_exl3_rot_in (FWHT128 * suh -> fp16)', shapes: 'xg, xu [33,792, 2560] fp16 (~346 MB)', bw: '~200 GB/s', why: '5.6% (28 ms): rotates all 33,792 pairs by each expert\'s suh + 128-pt Walsh-Hadamard transform into fp16 scratch once for ALL 513 experts.', what: 'Prepares rotated inputs for both gate and up trellises in a single launch (Patch 0010 shares this with expert 512).', example: 'One launch rotates all 512 routed + 1 shared expert pairs together.', headroom: 'Already fused across all 513 experts.' },
+      { id: 'd_gu4', name: '4a. Routed 512x Gate+Up (4-bit)', ms: 290.0, status: 'med', pos: [-1.2, 0, -2.5], isMoEGrid: true, kernel: 'tf_exl3_prompt_gu_mul1 (3-stage cp.async, Patch 0007)', shapes: '512 experts x (gate[512,2560] + up[512,2560]) 4-bit + fused SwiGLU + rot_d', bw: '~48 eff. TFLOPS w/ on-the-fly 4-bit trellis decode', why: '58.2% of MoE (290 ms): decodes 2 matrices (gate + up) per expert across 512 experts x 48 layers = 49,152 4-bit trellis matrices, fuses SiLU(gate)*up + down-Hadamard rotation directly in registers (ZERO fp32 split-K partials!).', what: '3-stage cp.async transposed prompt kernel (64 pairs/CTA). Eliminated 3x 1,024-row passes + 307 ms of finish kernels.', example: 'Writes rotated SwiGLU activations xd[33,792, 512] fp16 straight to scratch.', headroom: 'Already 3-stage cp.async transposed.' },
+      { id: 'd_dn4', name: '4b. Routed 512x Down (4-bit)', ms: 135.0, status: 'med', pos: [4.2, 0, -2.5], isMoEGrid: true, kernel: 'tf_exl3_prompt_down_mul1 (3-stage cp.async, Patch 0007)', shapes: '512 experts x down[2560,512] 4-bit -> y[33,792, 2560] fp32', bw: 'Half the matrices of gate+up (~135 ms vs 290 ms)', why: '27.1% of MoE (135 ms): 1 matrix per expert (down) vs 2 for gate+up, writing 10 routed fp32 slots per token.', what: 'Completes the 4-bit routed expert FFN and applies output Hadamard FWHT128 * svh_d.', example: 'Writes slots 0..9 of y[token, slot, 2560] in fp32.', headroom: 'Already 3-stage cp.async transposed.' },
+      { id: 'd_sh6', name: '5. Shared Expert #512 (6-bit)', ms: 30.2, status: 'sat', pos: [1.5, 0, 2.5], kernel: 'tf_exl3_prompt_{gu,down}_k12_mul1 (Patch 0010, 48 KiB SMEM)', shapes: '1x 6-bit gate+up+down over ALL 3,072 rows (skip = -514)', bw: 'Was ~150 ms before Patch 0010 (5x faster!)', why: '6.1% of MoE (30.2 ms): 6-bit trellis needs 49,152 B dynamic SMEM (fits 2 blocks/SM on GB10\'s 99 KiB SMEM!) and reuses routed4\'s router & rot_in.', what: 'Runs ONLY expert 512 in one 3,072-row pass, writing slot 10 of y[token, 10, 2560] fp32.', example: 'Cut 248K cold prefill by -11.8 s (146.2s -> 134.4s) with 100% bit-exact parity.', headroom: 'Saturated.' },
+      { id: 'd_wb', name: '6. Weighted Sum -> HC Attn', ms: 0.5, status: 'sat', pos: [9.5, 0, 0], kernel: 'Fused into next layer\'s hcWriteback (9-slot fp32 -> 4 streams)', shapes: 'y[33,792, 2560] fp32 (283 MB/layer) -> h[3072, 10240] bf16', bw: 'Counted in next layer\'s hc_attn (63 ms @ >90% BW)', why: 'Weighted reduction of all 11 expert slots is fused directly into the next layer\'s hcWriteback to avoid an extra 62 MB residual write/read.', what: 'Combines 10 routed slots * router_wts + shared slot 10 into the 4 Hyper-Connection residual streams.', example: 'Layer L MoE output -> Layer L+1 hc_attn writeback.', headroom: 'Already fused.' },
+    ],
+    edges: [
+      ['d_in', 'd_router', 0x38bdf8], ['d_router', 'd_rot', 0x38bdf8],
+      ['d_rot', 'd_gu4', 0xfbbf24], ['d_gu4', 'd_dn4', 0xfbbf24], ['d_dn4', 'd_wb', 0x34d399],
+      ['d_rot', 'd_sh6', 0xa78bfa], ['d_sh6', 'd_wb', 0x34d399],
+    ]
+  },
+
+  attn: {
+    title: 'Deep-Dive: QSA + MXFP8 Attention Inner Flow (245K Chunk, 12 Layers)',
+    totalMs: 318.3,
+    kpis: [
+      { lbl: '245K Attn Total', val: '318.3 ms', sub: 'was 696 ms (-54% via 0009/0011/0012!)' },
+      { lbl: 'QSA Score TC v2', val: '57.6 ms', sub: 'was 329 ms (5.7x faster!)' },
+      { lbl: 'MXFP8 Attn Core', val: '182.4 ms', sub: 'was 298 ms BF16 (1.63x faster!)' },
+      { lbl: 'KV Footprint', val: '528 B/pos', sub: '5.10 GiB/262K (8 streams max)' },
+    ],
+    stages: [
+      { id: 'a_prep', name: '1. Prep + MXFP8 Quant', ms: 7.1, status: 'sat', pos: [-12.5, 0, 0], kernel: 'fn_attn_prep_body + mxfp8_quant_row (Patch 0012)', shapes: 'pa[3072,13952] -> Q bf16, KC/VC MXFP8 (528 B/pos), IQ/IKC bf16', bw: '2.2% of attn; warp-only zero-SMEM E8M0 quant', why: '2.2% (7.1 ms): 8 warps/head = 8 groups of 32 elements; each warp computes exact ceiling power-of-2 E8M0 scale in 2 ALU ops with zero SMEM.', what: 'Applies Q/K/I RMSNorm + RoPE and writes K & V directly as 256 E4M3 codes + 8 E8M0 scale bytes per head (528 B/pos vs 1024 B BF16).', example: 'Saves 3.15 GiB per 262K stream (8.25 -> 5.10 GiB), admitting 8 full 262K streams on GB10.', headroom: 'Saturated.' },
+      { id: 'a_pool', name: '2. QSA Key Pool', ms: 0.2, status: 'sat', pos: [-8.5, 0, 0], kernel: 'fn_qsa_pool_body (block ratio=4)', shapes: 'IKC[3072,128] -> POOLED[768,128] bf16', bw: '0.06% of attn', why: '0.06% (0.2 ms): only pools the 768 newly completed 4-token blocks in this chunk.', what: 'Averages every 4 indexer keys, norms, and RoPEs at block start.', example: 'At 245K context, POOLED holds 61,250 blocks (15.7 MB/layer).', headroom: 'Zero.' },
+      { id: 'a_score', name: '3. QSA Score TC v2', ms: 57.6, status: 'sat', pos: [-4.2, 0, 0], kernel: 'fn_qsa_scores_tc (Patch 0009 v2: 64x512, 8 warps, cp.async)', shapes: 'IQ[3072,4,128] x POOLED[61250,128]^T -> SC[3072, 61250] fp32', bw: 'Was 329 ms scalar (5.7x faster! Near ~45 ms floor)', why: '18.1% (57.6 ms): scores 3,072 queries x 61,250 blocks x 4 heads via BF16 mma16816 + FP32 acc in 87,040 B dynamic SMEM with 4x POOLED reuse and register-only head sum.', what: 'Replaces scalar FP32 FMA (~7 TFLOPS) with Blackwell BF16 Tensor Cores (~90 TFLOPS).', example: 'Cut 248K TTFT by -11.3 s vs scalar with 100% byte-identical 120K needle retrieval.', headroom: 'Near theoretical ~45 ms floor.' },
+      { id: 'a_sel', name: '4. QSA Top-512 Select', ms: 64.8, status: 'hot', pos: [0.5, 0, 0], kernel: 'fn_qsa_select_body (Patch 0011: 3-pass 11+11+10-bit + match_any)', shapes: 'SC[3072, 61250] fp32 (9.03 GB across 12 layers) -> top-512 block IDs', bw: 'Was 69.4 ms; 5 full passes over 9 GB SC', why: '20.4% (64.8 ms): even with 3 radix passes + warp-aggregated atomics, still scans 9.03 GB of SC 5 times (3 radix + count + write).', what: 'Finds the exact top-512 pooled blocks (2,048 keys) per query row in deterministic block order.', example: 'Selects the exact 2,048 most relevant keys out of 245,000 for every query.', headroom: 'REMAINING LEVER: Compacting pass-0 candidates (<2,000 items) into SMEM could cut 5 global passes -> 2 (~-25 ms/chunk).' },
+      { id: 'a_core', name: '5. MXFP8 Sparse Attn', ms: 182.4, status: 'med', pos: [5.5, 0, 0], kernel: 'fn_attn_fused (Patch 0012: cp.async MXFP8 + BF16x2 SIMD __hmul2)', shapes: '3,072 rows x 2,048 sparse keys x 2 KV heads x 528 B = ~38.5 GB read', bw: '~211 GB/s (77% peak; was 77 GB BF16 = 298 ms!)', why: '57.3% (182.4 ms): random-gather reads ~38.5 GB of MXFP8 K/V (half of BF16\'s 77 GB!), converts E4M3+E8M0 -> BF16 via SIMD __hmul2, and runs mma16816 online softmax.', what: 'Exact row-invariant sparse FlashAttention over the 2,048 selected keys.', example: '1.63x faster than BF16 attention at 245K while keeping 120K needle byte-identical!', headroom: 'REMAINING LEVER: Native Blackwell mxf8f6f4.block_scale MMA (zero BF16 dequant) could save ~25-35 ms/chunk.' },
+      { id: 'a_gate', name: '6. Attn Output Gate', ms: 6.2, status: 'sat', pos: [10.5, 0, 0], kernel: 'fn_attn_gate (o / (1 + exp(-gate)))', shapes: 'ao[3072, 6144] -> gated[3072, 6144] bf16', bw: '1.9% of attn', why: '1.9% (6.2 ms): simple elementwise SiLU-style gate + 32-group sums.', what: 'Applies learned per-element output gate before attn_out projection.', example: 'Feeds gated[3072, 6144] into 6-bit attn_out.', headroom: 'Saturated.' },
+    ],
+    edges: [
+      ['a_prep', 'a_pool', 0xa78bfa], ['a_pool', 'a_score', 0xa78bfa],
+      ['a_score', 'a_sel', 0xf87171], ['a_sel', 'a_core', 0xfbbf24], ['a_core', 'a_gate', 0x34d399]
+    ]
+  },
+
+  hc: {
+    title: 'Deep-Dive: 4-Stream Hyper-Connections (N=1 Decode: 9.9 ms = 20% of Round!)',
+    totalMs: 9.9,
+    kpis: [
+      { lbl: 'N=1 Decode HC', val: '9.9 ms (20%)', sub: 'hc_attn 4.6 + hc_mlp 5.3 ms' },
+      { lbl: 'Weight Traffic', val: '1,266 MB BF16', sub: '96 x (6.64 + 6.55 MB) / round' },
+      { lbl: 'Effective Decode BW', val: '~128 GB/s', sub: 'Only 47% of 273 GB/s GB10 peak!' },
+      { lbl: 'Prefill HC (245K)', val: '271.8 ms', sub: '63 ms writeback + 209 ms readoutFused' },
+    ],
+    stages: [
+      { id: 'h_wb', name: '1. hcWriteback', ms: 1.0, status: 'sat', pos: [-11, 0, 0], kernel: 'hcWriteback (96x/round)', shapes: '4 residual streams h[n, 4, 2560] bf16', bw: 'L2 resident in decode (63 ms in 3072-row prefill)', why: '10.1% of decode HC: folds previous branch/MoE into 4 residual streams and computes group sums pss.', what: 'Updates h[n, 10240] in place.', example: 'In decode n=4, h is only 80 KB (fits L2); in prefill n=3072, 9-slot MoE writeback reads 19.6 GB (63 ms).', headroom: 'Already optimal (fusing with hcNorm for n<64 was slower due to 1-CTA/row).' },
+      { id: 'h_norm', name: '2. hcNormalize', ms: 0.7, status: 'sat', pos: [-6.5, 0, 0], kernel: 'hcNormalize (96x/round)', shapes: 'h[n, 10240] -> norm[n, 10240] bf16', bw: 'L2 resident', why: '7.1% of decode HC: RMSNorm across the 4 streams using pss.', what: 'Produces normalized 10,240-wide input for W_down.', example: 'Runs 96 times per decode round.', headroom: 'Small.' },
+      { id: 'h_down', name: '3. W_down [324, 10240]', ms: 4.1, status: 'hot', pos: [-1.5, 0, 0], kernel: 'qmmf BF16 (TF_QMMF_HALF_BELOW=0 -> 1 exact wave of 48 SMs!)', shapes: '96 x [324, 10240] BF16 = 637 MB read/round', bw: '~155 GB/s (57% of 273 GB/s peak)', why: '41.4% of decode HC (4.1 ms): reads 637 MB BF16 every round! TF_QMMF_HALF_BELOW=0 fixed 2-wave (88 CTA) -> 1-wave (48 CTA = 6 clusters x 8) on GB10 (+1.5% N=1 decode).', what: 'Computes 320 low-rank mix activations + 4 inject gates.', example: 'Quantizing to MXFP8 saved -2.2 ms here, but 3-bit E4M3 mantissa broke 120K needle retrieval.', headroom: 'HIGH LEVER: INT8 (7-bit mantissa) W_down could halve 637 MB -> 318 MB without 3-bit FP8 drift.' },
+      { id: 'h_act', name: '4. hcReduceAct', ms: 0.4, status: 'sat', pos: [3.2, 0, 0], kernel: 'hcReduceAct (SiLU + split inject)', shapes: '[n, 324] fp32 -> act[n, 320] + inj[n, 4]', bw: 'Tiny', why: '4.0% of decode HC: tiny launch overhead x 96.', what: 'Applies activation and separates the 4 stream injection gates.', example: '96 launches per round.', headroom: 'Tiny.' },
+      { id: 'h_up', name: '5. W_up [10240, 320] + Mix', ms: 3.7, status: 'hot', pos: [8.5, 0, 0], kernel: 'qmmf BF16 (160 CTAs, only 5 K-steps!) + hcDenseMix', shapes: '96 x [10240, 320] BF16 = 629 MB read/round + hc_up DRAM roundtrip', bw: '~170 GB/s (62% of peak)', why: '37.4% of decode HC (3.7 ms): reads 629 MB BF16 through a heavy 4-stage cp.async pipeline for only 5 K-steps (320/64), writes hc_up, then launches separate hcDenseMix!', what: 'Projects act[n, 320] back to 10,240 and mixes the 4 streams into mixed[n, 2560].', example: 'Prefill already has fusedUpMix (readoutFused), but decode n<=16 still runs 2 unfused kernels!', headroom: 'HIGH LEVER (100% EXACT BF16): A custom fused BF16 decode W_up+hcDenseMix kernel (or INT8) could save ~1.5-2.5 ms/round!' },
+    ],
+    edges: [
+      ['h_wb', 'h_norm', 0x38bdf8], ['h_norm', 'h_down', 0xf87171],
+      ['h_down', 'h_act', 0xfbbf24], ['h_act', 'h_up', 0xf87171]
+    ]
+  },
+
+  dflash: {
+    title: 'Deep-Dive: DFlash2 Speculative Decoding Loop (N=1 Round = 49.6 ms)',
+    totalMs: 49.6,
+    kpis: [
+      { lbl: 'Draft Overhead', val: '3.1 ms (6.3%)', sub: 'ingest 0.31 + block 2.79 ms' },
+      { lbl: 'Target Verify', val: '35.6–54.4 ms', sub: '2 rows=35.6ms ... 8 rows=54.4ms' },
+      { lbl: 'Acceptance (Code/JSON)', val: '81–85%', sub: '5.0–6.5 tok/round -> 97–116 tok/s' },
+      { lbl: 'Acceptance (Prose)', val: '57%', sub: '2.0 tok/round -> 53 tok/s (BW wall)' },
+    ],
+    stages: [
+      { id: 'f_tap', name: '1. Target Taps (5 Layers)', ms: 0.1, status: 'sat', pos: [-12, 0, 0], kernel: 'df_tap (layers 5, 15, 25, 35, 45)', shapes: '5 x [kept, 2560] bf16 copied to tap buffer', bw: '0.2% of round', why: '0.2%: tiny copy of accepted hidden states at 5 layers.', what: 'Captures target model context features to condition DFlash2.', example: 'After Round k accepts 5 tokens, their 5-layer taps go to DFlash2.', headroom: 'Zero.' },
+      { id: 'f_ing', name: '2. DFlash2 Ingest', ms: 0.3, status: 'sat', pos: [-7.5, 0, 0], kernel: 'ingestPass (fc + rmsnorm + 5x kv into 2048-tok ring)', shapes: 'kept rows -> 5-layer sliding-window KV ring', bw: '0.6% of round', why: '0.6% (0.31 ms): projects only the newly accepted tokens into DFlash2\'s 2,048-token context ring.', what: 'Keeps DFlash2 synchronized with the target model\'s exact accepted history.', example: 'Same 0.31 ms whether context is 1K or 248K (sliding window = 2,048).', headroom: 'Zero.' },
+      { id: 'f_blk', name: '3. DFlash2 Block-8 Pass', ms: 2.5, status: 'sat', pos: [-2.5, 0, 0], kernel: '5-layer 4-bit DFlash2 (0.44 GiB) + draft lm_head + top16', shapes: '[anchor, MASK x 7] -> 7 x top-16 candidates', bw: '~175 GB/s across 0.44 GiB', why: '5.0% (2.5 ms): 5 tiny 4-bit layers predict 7 masked future positions in parallel.', what: 'Outputs top-16 logit candidates + rank-256 codebook features for positions 1..7.', example: 'Anchor "def" -> predicts 7 future token distributions in one 2.5 ms pass!', headroom: 'Already tiny (5% of round).' },
+      { id: 'f_sel', name: '4. Host Codebook Select', ms: 0.3, status: 'sat', pos: [2.2, 0, 0], kernel: 'cuda_dflash_select.zig (pred/succ dot + chain_prob >= 0.50)', shapes: 'Up to 7 drafts; stops when product(p_i) < 0.50', bw: '0.6% of round', why: '0.6% (0.3 ms): greedily (or keyed-sampled) picks best chain; stops early on high-entropy prose so target doesn\'t waste +3 ms/row on doomed drafts.', what: 'Optimal cutoff 0.50 balances +3.0 ms/row MoE verify cost against acceptance probability.', example: 'Code: drafts 5-7 tokens (81% accept). Prose: stops at 2 tokens (57% accept).', headroom: 'Sweep (0.50/0.25/0.10/0.01) & 14-draft 2-block confirmed 7 / 0.50 is optimal.' },
+      { id: 'f_ver', name: '5. 48-Layer Target Verify', ms: 46.4, status: 'hot', pos: [7.5, 0, 0], kernel: 'CUDA-graphed 48-layer forward over [t0, d1..dm]', shapes: 'm+1 rows (2..8): ~5.6–8.9 GB weights read', bw: '273 GB/s physical floor = 20.5–32.6 ms', why: '93.5% (46.4 ms): the entire decode round is dominated by reading 6-9 GB of Target weights (Dense 2.12 GB + HC 1.27 GB + Active Experts 2.2-5.5 GB) from GB10\'s 273 GB/s LPDDR5X!', what: 'Verifies all m drafts in parallel, guarantees 100% bit-exact output (draft_on == draft_off), and emits prefix + 1 bonus token.', example: 'Prose physics wall: 2.0 tok/round / 0.038s = 53 tok/s (even 100% of 273 GB/s = 23 ms -> max 85 tok/s!). Code/JSON: 5-6.5 tok/round -> 97-116 tok/s.', headroom: 'Every -4 ms saved in Target Verify (e.g. fused BF16 HC) lifts ALL workloads by +9-10%.' },
+      { id: 'f_rb', name: '6. Accept + 0ms Rollback', ms: 0.0, status: 'sat', pos: [12.2, 0, 0], kernel: 'fn_gdn_rows_late circular log + KV pos rewind', shapes: '0.0 ms rollback overhead', bw: '0.0%', why: '0.0%: GDN state uses a pending-row ring buffer, so rejected drafts simply move the pointer back!', what: 'Commits accepted tokens to client SSE stream and feeds new anchor back to Step 1.', example: 'Accepted 4/5 drafts -> emits 5 tokens in 1 SSE burst, rewinds 1 rejected slot in 0.0 ms.', headroom: 'Zero.' },
+    ],
+    edges: [
+      ['f_tap', 'f_ing', 0xa78bfa], ['f_ing', 'f_blk', 0xa78bfa], ['f_blk', 'f_sel', 0xa78bfa],
+      ['f_sel', 'f_ver', 0xf87171], ['f_ver', 'f_rb', 0x34d399], ['f_rb', 'f_tap', 0x38bdf8, true]
+    ]
   }
 };
 
@@ -462,6 +591,28 @@ function makeTrack(z, color, label) {
 makeTrack(-2.6, 0x38bdf8, '36x GDN');
 makeTrack(2.6, 0xa78bfa, '12x QSA Attn');
 
+// Floor directional banner (LEFT = INPUT/START ━━▶ RIGHT = OUTPUT)
+function makeDirectionBanner() {
+  const c = document.createElement('canvas');
+  c.width = 1024; c.height = 96;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
+  ctx.strokeStyle = 'rgba(56, 189, 248, 0.5)';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.roundRect(8, 10, 1008, 76, 16); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#38bdf8';
+  ctx.font = 'bold 34px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('READ / EXECUTION DIRECTION:   INPUT  ━━━━▶  48 LAYERS  ━━━━▶  OUTPUT', 512, 60);
+  const tex = new THREE.CanvasTexture(c);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(24, 2.2), mat);
+  plane.rotation.x = -Math.PI / 2;
+  plane.position.set(0, 0.04, 6.2);
+  scene.add(plane);
+}
+makeDirectionBanner();
+
 // Dynamic scene groups
 const stageGroup = new THREE.Group();
 const pipeGroup = new THREE.Group();
@@ -469,12 +620,18 @@ const particleGroup = new THREE.Group();
 scene.add(stageGroup, pipeGroup, particleGroup);
 
 let currentModeKey = 'prefill245';
+let deepViewActive = false;
+let currentDeepKey = 'moe';
 let selectedId = null;
 let stageMeshes = [];
 let particles = [];
 let camAnim = null;
 let tourActive = false;
 let tourIdx = 0;
+
+function activeData() {
+  return deepViewActive ? DEEP_MODES[currentDeepKey] : MODES[currentModeKey];
+}
 
 function statusColor(status) {
   if (status === 'hot') return 0xf87171;
@@ -533,8 +690,23 @@ function addCurvePipe(p1, p2, color, loop = false) {
   else mid.y += 0.35;
   const curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
   const tubeGeo = new THREE.TubeGeometry(curve, 28, loop ? 0.07 : 0.08, 8, false);
-  const tubeMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: loop ? 0.45 : 0.35 });
+  const tubeMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: loop ? 0.50 : 0.42 });
   pipeGroup.add(new THREE.Mesh(tubeGeo, tubeMat));
+
+  // Explicit 3D directional arrowheads (cones aligned along the curve tangent!)
+  const arrowTs = loop ? [0.25, 0.5, 0.75] : [0.55];
+  const up = new THREE.Vector3(0, 1, 0);
+  for (const at of arrowTs) {
+    const pt = curve.getPointAt(at);
+    const tan = curve.getTangentAt(at).normalize();
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(0.22, 0.55, 10),
+      new THREE.MeshBasicMaterial({ color })
+    );
+    cone.position.copy(pt);
+    cone.quaternion.setFromUnitVectors(up, tan);
+    pipeGroup.add(cone);
+  }
 
   const count = loop ? 3 : 2;
   for (let k = 0; k < count; k++) {
@@ -547,9 +719,8 @@ function addCurvePipe(p1, p2, color, loop = false) {
   }
 }
 
-function buildScene(modeKey) {
-  currentModeKey = modeKey;
-  const mode = MODES[modeKey];
+function buildScene() {
+  const mode = activeData();
   clearGroup(stageGroup);
   clearGroup(pipeGroup);
   clearGroup(particleGroup);
@@ -565,24 +736,52 @@ function buildScene(modeKey) {
     const h = Math.max(0.45, (st.ms / maxMs) * 7.8);
     const col = statusColor(st.status);
 
-    const geo = new THREE.BoxGeometry(1.9, h, 1.9);
-    const mat = new THREE.MeshStandardMaterial({
-      color: col,
-      emissive: col,
-      emissiveIntensity: 0.22,
-      roughness: 0.32,
-      metalness: 0.35,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(st.pos[0], h / 2, st.pos[2]);
-    mesh.userData = { stage: st, baseY: h / 2, h };
-    stageGroup.add(mesh);
-    stageMeshes.push(mesh);
+    if (st.isMoEGrid) {
+      // Multi-expert 4x4 3D bank representing 512 sparse routed experts (glowing active + dim inactive)
+      const hitGeo = new THREE.BoxGeometry(2.5, h, 2.5);
+      const hitMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.08, depthWrite: false });
+      const hitMesh = new THREE.Mesh(hitGeo, hitMat);
+      hitMesh.position.set(st.pos[0], h / 2, st.pos[2]);
+      hitMesh.userData = { stage: st, baseY: h / 2, h };
+      stageGroup.add(hitMesh);
+      stageMeshes.push(hitMesh);
 
-    // Subtle wireframe cap
-    const edges = new THREE.EdgesGeometry(geo);
-    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.22 }));
-    mesh.add(line);
+      const subW = 0.42, gap = 0.56;
+      for (let gx = 0; gx < 4; gx++) {
+        for (let gz = 0; gz < 4; gz++) {
+          const active = ((gx * 5 + gz * 3) % 3) !== 0; // ~10 of 16 active visually
+          const sh = active ? h * (0.72 + ((gx + gz) % 3) * 0.14) : Math.max(0.35, h * 0.22);
+          const sGeo = new THREE.BoxGeometry(subW, sh, subW);
+          const sMat = new THREE.MeshStandardMaterial({
+            color: active ? col : 0x334155,
+            emissive: active ? col : 0x0f172a,
+            emissiveIntensity: active ? 0.32 : 0.05,
+            roughness: 0.35, metalness: 0.35
+          });
+          const sm = new THREE.Mesh(sGeo, sMat);
+          sm.position.set(st.pos[0] + (gx - 1.5) * gap, sh / 2, st.pos[2] + (gz - 1.5) * gap);
+          stageGroup.add(sm);
+        }
+      }
+    } else {
+      const geo = new THREE.BoxGeometry(1.9, h, 1.9);
+      const mat = new THREE.MeshStandardMaterial({
+        color: col,
+        emissive: col,
+        emissiveIntensity: 0.22,
+        roughness: 0.32,
+        metalness: 0.35,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(st.pos[0], h / 2, st.pos[2]);
+      mesh.userData = { stage: st, baseY: h / 2, h };
+      stageGroup.add(mesh);
+      stageMeshes.push(mesh);
+
+      const edges = new THREE.EdgesGeometry(geo);
+      const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.22 }));
+      mesh.add(line);
+    }
 
     const sp = makeLabelSprite(st.name.replace(/^\d+[a-c]?\.\s*/, ''), `${st.ms.toFixed(1)} ms (${pct.toFixed(1)}%)`, statusHex(st.status));
     sp.position.set(st.pos[0], h + 0.95, st.pos[2]);
@@ -597,31 +796,36 @@ function buildScene(modeKey) {
     addCurvePipe(p1, p2, col, loop);
   };
 
-  if (modeKey.startsWith('prefill')) {
-    connect('embed', 'ple', 0x38bdf8);
-    connect('ple', 'hc_attn', 0x38bdf8);
+  if (deepViewActive && mode.edges) {
+    for (const e of mode.edges) connect(e[0], e[1], e[2], !!e[3]);
   } else {
-    connect('draft', 'hc_attn', 0xa78bfa);
-    connect('head', 'draft', 0xa78bfa, true); // Speculative verify -> next DFlash2 round!
+    if (currentModeKey.startsWith('prefill')) {
+      connect('embed', 'ple', 0x38bdf8);
+      connect('ple', 'hc_attn', 0x38bdf8);
+    } else {
+      connect('draft', 'hc_attn', 0xa78bfa);
+      connect('head', 'draft', 0xa78bfa, true);
+    }
+    connect('hc_attn', 'gdn_proj', 0x38bdf8);
+    connect('gdn_proj', 'gdn_core', 0x38bdf8);
+    connect('gdn_core', 'gdn_out', 0x38bdf8);
+    connect('gdn_out', 'hc_mlp', 0x38bdf8);
+
+    connect('hc_attn', 'attn_proj', 0xa78bfa);
+    connect('attn_proj', 'attn_core', 0xa78bfa);
+    connect('attn_core', 'attn_out', 0xa78bfa);
+    connect('attn_out', 'hc_mlp', 0xa78bfa);
+
+    connect('hc_mlp', 'route', 0x34d399);
+    connect('route', 'routed4', 0xfbbf24);
+    connect('route', 'shared6', 0xa78bfa);
+    connect('routed4', 'head', 0x34d399);
+    connect('shared6', 'head', 0x34d399);
+    // 48-layer recurrence loop
+    connect('routed4', 'hc_attn', 0x38bdf8, true);
   }
-  connect('hc_attn', 'gdn_proj', 0x38bdf8);
-  connect('gdn_proj', 'gdn_core', 0x38bdf8);
-  connect('gdn_core', 'gdn_out', 0x38bdf8);
-  connect('gdn_out', 'hc_mlp', 0x38bdf8);
-
-  connect('hc_attn', 'attn_proj', 0xa78bfa);
-  connect('attn_proj', 'attn_core', 0xa78bfa);
-  connect('attn_core', 'attn_out', 0xa78bfa);
-  connect('attn_out', 'hc_mlp', 0xa78bfa);
-
-  connect('hc_mlp', 'route', 0x34d399);
-  connect('route', 'experts', 0xfbbf24);
-  connect('experts', 'head', 0x34d399);
-  // 48-layer recurrence loop
-  connect('experts', 'hc_attn', 0x38bdf8, true);
 
   renderUI(mode);
-  // Select biggest bottleneck by default
   const biggest = [...mode.stages].sort((a, b) => b.ms - a.ms)[0];
   selectStage(biggest.id, false);
 }
@@ -672,14 +876,15 @@ function flyTo(pos, target) {
 
 function selectStage(id, animateCam = true) {
   selectedId = id;
-  const mode = MODES[currentModeKey];
+  const mode = activeData();
   const st = mode.stages.find(s => s.id === id);
   if (!st) return;
 
   document.querySelectorAll('.stage-row').forEach(el => el.classList.toggle('selected', el.dataset.id === id));
   stageMeshes.forEach(m => {
     const isSel = m.userData.stage.id === id;
-    m.material.emissiveIntensity = isSel ? 0.65 : 0.20;
+    if (m.material.emissiveIntensity !== undefined) m.material.emissiveIntensity = isSel ? 0.65 : 0.20;
+    else m.material.opacity = isSel ? 0.24 : 0.08;
   });
 
   const pct = (st.ms / mode.totalMs) * 100;
@@ -693,6 +898,8 @@ function selectStage(id, animateCam = true) {
     <div class="meta-box" style="grid-column:span 2"><div class="k">Shapes &amp; Bandwidth</div><div class="v" style="font-size:11px;font-weight:500;">${st.shapes}<br><span style="color:#7dd3fc">${st.bw}</span></div></div>
   `;
 
+  const whyText = st.why || `Takes ${pct.toFixed(1)}% (${st.ms.toFixed(1)} ms) of this pass due to ${st.shapes} running at ${st.bw}.`;
+  document.getElementById('ins-why').innerHTML = `<h3>Why ${pct.toFixed(1)}% (${st.ms.toFixed(1)} ms) Is Spent Here</h3><p>${whyText}</p>`;
   document.getElementById('ins-what').innerHTML = `<h3>What Happens Here</h3><p>${st.what}</p>`;
 
   const subCard = document.getElementById('ins-sub');
@@ -721,7 +928,7 @@ function selectStage(id, animateCam = true) {
 
 // Guided Tour
 function updateTourStep() {
-  const stages = MODES[currentModeKey].stages;
+  const stages = activeData().stages;
   tourIdx = (tourIdx + stages.length) % stages.length;
   document.getElementById('tour-step').textContent = `${tourIdx + 1} / ${stages.length}`;
   selectStage(stages[tourIdx].id, true);
@@ -742,14 +949,41 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   flyTo(defaultCamPos, defaultTarget);
 });
 
+document.getElementById('btn-deep').addEventListener('click', (e) => {
+  deepViewActive = !deepViewActive;
+  e.target.classList.toggle('active', deepViewActive);
+  document.getElementById('sub-tabs').classList.toggle('show', deepViewActive);
+  document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('active', !deepViewActive && b.dataset.mode === currentModeKey));
+  tourActive = false;
+  document.getElementById('btn-tour').classList.remove('active');
+  document.getElementById('tour-controls').classList.remove('show');
+  buildScene();
+  flyTo(defaultCamPos, defaultTarget);
+});
+
+document.querySelectorAll('[data-deep]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-deep]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentDeepKey = btn.dataset.deep;
+    deepViewActive = true;
+    buildScene();
+    flyTo(defaultCamPos, defaultTarget);
+  });
+});
+
 document.querySelectorAll('[data-mode]').forEach(btn => {
   btn.addEventListener('click', () => {
+    deepViewActive = false;
+    document.getElementById('btn-deep').classList.remove('active');
+    document.getElementById('sub-tabs').classList.remove('show');
     document.querySelectorAll('[data-mode]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    currentModeKey = btn.dataset.mode;
     tourActive = false;
     document.getElementById('btn-tour').classList.remove('active');
     document.getElementById('tour-controls').classList.remove('show');
-    buildScene(btn.dataset.mode);
+    buildScene();
     flyTo(defaultCamPos, defaultTarget);
   });
 });
@@ -766,7 +1000,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   const hits = raycaster.intersectObjects(stageMeshes, false);
   if (hits.length) {
     const st = hits[0].object.userData.stage;
-    const pct = (st.ms / MODES[currentModeKey].totalMs) * 100;
+    const pct = (st.ms / activeData().totalMs) * 100;
     tooltip.style.display = 'block';
     tooltip.style.left = (e.clientX + 14) + 'px';
     tooltip.style.top = (e.clientY + 14) + 'px';
@@ -815,7 +1049,7 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-buildScene('prefill245');
+buildScene();
 animate();
 </script>
 </body>
