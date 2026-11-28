@@ -1,0 +1,101 @@
+Return a prefixed call to an unoffered tool as a tool call (TF_TOOL_UNOFFERED_PREFIX, e.g. `mcp__`).
+
+TensorFold keeps a tool-call envelope that names a tool absent from the request's `tools` as
+plain reply text. pi exposes MCP tools only inside its `codemode` tool, but after `codemode`
+lists `ALL_TOOLS` (72 names) the model often writes `<function=mcp__server__tool>` as a
+top-level call: the turn then ends with no call and raw markup as content (10/12 replays of
+the failing session context). With `TF_TOOL_UNOFFERED_PREFIX=mcp__` (comma-separated prefixes)
+the call is returned with the name as written, in the final parser (`tool_parse.callName`)
+and the streamer (`tool_stream` `.call`), so the client answers "tool not found" and the model
+retries through `codemode`. Other unoffered names, and an unset variable, keep stock behavior
+(envelope kept as content). Test: tool_stream_test.zig "TF_TOOL_UNOFFERED_PREFIX ..." covers
+final parse, off/on/other names, and the stream at every prefix boundary.
+
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 101d6cf..82ccd6a 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -247,7 +247,20 @@ fn argumentsClose(a: Allocator, body: []const u8) Allocator.Error![]const u8 {
+ /// The offered tool's spelling, or null when the request did not declare that name.
+ fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
+     const name = strip(c.name);
+-    return if (known.get(try std.ascii.allocLowerString(a, name))) |offered| offered else null;
++    if (known.get(try std.ascii.allocLowerString(a, name))) |offered| return offered;
++    return if (unofferedPass(name)) name else null;
++}
++
++/// TF_TOOL_UNOFFERED_PREFIX (comma-separated, e.g. ``mcp__``): a call naming an unoffered tool with one of these prefixes is
++/// returned as a call, so the client answers "tool not found" and the model can retry, instead of the envelope staying as text.
++pub fn unofferedPass(name: []const u8) bool {
++    const raw = std.c.getenv("TF_TOOL_UNOFFERED_PREFIX") orelse return false;
++    var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
++    while (it.next()) |prefix| {
++        const p = std.mem.trim(u8, prefix, " ");
++        if (p.len > 0 and name.len > p.len and std.mem.startsWith(u8, name, p)) return true;
++    }
++    return false;
+ }
+ 
+ /// A named ``_openai_tool_call`` with compact JSON arguments, or null when arguments are non-finite.
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index b9257bc..f9dfa37 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -231,7 +231,8 @@ pub const Streamer = struct {
+                 .call => {
+                     if (opening(rest, "<function=")) |m| {
+                         const lower = try std.ascii.allocLowerString(s.a, reply_text.pyStrip(m.name));
+-                        const name = s.known.get(lower) orelse {
++                        const written = reply_text.pyStrip(m.name);
++                        const name = s.known.get(lower) orelse if (tool_parse.unofferedPass(written)) try s.a.dupe(u8, written) else {
+                             s.buffered_close = "</tool_call>";
+                             s.dsml_searched = s.pos;
+                             if (!s.giveUp()) return;
+diff --git a/zig/src/server/tool_stream_test.zig b/zig/src/server/tool_stream_test.zig
+index b1177ce..4dce930 100644
+--- a/zig/src/server/tool_stream_test.zig
++++ b/zig/src/server/tool_stream_test.zig
+@@ -251,3 +251,43 @@ test "a malformed DSML block's header stands: its nested XML is argument text an
+         try std.testing.expectEqualStrings("{\"q\":\"<tool_call><function=lookup></function></tool_call>\"{}", try sentArguments(a, out.items));
+     }
+ }
++
++test "TF_TOOL_UNOFFERED_PREFIX returns a prefixed unoffered call, final and streamed, and keeps other names as text" {
++    const env = @import("sys").env;
++    defer _ = env.unsetenv("TF_TOOL_UNOFFERED_PREFIX");
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"codemode\"}}]")).ok.array;
++    const mcp = "Opening. <tool_call>\n<function=mcp__chrome__new_page>\n<parameter=url>\nhttps://x.test/?q=a\n</parameter>\n</function>\n</tool_call>";
++    const other = "Opening. <tool_call><function=launch><parameter=when>now</parameter></function></tool_call>";
++
++    _ = env.unsetenv("TF_TOOL_UNOFFERED_PREFIX");
++    const off = try tool_parse.parse(a, mcp, tools, null);
++    try std.testing.expect(off.calls == null and off.kept_unoffered == 1);
++
++    _ = env.setenv("TF_TOOL_UNOFFERED_PREFIX", "mcp__", 1);
++    const on = try tool_parse.parse(a, mcp, tools, null);
++    try std.testing.expectEqual(@as(usize, 1), on.calls.?.len);
++    try std.testing.expectEqualStrings("mcp__chrome__new_page", on.calls.?[0].get("function").?.strField("name").?);
++    try std.testing.expectEqualStrings("{\"url\":\"https://x.test/?q=a\"}", on.calls.?[0].get("function").?.strField("arguments").?);
++    try std.testing.expectEqualStrings("Opening.", on.content);
++    try std.testing.expectEqual(@as(usize, 0), on.rejected_envelopes);
++
++    const kept = try tool_parse.parse(a, other, tools, null);
++    try std.testing.expect(kept.calls == null and kept.kept_unoffered == 1);
++
++    // streamed through every prefix: exactly one call, with the same arguments
++    for (0..mcp.len + 1) |n| {
++        var s = try Streamer.init(a, tools);
++        var out: std.ArrayList(Value) = .empty;
++        try s.feed(mcp[0..n], &out);
++        try s.feed(mcp, &out);
++        var names: usize = 0;
++        for (out.items) |d| for (d.get("tool_calls").?.array) |c| {
++            if (c.get("id") != null) names += 1;
++        };
++        try std.testing.expectEqual(@as(usize, 1), names);
++        try std.testing.expectEqualStrings("{\"url\":\"https://x.test/?q=a\"}", try canonical(a, try sentArguments(a, out.items)));
++    }
++}

@@ -44,6 +44,9 @@ export TF_FLASHNEXT_DFLASH_COPIES="${TF_FLASHNEXT_DFLASH_COPIES:-0}"
 # Fused BF16 hyper-connection read-out on prompt passes >= 768 rows (bit-identical, +3-4% prefill)
 export TF_FLASHNEXT_READOUT_FUSED="${TF_FLASHNEXT_READOUT_FUSED:-1}"
 export TF_QMMF_HALF_BELOW="${TF_QMMF_HALF_BELOW:-0}"
+# A call to an unoffered tool with this prefix (pi exposes mcp__* only inside codemode) is returned as a call, so the client
+# answers "tool not found" and the model retries, instead of the markup ending the turn as text (patch 0015; "" = stock)
+export TF_TOOL_UNOFFERED_PREFIX="${TF_TOOL_UNOFFERED_PREFIX-mcp__}"
 # Mixed prefill+decode interleaving: 0.85 gives 4x concurrent decode throughput during long prefills (+4.3s on 65K)
 export TENSORFOLD_PREFILL_SHARE="${TENSORFOLD_PREFILL_SHARE:-0.85}"
 export TF_FLASHNEXT_CHUNK="${TF_FLASHNEXT_CHUNK:-3072}"
