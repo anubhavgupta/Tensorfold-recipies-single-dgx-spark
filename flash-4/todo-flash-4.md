@@ -43,18 +43,13 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **How to fix:** Quantize the CTA's small `Q` tile to MXFP8 once at CTA start, and execute `mma.sync.aligned.kind::mxf8f6f4.block_scale` directly on staged `E4M3 + E8M0/32` KV tiles — eliminating `kv8_convert` and `tiles_kv`, dropping SMEM to `~26 KB` (restoring **3 CTAs/SM**), and doubling TC throughput.
   - **Est. gain:** `-25 to -35 ms/chunk` (`182.4 → ~145–155 ms`, **-2.5 s** off 248K TTFT, >90% GB10 BW ceiling).
 
-- [ ] **Asymmetric KV Cache (`K=MXFP8` / `V=NVFP4 or Q4–Q6`, ExLlamaV3 Pattern)**
-  - **Root cause:** Keys enter `exp(Q·K^T)` softmax (precision-sensitive), while Values are averaged linearly (much more tolerant of 4–6 bits).
-  - **Goal:** Keep `K` in MXFP8 (`E4M3 + E8M0/32`) and compress `V` to 4–6 bits (`NVFP4` or `Q4`/`Q6`), shrinking per-stream 262K KV from `5.10 GiB → ~3.8 GiB` (**10–11 full 262K streams** on GB10) and cutting 248K `attn_core` reads another ~25%.
-  - **Validation gate:** Must pass 120K needle retrieval (`FALCON-9472-OMEGA`) and 5/5 `draft_on == draft_off` exactness.
-
 ---
 
 ## 3. Dense 6-bit EXL3 (`gdn_proj` + `gdn_out` + `attn_proj` + `attn_out`: `432 ms` prefill / `11.7 ms` N=1 decode)
 
-- [ ] **Custom 3-Stage `cp.async` Transposed 6-bit Dense Prompt Kernel (Prefill)**
-  - **Root cause:** `exl3_linear_wc` runs in 128-row blocks (24× weight re-reads per 3,072-row chunk, ALU-bound on 6-bit trellis decode). Unpacking to DRAM BF16 + `qmmf` was slower (`-3%` to `-7%`) due to 5.4 GB unpacked DRAM traffic.
-  - **Goal:** Apply the same transposed 3-stage `cp.async` SMEM design as `exl3_prompt.cuh` (Patch `0007`/`0010`) directly to 6-bit dense projections so each 6-bit weight tile is decoded once in SMEM/registers across 64–128 rows without ever writing unpacked weights to DRAM, and write directly into stitched output columns.
+- [ ] **ExLlamaV3-Style Dense Prefill Staging (`FP16 Unpack + cuBLAS` for `M = 3,072`) — OR Custom 3-Stage `cp.async` Transposed 6-bit Dense Prompt Kernel (Prefill)**
+  - **Root cause:** `exl3_linear_wc` runs in 128-row blocks (24× weight re-reads per 3,072-row chunk, ALU-bound on 6-bit trellis decode). Earlier Wave-3 `unpack + BF16 qmmf` was slower due to 1,024-row blocks and a layout mismatch.
+  - **Goal:** Either (a) **ExLlamaV3 default (`Prefill staging`)**: unpack each 6-bit dense `W_q` once per 3,072-row chunk into FP16 scratch and run native **FP16 cuBLAS `cublasGemmEx`** (FP32 acc, within 1–3% of native FP16), or (b) apply `exl3_prompt.cuh`'s 3-stage `cp.async` transposed SMEM design directly to 6-bit dense projections without writing unpacked weights to DRAM.
   - **Est. gain:** `-100 to -150 ms/chunk` (**+8–11% cold prefill**, toward `~2,250+ tok/s`), 100% lossless.
 
 - [ ] **Zero-Copy Strided Output (`y_stride` + `col` offset) in `tf_exl3_group_12_2` (Decode N=1)**
