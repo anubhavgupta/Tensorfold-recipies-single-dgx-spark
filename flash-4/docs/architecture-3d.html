@@ -137,10 +137,10 @@
     <span>Qwen3.8-Flash-Next (EXL3 4.05bpw + DFlash2 + MXFP8 KV) &bull; NVIDIA DGX Spark GB10 (128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)</span>
   </div>
   <div class="mode-group">
-    <button class="btn active" data-mode="prefill245">Prefill 245K (1,630 ms)</button>
-    <button class="btn" data-mode="prefill16">Prefill 16K (1,409 ms)</button>
-    <button class="btn" data-mode="decode1">Decode N=1 (49.6 ms)</button>
-    <button class="btn" data-mode="decode4">Decode N=4 (96.5 ms)</button>
+    <button class="btn active" data-mode="prefill245">Prefill 245K (1,485 ms)</button>
+    <button class="btn" data-mode="prefill16">Prefill 16K (1,280 ms)</button>
+    <button class="btn" data-mode="decode1">Decode N=1 (45.5 ms)</button>
+    <button class="btn" data-mode="decode4">Decode N=4 (90.0 ms)</button>
     <button class="btn deep" id="btn-deep">&#128269; Deep-Dive Inner View</button>
     <button class="btn tour" id="btn-tour">&#9654; Guided Tour</button>
     <button class="btn" id="btn-reset">Reset Cam</button>
@@ -208,11 +208,11 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 // ============================================================================
 const MODES = {
   prefill245: {
-    title: 'Prefill — 245K Context Chunk (3,072 rows)',
-    totalMs: 1630.2,
+    title: 'Prefill — 245K Context Chunk (3,072 rows, Patches 0001–0014)',
+    totalMs: 1485.0,
     kpis: [
-      { lbl: 'Chunk Latency', val: '1,630.2 ms', sub: 'was 2,927 ms (-44%)' },
-      { lbl: '248K Cold Speed', val: '1,928 tok/s', sub: 'TTFT 128.5s (was 229.7s)' },
+      { lbl: 'Chunk Latency', val: '~1,485 ms', sub: 'was 2,927 ms (-49% / 1.97x!)' },
+      { lbl: '248K Cold Speed', val: '2,067 tok/s', sub: 'TTFT 119.8s (was 229.7s, -110s!)' },
       { lbl: 'Active Layers', val: '36 GDN + 12 QSA', sub: '48 layers, 513 experts' },
       { lbl: 'KV Cache (MXFP8)', val: '5.10 GiB/262K', sub: '8 full 262K streams max' },
     ],
@@ -249,13 +249,14 @@ const MODES = {
         headroom: 'Writeback is at >90% LPDDR5X ceiling. Quantizing HC weights to MXFP8 broke 120K needle retrieval — must stay BF16.'
       },
       {
-        id: 'gdn_proj', name: '4a. GDN Proj (36x)', ms: 230.6, status: 'med', pos: [-5.5, 0, -2.6],
-        kernel: 'exl3_linear_wc (6-bit mul1, 128-row blocks)',
+        id: 'gdn_proj', name: '4a. GDN Proj (36x)', ms: 152.0, status: 'sat', pos: [-5.5, 0, -2.6],
+        kernel: 'Patch 0014: FP16 unpack once + cuBLASLt FP16->FP32 + strided rotOut',
         shapes: 'mixed[3072, 2560] x (qkv[8192] + z[4096] + a/b[96])',
-        bw: '1.15 GB 6-bit weights x 24 blocks; ALU-bound on 6-bit trellis decode',
-        what: '36 Gated DeltaNet layers: projects mixed[3072, 2560] into Q/K/V (8192), gate Z (4096), and plain BF16 decay/beta (96) using 6-bit EXL3 weights.',
-        example: 'Runs 24x 128-row blocks per 3,072-row chunk. Unpacking to BF16+qmmf was tested and 3-7% slower (5.4 GB unpacked write/read > on-the-fly decode).',
-        headroom: 'Moderate (~14% of chunk): only a custom 3-stage cp.async transposed 6-bit dense prompt kernel (like exl3_prompt.cuh) could beat exl3_linear_wc without unpacking to DRAM.'
+        bw: 'Was 230.6 ms on exl3_linear_wc (-79 ms / 1.52x faster! Zero copyCols)',
+        why: '10.2% of 245K chunk (down from 14.1%): Patch 0014 unpacks each 6-bit trellis once per chunk to FP16, runs Blackwell cuBLASLt FP16->FP32 GEMM at ~95 TFLOPS, and writes straight into strided output columns.',
+        what: '36 Gated DeltaNet layers using ExLlamaV3-style FP16 prefill staging (TF_EXL3_PREFILL_CUBLAS=1) with FP32 Z accumulation before FWHT128 * svh.',
+        example: 'Pushed 248K cold prefill under 2 minutes (126.95s -> 119.78s / 2,067 tok/s) with 100% byte-identical 120K needle & 4K long prompt!',
+        headroom: 'At HW ceiling (native Blackwell cuBLASLt FP16 Tensor Cores).'
       },
       {
         id: 'gdn_core', name: '4b. GDN Core (36x)', ms: 100.0, status: 'sat', pos: [-2.2, 0, -2.6],
@@ -264,51 +265,51 @@ const MODES = {
         bw: '2.77 ms/layer; double-buffered register-prefetched FP32 recurrence',
         what: 'Updates the linear-attention Gated DeltaNet recurrent state S = g*S + k*(beta*(v - S*k)) across all 3,072 tokens in exact FP32 so prefill matches step-by-step decode bit-for-bit.',
         example: 'Unlike quadratic attention, GDN cost is O(1) per token — identical 100.0 ms at 4K and 245K context!',
-        headroom: 'Low (6.1% of chunk). Chunked WY Tensor-Core form would change FP32 rounding vs decode.'
+        headroom: 'Low (6.7% of chunk). Chunked WY Tensor-Core form logged in long-term-testing-todo.md.'
       },
       {
-        id: 'gdn_out', name: '4c. GDN Out (36x)', ms: 98.7, status: 'med', pos: [1.1, 0, -2.6],
-        kernel: 'exl3_linear_wc (6-bit mul1, [2560, 6144])',
+        id: 'gdn_out', name: '4c. GDN Out (36x)', ms: 66.0, status: 'sat', pos: [1.1, 0, -2.6],
+        kernel: 'Patch 0014: FP16 unpack once + cuBLASLt FP16->FP32 + rotOut',
         shapes: 'gated_v[3072, 6144] -> out[3072, 2560]',
-        bw: '425 MB 6-bit weights across 36 layers; ALU-bound on trellis decode',
-        what: 'Output projection for the 36 GDN layers (6-bit EXL3).',
-        example: 'Same 128-row exl3_linear_wc schedule as gdn_proj.',
-        headroom: 'Moderate (6.1% of chunk) — same custom transposed 6-bit dense prompt kernel opportunity as gdn_proj.'
+        bw: 'Was 98.7 ms on exl3_linear_wc (-33 ms / 1.50x faster!)',
+        what: 'Output projection for the 36 GDN layers via ExLlamaV3-style FP16 prefill staging (Patch 0014).',
+        example: 'One unpack + one 3,072-row cuBLASLt FP16->FP32 GEMM per layer.',
+        headroom: 'At HW ceiling (4.4% of chunk).'
       },
       {
-        id: 'attn_proj', name: '5a. Attn Proj (12x)', ms: 69.7, status: 'med', pos: [-5.5, 0, 2.6],
-        kernel: 'exl3_linear_wc (6-bit mul1 q/k/v + 4-bit indexer)',
+        id: 'attn_proj', name: '5a. Attn Proj (12x)', ms: 48.0, status: 'sat', pos: [-5.5, 0, 2.6],
+        kernel: 'Patch 0014: FP16 unpack once + cuBLASLt FP16->FP32 + strided rotOut',
         shapes: 'mixed[3072, 2560] -> Q|Gate[12288] + K[512] + V[512] + Indexer[640]',
-        bw: '340 MB 6-bit/4-bit EXL3 across 12 attention layers',
+        bw: 'Was 69.7 ms on exl3_linear_wc (-22 ms / 1.45x faster!)',
         what: 'Projects mixed hidden states into 24 Q+Gate heads, 2 KV heads (dim 256), and 4 QSA indexer heads (dim 128) + 1 indexer key head.',
         example: 'Only 12 of 48 layers are full attention (every 4th layer: 3, 7, 11, ..., 47).',
-        headroom: 'Small (4.3% of chunk).'
+        headroom: 'At HW ceiling (3.2% of chunk).'
       },
       {
-        id: 'attn_core', name: '5b. QSA + MXFP8 Attn (12x)', ms: 318.3, status: 'hot', pos: [-2.2, 0, 2.6],
-        kernel: 'fn_attn_prep(MXFP8) + qsa_score_tc_v2 (0009) + qsa_select_3pass (0011) + fn_attn_fused(MXFP8, 0012)',
+        id: 'attn_core', name: '5b. QSA + MXFP8 Attn (12x)', ms: 304.5, status: 'med', pos: [-2.2, 0, 2.6],
+        kernel: 'fn_attn_prep(MXFP8) + qsa_score_tc_v2 (0009) + qsa_select_2pass (0011) + fn_attn_fused(MXFP8, 0012)',
         shapes: '245K context -> 61,250 pooled blocks -> top-512 blocks (2,048 keys/query) x 12 layers',
-        bw: 'Core reads ~38.5 GB MXFP8 KV @ ~211 GB/s (77% peak; was 77 GB BF16 = 298 ms!)',
-        what: 'Full long-context sparse attention pipeline: (1) RoPE + warp-only MXFP8 KV quant, (2) pool indexer keys, (3) BF16 Tensor Core 64-row cp.async score all 61K blocks, (4) 3-pass radix top-512 select, (5) sparse MXFP8 attention with BF16x2 SIMD dequant, (6) output gate.',
+        bw: 'Was 696 ms before 0009/0011/0012 (-56%!); MXFP8 core reads 38.5 GB @ ~211 GB/s',
+        what: 'Full long-context sparse attention pipeline: (1) RoPE + warp-only MXFP8 KV quant, (2) pool indexer keys, (3) BF16 Tensor Core 64-row cp.async score all 61K blocks, (4) 2-global-pass SMEM-compacted top-512 select, (5) sparse MXFP8 attention with BF16x2 SIMD dequant, (6) output gate.',
         subs: [
-          ['attn_prep (RoPE + MXFP8 quant)', 7.1, 0.44],
+          ['attn_prep (RoPE + MXFP8 quant)', 7.1, 0.48],
           ['qsa_pool (block mean+RoPE)', 0.2, 0.01],
-          ['qsa_score_tc v2 (Patch 0009, was 329 ms!)', 57.6, 3.53],
-          ['qsa_select 3-pass (Patch 0011, was 69 ms)', 64.8, 3.97],
-          ['attn_core MXFP8 (Patch 0012, was 298 ms!)', 182.4, 11.19],
-          ['attn_gate (SiLU gate)', 6.2, 0.38],
+          ['qsa_score_tc v2 (Patch 0009, was 329 ms!)', 57.6, 3.88],
+          ['qsa_select 2-pass SMEM (Patch 0011, was 69 ms)', 51.0, 3.43],
+          ['attn_core MXFP8 (Patch 0012, was 298 ms!)', 182.4, 12.28],
+          ['attn_gate (SiLU gate)', 6.2, 0.42],
         ],
-        example: '120K Needle Example: Query "Project Obsidian code?" scores 30,000 pooled blocks in 28 ms via mma16816, selects top-512 blocks containing "FALCON-9472-OMEGA", gathers 2,048 MXFP8 keys (528 B/pos) and produces byte-identical answer!',
-        headroom: 'Remaining levers: (1) Native Blackwell mxf8f6f4.block_scale MMA inside attn_core (no BF16 dequant, est. -30 ms), (2) 2-pass SMEM-compacted qsa_select (est. -25 ms).'
+        example: '120K Needle Example: Query "Project Obsidian code?" scores 30,000 pooled blocks via mma16816, selects top-512 in 2 global passes (40 KiB SMEM), gathers 2,048 MXFP8 keys (528 B/pos) and produces byte-identical answer!',
+        headroom: 'Only long-term PTX item left: native Blackwell mxf8f6f4.block_scale MMA (logged in long-term-testing-todo.md).'
       },
       {
-        id: 'attn_out', name: '5c. Attn Out (12x)', ms: 32.8, status: 'sat', pos: [1.1, 0, 2.6],
-        kernel: 'exl3_linear_wc (6-bit mul1, [2560, 6144])',
+        id: 'attn_out', name: '5c. Attn Out (12x)', ms: 22.0, status: 'sat', pos: [1.1, 0, 2.6],
+        kernel: 'Patch 0014: FP16 unpack once + cuBLASLt FP16->FP32 + rotOut',
         shapes: 'gated_ao[3072, 6144] -> out[3072, 2560]',
-        bw: '142 MB 6-bit weights across 12 layers',
-        what: 'Output projection for the 12 attention layers.',
+        bw: 'Was 32.8 ms (-11 ms)',
+        what: 'Output projection for the 12 attention layers via Patch 0014 cuBLASLt.',
         example: 'Writes residual branch to s.part for HC MLP writeback.',
-        headroom: 'Small (2.0% of chunk).'
+        headroom: 'At HW ceiling (1.5% of chunk).'
       },
       {
         id: 'hc_mlp', name: '6. HC MLP (48x)', ms: 104.7, status: 'sat', pos: [4.4, 0, 0],
@@ -361,13 +362,13 @@ const MODES = {
   },
 
   prefill16: {
-    title: 'Prefill — 16K Context Chunk (3,072 rows)',
-    totalMs: 1409.1,
+    title: 'Prefill — 16K Context Chunk (3,072 rows, Patches 0001–0014)',
+    totalMs: 1280.0,
     kpis: [
-      { lbl: 'Chunk Latency', val: '1,409.1 ms', sub: 'was 2,413 ms (-42%)' },
-      { lbl: '16K Cold Speed', val: '2,050–2,101 tok/s', sub: '2.0x faster than flash-3' },
-      { lbl: 'Experts Share', val: '32.3% (455.6 ms)', sub: 'was 58.3% (1,407 ms)' },
-      { lbl: 'Dense 6-bit Share', val: '30.4% (428.8 ms)', sub: '24x 128-row wc blocks' },
+      { lbl: 'Chunk Latency', val: '~1,280 ms', sub: 'was 2,413 ms (-47%!)' },
+      { lbl: '16K Cold Speed', val: '2,123 tok/s', sub: '2.05x faster than flash-3!' },
+      { lbl: 'Experts Share', val: '35.6% (455.6 ms)', sub: 'was 58.3% (1,407 ms)' },
+      { lbl: 'Dense 6-bit (0014)', val: '22.5% (~288 ms)', sub: 'was 429 ms (-141 ms cuBLASLt!)' },
     ],
     stages: [
       { id: 'embed', name: '1. Token Embed', ms: 0.6, status: 'sat', pos: [-14, 0, 0], kernel: 'embedDense', shapes: '3,072 rows -> h[3072,10240]', bw: '0.04%', what: 'Token embedding lookup into 4 residual streams.', example: '3,072 tokens of a 16K prompt.', headroom: 'Zero.' },
@@ -388,24 +389,24 @@ const MODES = {
   },
 
   decode1: {
-    title: 'Decode — N=1 Speculative Round (4.2 rows/window, Graphs ON)',
-    totalMs: 49.6,
+    title: 'Decode — N=1 Speculative Round (4 rows/window, Patches 0001–0014)',
+    totalMs: 45.5,
     kpis: [
-      { lbl: 'Round Latency', val: '49.6 ms', sub: 'verify 46.5 + draft 3.1 ms' },
-      { lbl: 'N=1 Speed (Code/JSON)', val: '97–116 tok/s', sub: '5.0–6.5 tok/round (81–85% acc)' },
-      { lbl: 'N=1 Speed (Prose)', val: '52.7–54.4 tok/s', sub: '2.0 tok/round (57% acc)' },
+      { lbl: 'Round Latency', val: '45.5 ms', sub: 'verify 42.4 (-3.5 ms via 0013!) + draft 3.1' },
+      { lbl: 'N=1 Code / JSON', val: '97.5 / 109.7 tok/s', sub: '+7.1% / +10.0% via Patch 0013!' },
+      { lbl: 'N=1 Prose / DevOps', val: '53.4 / 89.0 tok/s', sub: '+8.3% / +7.4% via Patch 0013!' },
       { lbl: 'Weight Traffic', val: '~6.3 GB/round', sub: '273 GB/s floor = 23.1 ms' },
     ],
     stages: [
-      { id: 'draft', name: '0. DFlash2 Drafter', ms: 3.1, status: 'sat', pos: [-14, 0, 0], kernel: '5-layer 4-bit DFlash2 + host codebook selector', shapes: 'ingest 0.31 ms + block[8] 2.79 ms (0.44 GiB weights)', bw: '~158 GB/s across 5 tiny layers', what: 'Ingests target hidden taps from layers 5/15/25/35/45 into a 2048-tok ring, runs a 5-layer 4-bit block-8 pass, and selects up to 7 draft tokens stopping when cumulative prob < 0.50.', example: 'Code example: anchor "def" -> drafts [" insert", "(", "self", ",", " key", ",", " val"] (7 drafts, 6 accepted = 7 tokens in 1 round!). Prose example: anchor "The" -> drafts [" rapid", " expansion"] (2 drafts, 1 accepted = 2 tokens).', headroom: 'Only 6.3% of round. 2-block (14-draft) was tested & slower because block 2 lacks target taps.' },
-      { id: 'hc_attn', name: '1. HC Attn (48x)', ms: 4.6, status: 'hot', pos: [-10.5, 0, 0], kernel: 'hcWriteback + hcNorm + qmmf BF16 (TF_QMMF_HALF_BELOW=0)', shapes: '48x (W_down[324,10240] + W_up[10240,320]) = 633 MB BF16', bw: '~138 GB/s (51% of GB10 273 GB/s peak!)', what: 'Reads 633 MB of BF16 Hyper-Connection weights every single decode round. TF_QMMF_HALF_BELOW=0 fixed 2-wave -> 1-wave on 48 SMs (+1.5%).', example: 'We tested MXFP8 HC (326 MB): cut verify by -4.5 ms (+14-18% decode!), proving HC BW is a huge lever — but 3-bit FP8 mantissa broke 120K needle retrieval.', headroom: 'HIGH LEVER (9.3% + 10.7% = 20% combined HC): A custom fused BF16 W_up + hcDenseMix decode kernel or INT8 (7-bit mantissa) HC could recover 2-4 ms/round without breaking 120K needle.' },
-      { id: 'gdn_proj', name: '2a. GDN Proj (36x)', ms: 6.5, status: 'med', pos: [-6.5, 0, -2.6], kernel: 'tf_exl3_group_12_2_{4,8} (Patch 0008 6-bit decodeGroup)', shapes: '36x fused (qkv[8192] + z[4096]) 6-bit = 1.15 GB', bw: '~177 GB/s (65% of 273 GB/s peak)', what: 'Fuses in_proj_qkv + z into ONE Hadamard rotation + ONE 6-bit EXL3 GEMM launch (Patch 0008 gave +2.3-3.4% N=1 decode!).', example: 'Reads 1.15 GB of 6-bit trellis weights for the 4-row verify window.', headroom: 'Moderate (13.1% of round; ~2.0 ms above 240 GB/s).' },
+      { id: 'draft', name: '0. DFlash2 Drafter', ms: 3.1, status: 'sat', pos: [-14, 0, 0], kernel: '5-layer 4-bit DFlash2 + host codebook selector', shapes: 'ingest 0.31 ms + block[8] 2.79 ms (0.44 GiB weights)', bw: '~158 GB/s across 5 tiny layers', what: 'Ingests target hidden taps from layers 5/15/25/35/45 into a 2048-tok ring, runs a 5-layer 4-bit block-8 pass, and selects up to 7 draft tokens stopping when cumulative prob < 0.50.', example: 'Code example: anchor "def" -> drafts [" insert", "(", "self", ",", " key", ",", " val"] (7 drafts, 6 accepted = 7 tokens in 1 round!). Prose example: anchor "The" -> drafts [" rapid", " expansion"] (2 drafts, 1 accepted = 2 tokens).', headroom: 'Only 6.8% of round. 2-block (14-draft) was tested & slower because block 2 lacks target taps.' },
+      { id: 'hc_attn', name: '1. HC Attn (48x)', ms: 3.1, status: 'med', pos: [-10.5, 0, 0], kernel: 'Patch 0013: fn_hcn_up1 fused BF16 W_up+hcDenseMix + 1-wave W_down', shapes: '48x (W_down[324,10240] + fused W_up[10240,320]+Mix) = 633 MB BF16', bw: '~204 GB/s (75% peak! Was 4.6 ms before Patch 0013)', what: 'Patch 0013 fused W_up + hcDenseMix into 1 launch (fn_hcn_up1, 80 CTAs, 14.2 KiB SMEM), saving -2.6 to -4.1 ms/round across HC Attn + HC MLP with 100% bit-exact BF16!', example: 'Boosted N=1 decode +6.9% to +9.7% across ALL workloads with 4/4 identical greedy & T=0.7 SHAs.', headroom: 'Lossless ceiling reached. Only lossy INT8 HC weights remain (in long-term-testing-todo.md).' },
+      { id: 'gdn_proj', name: '2a. GDN Proj (36x)', ms: 6.1, status: 'sat', pos: [-6.5, 0, -2.6], kernel: 'Patch 0008: tf_exl3_group_12_2 + zero-copy y_stride (-72 copyCols)', shapes: '36x fused (qkv[8192] + z[4096]) 6-bit = 1.15 GB', bw: '~189 GB/s (zero exl3_tmp traffic!)', what: 'Fuses in_proj_qkv + z into ONE rotation + ONE launch writing straight into pa via y_stride (Patch 0008).', example: 'Reads 1.15 GB of 6-bit trellis weights with zero copyCols launches.', headroom: 'At lossless EXL3 ceiling.' },
       { id: 'gdn_core', name: '2b. GDN Core (36x)', ms: 1.8, status: 'sat', pos: [-2.8, 0, -2.6], kernel: 'fn_gdn_rows_late (with rollback log)', shapes: '36x state[48,128,128] fp32 (113 MB total)', bw: '3.6% of round', what: 'Steps 4 verify rows through GDN state using a circular pending-row log so rejected draft tokens roll back cleanly in 0.0 ms.', example: 'If 4 of 6 drafts accept, rollback replays only the 4 kept tokens into state_in.', headroom: 'Saturated (3.6%).' },
       { id: 'gdn_out', name: '2c. GDN Out (36x)', ms: 2.4, status: 'med', pos: [0.8, 0, -2.6], kernel: 'tf_exl3_linear_12_2 (6-bit mul1)', shapes: '36x [2560, 6144] = 425 MB', bw: '~177 GB/s', what: '6-bit EXL3 GDN output projection.', example: '425 MB read across 36 layers.', headroom: 'Small (4.8%).' },
       { id: 'attn_proj', name: '3a. Attn Proj (12x)', ms: 2.0, status: 'sat', pos: [-6.5, 0, 2.6], kernel: 'tf_exl3_group_12_2 (Patch 0008 fused q+k+v)', shapes: '12x fused (q+k+v) 6-bit = 340 MB', bw: '~170 GB/s', what: 'Fused 6-bit Q/Gate + K + V projection in one launch.', example: '12 attention layers.', headroom: 'Small (4.0%).' },
       { id: 'attn_core', name: '3b. MXFP8 Attn (12x)', ms: 0.5, status: 'sat', pos: [-2.8, 0, 2.6], kernel: 'MXFP8 KV prep + QSA + attn_chunks (Patch 0012)', shapes: '0.5 ms @ 4K | 3.6 ms @ 245K (score 1.6, select 0.7, core 1.0)', bw: '1.0% @ 4K | 7.2% @ 245K', what: 'Writes MXFP8 K/V for verify window, runs QSA sparse attention over 2,048 keys at long context.', example: 'Even at 245K context, MXFP8 attention only adds 3.1 ms to a decode round!', headroom: 'Saturated.' },
       { id: 'attn_out', name: '3c. Attn Out (12x)', ms: 0.8, status: 'sat', pos: [0.8, 0, 2.6], kernel: 'tf_exl3_linear_12_2 (6-bit)', shapes: '12x [2560, 6144] = 142 MB', bw: '~177 GB/s', what: '12-layer attention output projection.', example: '142 MB read.', headroom: 'Zero (1.6%).' },
-      { id: 'hc_mlp', name: '4. HC MLP (48x)', ms: 5.3, status: 'hot', pos: [4.2, 0, 0], kernel: 'hcWriteback + hcNorm + qmmf BF16', shapes: '48x (W_down + W_up) = 633 MB BF16', bw: '~119 GB/s (44% of GB10 273 GB/s peak!)', what: 'Second 633 MB BF16 Hyper-Connection pass per layer (feeding MoE).', example: 'Combined with hc_attn, HC takes 9.9 ms (20% of entire N=1 decode round!) for 1.27 GB BF16.', headroom: 'HIGH LEVER: Custom fused BF16 W_up+hcDenseMix kernel or INT8 (7-bit) HC weights (must pass 120K needle!).' },
+      { id: 'hc_mlp', name: '4. HC MLP (48x)', ms: 3.4, status: 'med', pos: [4.2, 0, 0], kernel: 'Patch 0013: fn_hcn_up1 fused BF16 W_up+hcDenseMix + 1-wave W_down', shapes: '48x (W_down + fused W_up+Mix) = 633 MB BF16', bw: '~186 GB/s (68% peak! Was 5.3 ms before Patch 0013)', what: 'Second 633 MB BF16 HC pass per layer, now accelerated by Patch 0013 fn_hcn_up1 (zero hc_up DRAM write/read, zero hcDenseMix launch).', example: 'Combined HC dropped from 9.9 ms -> ~6.5 ms (-3.4 ms/round = +7-10% N=1 decode!).', headroom: 'Lossless ceiling reached. Only lossy INT8 HC weights remain (in long-term-testing-todo.md).' },
       { id: 'route', name: '5. MoE Router (48x)', ms: 1.5, status: 'sat', pos: [7.2, 0, 0], kernel: 'routerMany + topkMany', shapes: '4 rows x 512 logits x 48 layers', bw: '3.0% of round', what: 'Selects top-10 routed experts + shared 512 for each verify row.', example: '4 verify rows typically activate ~25-35 distinct experts/layer.', headroom: 'Saturated.' },
       { id: 'routed4', name: '6a. MoE Routed 512x4-bit (48x)', ms: 16.5, status: 'med', pos: [10.4, 0, -1.7], isMoEGrid: true, kernel: 'exl3_grouped (4-bit routed, top-10/tok)', shapes: '~25-35 distinct routed experts/layer (~2.6-3.2 GB read)', bw: '~185-200 GB/s (+3.0 ms per extra draft row!)', why: '33.3% of N=1 round: 4 verify rows pick ~30 distinct 4-bit experts per layer x 48 layers = ~2.8 GB read from LPDDR5X (2.8 GB / 185 GB/s = 15-16.5 ms). Every extra draft token activates ~5-8 new experts = +3.0 ms!', what: 'Grouped decode kernel reads only the active routed experts picked by the 4-6 verify rows (out of 512 total per layer).', subs: [['up rot + gemm + fin', 10.3, 20.8], ['down rot + gemm + fin', 6.2, 12.5]], example: 'Verify cost curve: 2 rows = 35.6 ms, 4 rows = 43.1 ms, 8 rows = 54.4 ms (+3.0 ms/row purely from reading more distinct experts!).', headroom: 'Bandwidth-bound. Hot-expert caching cannot help on GB10 (all weights already in unified RAM; 24 MiB L2 is 6x too small).' },
       { id: 'shared6', name: '6b. MoE Shared #512 (6-bit, 48x)', ms: 2.3, status: 'sat', pos: [10.4, 0, 2.0], kernel: 'exl3_grouped (expert 512, 6-bit mul1)', shapes: '48 x 2.95 MB = 141 MB read every round', bw: '~61-100 GB/s (tiny 2.3 ms across 48 layers)', why: '4.6% of N=1 round: shared expert 512 is 6-bit (2.95 MB/layer = 141 MB total) and fires on every single token regardless of routing.', what: 'Always-active shared expert 512 evaluated for all verify rows.', example: '48 layers x 2.95 MB = 141 MB — 6x larger than GB10\'s 24 MiB L2 cache, so it streams from LPDDR5X each round.', headroom: 'Small (4.6%).' },
@@ -414,13 +415,13 @@ const MODES = {
   },
 
   decode4: {
-    title: 'Decode — N=4 Concurrent Streams (~18–24 rows/round)',
-    totalMs: 96.5,
+    title: 'Decode — N=4 Concurrent Streams (Patches 0001–0014)',
+    totalMs: 90.0,
     kpis: [
-      { lbl: 'Round Latency', val: '96.5 ms', sub: 'verify 93.2 + draft 3.3 ms' },
-      { lbl: 'Aggregate Steady', val: '189 / 109 / 210', sub: 'code / prose / json tok/s' },
+      { lbl: 'Round Latency', val: '~90.0 ms', sub: '+4.1–8.0% faster via Patch 0013!' },
+      { lbl: 'Aggregate Steady', val: '188 / 110 / 211', sub: 'code / prose / json tok/s' },
       { lbl: 'Experts Bandwidth', val: '236 GB/s', sub: '86% of GB10 273 GB/s peak!' },
-      { lbl: 'Experts Share', val: '57.0% (55.0 ms)', sub: '11.94 GB distinct experts/round' },
+      { lbl: 'Experts Share', val: '61.1% (55.0 ms)', sub: '11.94 GB distinct experts/round' },
     ],
     stages: [
       { id: 'draft', name: '0. DFlash2 (4 streams)', ms: 3.3, status: 'sat', pos: [-14, 0, 0], kernel: 'Batched 4x block[8] = 32 rows', shapes: '4 streams drafted in ONE pass (3.3 ms vs 3.1 ms for N=1!)', bw: '3.4% of round', what: 'Batches all 4 streams into one 32-row DFlash2 forward pass — almost zero extra latency over N=1!', example: '4 concurrent users (code, prose, devops, json) all drafted in 3.3 ms total.', headroom: 'Saturated.' },
@@ -471,18 +472,18 @@ const DEEP_MODES = {
 
   attn: {
     title: 'Deep-Dive: QSA + MXFP8 Attention Inner Flow (245K Chunk, 12 Layers)',
-    totalMs: 318.3,
+    totalMs: 304.5,
     kpis: [
-      { lbl: '245K Attn Total', val: '318.3 ms', sub: 'was 696 ms (-54% via 0009/0011/0012!)' },
+      { lbl: '245K Attn Total', val: '304.5 ms', sub: 'was 696 ms (-56% via 0009/0011/0012!)' },
       { lbl: 'QSA Score TC v2', val: '57.6 ms', sub: 'was 329 ms (5.7x faster!)' },
+      { lbl: 'QSA Select 2-Pass', val: '51.0 ms', sub: 'was 69.4 ms (-26% SMEM-compacted!)' },
       { lbl: 'MXFP8 Attn Core', val: '182.4 ms', sub: 'was 298 ms BF16 (1.63x faster!)' },
-      { lbl: 'KV Footprint', val: '528 B/pos', sub: '5.10 GiB/262K (8 streams max)' },
     ],
     stages: [
       { id: 'a_prep', name: '1. Prep + MXFP8 Quant', ms: 7.1, status: 'sat', pos: [-12.5, 0, 0], kernel: 'fn_attn_prep_body + mxfp8_quant_row (Patch 0012)', shapes: 'pa[3072,13952] -> Q bf16, KC/VC MXFP8 (528 B/pos), IQ/IKC bf16', bw: '2.2% of attn; warp-only zero-SMEM E8M0 quant', why: '2.2% (7.1 ms): 8 warps/head = 8 groups of 32 elements; each warp computes exact ceiling power-of-2 E8M0 scale in 2 ALU ops with zero SMEM.', what: 'Applies Q/K/I RMSNorm + RoPE and writes K & V directly as 256 E4M3 codes + 8 E8M0 scale bytes per head (528 B/pos vs 1024 B BF16).', example: 'Saves 3.15 GiB per 262K stream (8.25 -> 5.10 GiB), admitting 8 full 262K streams on GB10.', headroom: 'Saturated.' },
       { id: 'a_pool', name: '2. QSA Key Pool', ms: 0.2, status: 'sat', pos: [-8.5, 0, 0], kernel: 'fn_qsa_pool_body (block ratio=4)', shapes: 'IKC[3072,128] -> POOLED[768,128] bf16', bw: '0.06% of attn', why: '0.06% (0.2 ms): only pools the 768 newly completed 4-token blocks in this chunk.', what: 'Averages every 4 indexer keys, norms, and RoPEs at block start.', example: 'At 245K context, POOLED holds 61,250 blocks (15.7 MB/layer).', headroom: 'Zero.' },
       { id: 'a_score', name: '3. QSA Score TC v2', ms: 57.6, status: 'sat', pos: [-4.2, 0, 0], kernel: 'fn_qsa_scores_tc (Patch 0009 v2: 64x512, 8 warps, cp.async)', shapes: 'IQ[3072,4,128] x POOLED[61250,128]^T -> SC[3072, 61250] fp32', bw: 'Was 329 ms scalar (5.7x faster! Near ~45 ms floor)', why: '18.1% (57.6 ms): scores 3,072 queries x 61,250 blocks x 4 heads via BF16 mma16816 + FP32 acc in 87,040 B dynamic SMEM with 4x POOLED reuse and register-only head sum.', what: 'Replaces scalar FP32 FMA (~7 TFLOPS) with Blackwell BF16 Tensor Cores (~90 TFLOPS).', example: 'Cut 248K TTFT by -11.3 s vs scalar with 100% byte-identical 120K needle retrieval.', headroom: 'Near theoretical ~45 ms floor.' },
-      { id: 'a_sel', name: '4. QSA Top-512 Select', ms: 64.8, status: 'hot', pos: [0.5, 0, 0], kernel: 'fn_qsa_select_body (Patch 0011: 3-pass 11+11+10-bit + match_any)', shapes: 'SC[3072, 61250] fp32 (9.03 GB across 12 layers) -> top-512 block IDs', bw: 'Was 69.4 ms; 5 full passes over 9 GB SC', why: '20.4% (64.8 ms): even with 3 radix passes + warp-aggregated atomics, still scans 9.03 GB of SC 5 times (3 radix + count + write).', what: 'Finds the exact top-512 pooled blocks (2,048 keys) per query row in deterministic block order.', example: 'Selects the exact 2,048 most relevant keys out of 245,000 for every query.', headroom: 'REMAINING LEVER: Compacting pass-0 candidates (<2,000 items) into SMEM could cut 5 global passes -> 2 (~-25 ms/chunk).' },
+      { id: 'a_sel', name: '4. QSA Top-512 Select', ms: 51.0, status: 'sat', pos: [0.5, 0, 0], kernel: 'fn_qsa_select_body (Patch 0011: 2-global-pass SMEM-compacted + bitonic sort)', shapes: 'SC[3072, 61250] fp32 (9.03 GB) -> 2 global passes (18.1 GB vs 45.1 GB!)', bw: 'Was 69.4 ms (-26.5% / -18.4 ms/chunk! 100% bit-exact)', why: '16.7% (51.0 ms): Global Pass 1 finds 11-bit boundary, Global Pass 2 compacts <=4,096 candidates into 40 KiB SMEM, then finishes passes 1-2 + tie-break + 512-item bitonic sort purely in SMEM.', what: 'Finds exact top-512 pooled blocks (2,048 keys) in ascending block order with only 2 global reads of SC.', example: 'Cut 248K TTFT by -2.6 s with 100% byte-identical 120K needle retrieval.', headroom: 'At lossless ceiling (2 global passes over 9.03 GB).' },
       { id: 'a_core', name: '5. MXFP8 Sparse Attn', ms: 182.4, status: 'med', pos: [5.5, 0, 0], kernel: 'fn_attn_fused (Patch 0012: cp.async MXFP8 + BF16x2 SIMD __hmul2)', shapes: '3,072 rows x 2,048 sparse keys x 2 KV heads x 528 B = ~38.5 GB read', bw: '~211 GB/s (77% peak; was 77 GB BF16 = 298 ms!)', why: '57.3% (182.4 ms): random-gather reads ~38.5 GB of MXFP8 K/V (half of BF16\'s 77 GB!), converts E4M3+E8M0 -> BF16 via SIMD __hmul2, and runs mma16816 online softmax.', what: 'Exact row-invariant sparse FlashAttention over the 2,048 selected keys.', example: '1.63x faster than BF16 attention at 245K while keeping 120K needle byte-identical!', headroom: 'REMAINING LEVER: Native Blackwell mxf8f6f4.block_scale MMA (zero BF16 dequant) could save ~25-35 ms/chunk.' },
       { id: 'a_gate', name: '6. Attn Output Gate', ms: 6.2, status: 'sat', pos: [10.5, 0, 0], kernel: 'fn_attn_gate (o / (1 + exp(-gate)))', shapes: 'ao[3072, 6144] -> gated[3072, 6144] bf16', bw: '1.9% of attn', why: '1.9% (6.2 ms): simple elementwise SiLU-style gate + 32-group sums.', what: 'Applies learned per-element output gate before attn_out projection.', example: 'Feeds gated[3072, 6144] into 6-bit attn_out.', headroom: 'Saturated.' },
     ],
@@ -493,12 +494,12 @@ const DEEP_MODES = {
   },
 
   hc: {
-    title: 'Deep-Dive: 4-Stream Hyper-Connections (N=1 Decode: 9.9 ms = 20% of Round!)',
-    totalMs: 9.9,
+    title: 'Deep-Dive: 4-Stream Hyper-Connections (N=1 Decode: ~6.5 ms after Patch 0013!)',
+    totalMs: 6.5,
     kpis: [
-      { lbl: 'N=1 Decode HC', val: '9.9 ms (20%)', sub: 'hc_attn 4.6 + hc_mlp 5.3 ms' },
+      { lbl: 'N=1 Decode HC', val: '~6.5 ms (14.3%)', sub: 'was 9.9 ms (-3.4 ms via Patch 0013!)' },
       { lbl: 'Weight Traffic', val: '1,266 MB BF16', sub: '96 x (6.64 + 6.55 MB) / round' },
-      { lbl: 'Effective Decode BW', val: '~128 GB/s', sub: 'Only 47% of 273 GB/s GB10 peak!' },
+      { lbl: 'Effective Decode BW', val: '~195 GB/s', sub: '71% of 273 GB/s (was 47%!)' },
       { lbl: 'Prefill HC (245K)', val: '271.8 ms', sub: '63 ms writeback + 209 ms readoutFused' },
     ],
     stages: [
@@ -506,7 +507,7 @@ const DEEP_MODES = {
       { id: 'h_norm', name: '2. hcNormalize', ms: 0.7, status: 'sat', pos: [-6.5, 0, 0], kernel: 'hcNormalize (96x/round)', shapes: 'h[n, 10240] -> norm[n, 10240] bf16', bw: 'L2 resident', why: '7.1% of decode HC: RMSNorm across the 4 streams using pss.', what: 'Produces normalized 10,240-wide input for W_down.', example: 'Runs 96 times per decode round.', headroom: 'Small.' },
       { id: 'h_down', name: '3. W_down [324, 10240]', ms: 4.1, status: 'hot', pos: [-1.5, 0, 0], kernel: 'qmmf BF16 (TF_QMMF_HALF_BELOW=0 -> 1 exact wave of 48 SMs!)', shapes: '96 x [324, 10240] BF16 = 637 MB read/round', bw: '~155 GB/s (57% of 273 GB/s peak)', why: '41.4% of decode HC (4.1 ms): reads 637 MB BF16 every round! TF_QMMF_HALF_BELOW=0 fixed 2-wave (88 CTA) -> 1-wave (48 CTA = 6 clusters x 8) on GB10 (+1.5% N=1 decode).', what: 'Computes 320 low-rank mix activations + 4 inject gates.', example: 'Quantizing to MXFP8 saved -2.2 ms here, but 3-bit E4M3 mantissa broke 120K needle retrieval.', headroom: 'HIGH LEVER: INT8 (7-bit mantissa) W_down could halve 637 MB -> 318 MB without 3-bit FP8 drift.' },
       { id: 'h_act', name: '4. hcReduceAct', ms: 0.4, status: 'sat', pos: [3.2, 0, 0], kernel: 'hcReduceAct (SiLU + split inject)', shapes: '[n, 324] fp32 -> act[n, 320] + inj[n, 4]', bw: 'Tiny', why: '4.0% of decode HC: tiny launch overhead x 96.', what: 'Applies activation and separates the 4 stream injection gates.', example: '96 launches per round.', headroom: 'Tiny.' },
-      { id: 'h_up', name: '5. W_up [10240, 320] + Mix', ms: 3.7, status: 'hot', pos: [8.5, 0, 0], kernel: 'qmmf BF16 (160 CTAs, only 5 K-steps!) + hcDenseMix', shapes: '96 x [10240, 320] BF16 = 629 MB read/round + hc_up DRAM roundtrip', bw: '~170 GB/s (62% of peak)', why: '37.4% of decode HC (3.7 ms): reads 629 MB BF16 through a heavy 4-stage cp.async pipeline for only 5 K-steps (320/64), writes hc_up, then launches separate hcDenseMix!', what: 'Projects act[n, 320] back to 10,240 and mixes the 4 streams into mixed[n, 2560].', example: 'Prefill already has fusedUpMix (readoutFused), but decode n<=16 still runs 2 unfused kernels!', headroom: 'HIGH LEVER (100% EXACT BF16): A custom fused BF16 decode W_up+hcDenseMix kernel (or INT8) could save ~1.5-2.5 ms/round!' },
+      { id: 'h_up', name: '5. Fused W_up + Mix (0013)', ms: 1.9, status: 'sat', pos: [8.5, 0, 0], kernel: 'Patch 0013: fn_hcn_up1 (hcn::upmix_body<1,5>, 80 CTAs, 14.2 KiB SMEM)', shapes: '96 x [10240, 320] BF16 = 629 MB; ZERO hc_up DRAM traffic, ZERO hcDenseMix launch!', bw: 'Was 3.7 ms unfused (-1.8 to -3.5 ms saved! 100% bit-exact BF16)', why: '29.2% of decode HC (1.9 ms): Patch 0013 fused W_up + hcDenseMix + norm reads into 1 single kernel (80 CTAs, 6 CTAs/SM), lifting N=1 decode +7-10% and N=4 +4-8%!', what: 'Projects act[n, 320] and mixes all 4 streams into mixed[n, 2560] in registers.', example: 'Verified 4/4 greedy & T=0.7 SHAs 100% byte-identical.', headroom: 'At lossless BF16 ceiling (INT8 HC logged in long-term-testing-todo.md).' },
     ],
     edges: [
       ['h_wb', 'h_norm', 0x38bdf8], ['h_norm', 'h_down', 0xf87171],
