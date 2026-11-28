@@ -21,6 +21,11 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **Validation gate:** **Must pass 120K needle retrieval (`FALCON-9472-OMEGA`)**, 5/5 greedy & T=0.7 `draft_on == draft_off` exactness, and zero prefill regression.
   - **Est. gain:** `-3.0 to -4.0 ms/round` (**+8–10% N=1 decode** across all workloads).
 
+- [ ] **Column-Parallel Fused `hcWriteback + hcNormalize` for Decode (`n < 64`)**
+  - **Root cause:** Stock's fused `hcWritebackNorm` launches only **1 CTA per row**, which under-utilizes GB10's 48 SMs when `n = 1..8` (which is why stock gates it to `n >= 64` and why forcing `n >= 1` regressed decode by `-1.5–3%`). As a result, `HC MLP` + `HC Attn` run separate `hcWriteback` (including FP32 `s.part` reduction on `HC MLP`) and `hcNormalize` kernels (`96` extra launches + `h [n, 10240]` roundtrip).
+  - **Goal:** Split the 10,240 columns across multiple CTAs per row (with a tiny block/grid RMS reduction) so decode (`n < 64`) gets both kernel fusion and full 48-SM occupancy.
+  - **Est. gain:** `-0.5 to -0.8 ms/round` (**+1–2% N=1 decode**), 100% bit-exact BF16.
+
 ---
 
 ## 2. Long-Context Prefill (245K) — QSA + MXFP8 Attention (`318.3 ms` = 19.5% of chunk)
