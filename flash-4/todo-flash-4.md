@@ -43,6 +43,11 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **How to fix:** Quantize the CTA's small `Q` tile to MXFP8 once at CTA start, and execute `mma.sync.aligned.kind::mxf8f6f4.block_scale` directly on staged `E4M3 + E8M0/32` KV tiles — eliminating `kv8_convert` and `tiles_kv`, dropping SMEM to `~26 KB` (restoring **3 CTAs/SM**), and doubling TC throughput.
   - **Est. gain:** `-25 to -35 ms/chunk` (`182.4 → ~145–155 ms`, **-2.5 s** off 248K TTFT, >90% GB10 BW ceiling).
 
+- [ ] **Asymmetric KV Cache (`K=MXFP8` / `V=NVFP4 or Q4–Q6`, ExLlamaV3 Pattern)**
+  - **Root cause:** Keys enter `exp(Q·K^T)` softmax (precision-sensitive), while Values are averaged linearly (much more tolerant of 4–6 bits).
+  - **Goal:** Keep `K` in MXFP8 (`E4M3 + E8M0/32`) and compress `V` to 4–6 bits (`NVFP4` or `Q4`/`Q6`), shrinking per-stream 262K KV from `5.10 GiB → ~3.8 GiB` (**10–11 full 262K streams** on GB10) and cutting 248K `attn_core` reads another ~25%.
+  - **Validation gate:** Must pass 120K needle retrieval (`FALCON-9472-OMEGA`) and 5/5 `draft_on == draft_off` exactness.
+
 ---
 
 ## 3. Dense 6-bit EXL3 (`gdn_proj` + `gdn_out` + `attn_proj` + `attn_out`: `432 ms` prefill / `11.7 ms` N=1 decode)
