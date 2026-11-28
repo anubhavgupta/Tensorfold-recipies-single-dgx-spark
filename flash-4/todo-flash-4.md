@@ -75,6 +75,20 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 
 ---
 
+## 5. Lower-Priority / Exploratory Prefill Items (from `architecture-3d.html`)
+
+- [ ] **Chunked WY Tensor-Core `gdn_core` Prefill (`100.0 ms` = 6.1% @ 245K / 7.0% @ 16K)**
+  - **Root cause:** `gdn_prefill.cu` runs exact step-by-step FP32 recurrence across 3,072 rows (`2.77 ms/layer × 36 layers = 100 ms`) to match decode rounding bit-for-bit.
+  - **Goal:** Evaluate a chunked WY Tensor-Core prefill formulation (preserving FP32 state updates across chunks) and test against 120K needle retrieval + greedy parity.
+  - **Est. gain:** `-40 to -60 ms/chunk` (**+3–4% cold prefill**); note prefill rounding will differ slightly from step-by-step decode.
+
+- [ ] **Optional Startup `madvise(MADV_WILLNEED)` Pre-Fault for PLE N-Gram Table (`16.6 ms` cold 16K / `9.4 ms` 245K)**
+  - **Root cause:** Even with Patch `0011` (8-thread host gather), the very first cold prompt hits minor page faults on untouched mmap pages of the host n-gram table (`16.6 ms` vs `9.4 ms` warm).
+  - **Goal:** Add an opt-in startup pre-fault knob (only when host RAM headroom allows without squeezing KV cache) to eliminate first-request cold-fault spikes.
+  - **Est. gain:** `-5 to -7 ms` on first cold prompt chunk only (0.5% overall), 100% bit-exact.
+
+---
+
 ## Reference
 - Interactive 3D architecture & latency profiler: `flash-4/docs/architecture-3d.html`
 - Serve locally: `python3 -m http.server 8090 --directory flash-4/docs`
