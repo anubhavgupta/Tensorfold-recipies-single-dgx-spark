@@ -516,20 +516,20 @@ const DEEP_MODES = {
   },
 
   dflash: {
-    title: 'Deep-Dive: DFlash2 Speculative Decoding Loop (N=1 Round = 49.6 ms)',
-    totalMs: 49.6,
+    title: 'Deep-Dive: DFlash2 Speculative Decoding Loop (N=1 Round = 45.5 ms, Patch 0013)',
+    totalMs: 45.5,
     kpis: [
-      { lbl: 'Draft Overhead', val: '3.1 ms (6.3%)', sub: 'ingest 0.31 + block 2.79 ms' },
-      { lbl: 'Target Verify', val: '35.6–54.4 ms', sub: '2 rows=35.6ms ... 8 rows=54.4ms' },
-      { lbl: 'Acceptance (Code/JSON)', val: '81–85%', sub: '5.0–6.5 tok/round -> 97–116 tok/s' },
-      { lbl: 'Acceptance (Prose)', val: '57%', sub: '2.0 tok/round -> 53 tok/s (BW wall)' },
+      { lbl: 'Draft Overhead', val: '3.1 ms (6.8%)', sub: 'ingest 0.31 + block 2.79 ms' },
+      { lbl: 'Target Verify (0013)', val: '35.6–54.2 ms', sub: '-2.6 to -4.1 ms via fn_hcn_up1!' },
+      { lbl: 'Acceptance (Code/JSON)', val: '81–85%', sub: '5.0–6.5 tok/round -> 97.5–109.7 tok/s' },
+      { lbl: 'Acceptance (Prose)', val: '57%', sub: '2.0 tok/round -> 53.4 tok/s (BW wall)' },
     ],
     stages: [
       { id: 'f_tap', name: '1. Target Taps (5 Layers)', ms: 0.1, status: 'sat', pos: [-12, 0, 0], kernel: 'df_tap (layers 5, 15, 25, 35, 45)', shapes: '5 x [kept, 2560] bf16 copied to tap buffer', bw: '0.2% of round', why: '0.2%: tiny copy of accepted hidden states at 5 layers.', what: 'Captures target model context features to condition DFlash2.', example: 'After Round k accepts 5 tokens, their 5-layer taps go to DFlash2.', headroom: 'Zero.' },
       { id: 'f_ing', name: '2. DFlash2 Ingest', ms: 0.3, status: 'sat', pos: [-7.5, 0, 0], kernel: 'ingestPass (fc + rmsnorm + 5x kv into 2048-tok ring)', shapes: 'kept rows -> 5-layer sliding-window KV ring', bw: '0.6% of round', why: '0.6% (0.31 ms): projects only the newly accepted tokens into DFlash2\'s 2,048-token context ring.', what: 'Keeps DFlash2 synchronized with the target model\'s exact accepted history.', example: 'Same 0.31 ms whether context is 1K or 248K (sliding window = 2,048).', headroom: 'Zero.' },
       { id: 'f_blk', name: '3. DFlash2 Block-8 Pass', ms: 2.5, status: 'sat', pos: [-2.5, 0, 0], kernel: '5-layer 4-bit DFlash2 (0.44 GiB) + draft lm_head + top16', shapes: '[anchor, MASK x 7] -> 7 x top-16 candidates', bw: '~175 GB/s across 0.44 GiB', why: '5.0% (2.5 ms): 5 tiny 4-bit layers predict 7 masked future positions in parallel.', what: 'Outputs top-16 logit candidates + rank-256 codebook features for positions 1..7.', example: 'Anchor "def" -> predicts 7 future token distributions in one 2.5 ms pass!', headroom: 'Already tiny (5% of round).' },
       { id: 'f_sel', name: '4. Host Codebook Select', ms: 0.3, status: 'sat', pos: [2.2, 0, 0], kernel: 'cuda_dflash_select.zig (pred/succ dot + chain_prob >= 0.50)', shapes: 'Up to 7 drafts; stops when product(p_i) < 0.50', bw: '0.6% of round', why: '0.6% (0.3 ms): greedily (or keyed-sampled) picks best chain; stops early on high-entropy prose so target doesn\'t waste +3 ms/row on doomed drafts.', what: 'Optimal cutoff 0.50 balances +3.0 ms/row MoE verify cost against acceptance probability.', example: 'Code: drafts 5-7 tokens (81% accept). Prose: stops at 2 tokens (57% accept).', headroom: 'Sweep (0.50/0.25/0.10/0.01) & 14-draft 2-block confirmed 7 / 0.50 is optimal.' },
-      { id: 'f_ver', name: '5. 48-Layer Target Verify', ms: 46.4, status: 'hot', pos: [7.5, 0, 0], kernel: 'CUDA-graphed 48-layer forward over [t0, d1..dm]', shapes: 'm+1 rows (2..8): ~5.6–8.9 GB weights read', bw: '273 GB/s physical floor = 20.5–32.6 ms', why: '93.5% (46.4 ms): the entire decode round is dominated by reading 6-9 GB of Target weights (Dense 2.12 GB + HC 1.27 GB + Active Experts 2.2-5.5 GB) from GB10\'s 273 GB/s LPDDR5X!', what: 'Verifies all m drafts in parallel, guarantees 100% bit-exact output (draft_on == draft_off), and emits prefix + 1 bonus token.', example: 'Prose physics wall: 2.0 tok/round / 0.038s = 53 tok/s (even 100% of 273 GB/s = 23 ms -> max 85 tok/s!). Code/JSON: 5-6.5 tok/round -> 97-116 tok/s.', headroom: 'Every -4 ms saved in Target Verify (e.g. fused BF16 HC) lifts ALL workloads by +9-10%.' },
+      { id: 'f_ver', name: '5. 48-Layer Target Verify', ms: 42.4, status: 'med', pos: [7.5, 0, 0], kernel: 'CUDA-graphed 48-layer forward (Patches 0008 + 0013)', shapes: 'm+1 rows (2..8): ~5.6–8.9 GB weights read', bw: 'Was 46.4 ms; Patch 0013 saved -2.6 to -4.1 ms/round (+7-10% ALL workloads!)', why: '93.2% (42.4 ms): reading 6-9 GB of Target weights (Dense 2.12 GB + HC 1.27 GB + Active Experts 2.2-5.5 GB) from GB10\'s 273 GB/s LPDDR5X.', what: 'Verifies all m drafts in parallel, guarantees 100% bit-exact output (draft_on == draft_off), and emits prefix + 1 bonus token.', example: 'Patch 0013 (fused BF16 HC) + Patch 0008 (y_stride) already delivered the -4 ms win (+7-10% N=1 decode across code/prose/devops/json)!', headroom: 'At lossless EXL3/BF16 ceiling on GB10 (only lossy INT8 HC remains in long-term-testing-todo.md).' },
       { id: 'f_rb', name: '6. Accept + 0ms Rollback', ms: 0.0, status: 'sat', pos: [12.2, 0, 0], kernel: 'fn_gdn_rows_late circular log + KV pos rewind', shapes: '0.0 ms rollback overhead', bw: '0.0%', why: '0.0%: GDN state uses a pending-row ring buffer, so rejected drafts simply move the pointer back!', what: 'Commits accepted tokens to client SSE stream and feeds new anchor back to Step 1.', example: 'Accepted 4/5 drafts -> emits 5 tokens in 1 SSE burst, rewinds 1 rejected slot in 0.0 ms.', headroom: 'Zero.' },
     ],
     edges: [
