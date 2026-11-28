@@ -15,12 +15,6 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **Goal:** Stream `W_up` with coalesced `uint4` loads, keep `act [n, 320]` in SMEM (~10 KB), fuse `hcDenseMix` in registers, and write `mixed [n, 2560] + xsm` directly.
   - **Est. gain:** `-1.5 to -2.5 ms/round` (**+4–6% N=1 decode** across `prose`, `code`, `devops`, `json`), 100% bit-exact BF16.
 
-- [ ] **INT8 (7-bit Mantissa, Group-32/64) Hyper-Connections Weights (`W_down` + `W_up`)**
-  - **Root cause:** 96 HCs read `1.27 GB` of BF16 weights on every decode round. Earlier 8-bit MXFP8 HC (`E4M3`, 3-bit mantissa) saved **-4.5 ms/round (+8–18% N=1 decode)**, proving bandwidth is the lever, but 3-bit mantissa across 96 residual-mixing steps broke 120K needle retrieval.
-  - **Goal:** Prototype symmetric INT8 (7-bit mantissa = 16× finer precision than E4M3) with per-channel or group-32 FP32 scales, cutting `1.27 GB → 0.64 GB`.
-  - **Validation gate:** **Must pass 120K needle retrieval (`FALCON-9472-OMEGA`)**, 5/5 greedy & T=0.7 `draft_on == draft_off` exactness, and zero prefill regression.
-  - **Est. gain:** `-3.0 to -4.0 ms/round` (**+8–10% N=1 decode** across all workloads).
-
 - [ ] **Column-Parallel Fused `hcWriteback + hcNormalize` for Decode (`n < 64`)**
   - **Root cause:** Stock's fused `hcWritebackNorm` launches only **1 CTA per row**, which under-utilizes GB10's 48 SMs when `n = 1..8` (which is why stock gates it to `n >= 64` and why forcing `n >= 1` regressed decode by `-1.5–3%`). As a result, `HC MLP` + `HC Attn` run separate `hcWriteback` (including FP32 `s.part` reduction on `HC MLP`) and `hcNormalize` kernels (`96` extra launches + `h [n, 10240]` roundtrip).
   - **Goal:** Split the 10,240 columns across multiple CTAs per row (with a tiny block/grid RMS reduction) so decode (`n < 64`) gets both kernel fusion and full 48-SM occupancy.
