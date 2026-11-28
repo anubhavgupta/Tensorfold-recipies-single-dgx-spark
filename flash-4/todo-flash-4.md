@@ -39,9 +39,9 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
   - **Est. gain:** `-20 to -30 ms/chunk` (**-2.0 s** off 248K TTFT), 100% bit-exact.
 
 - [ ] **Native Blackwell `mma.sync.aligned.kind::mxf8f6f4.block_scale` in `attn_core` (`182.4 ms` @ 245K)**
-  - **Root cause:** Patch `0012` halved KV reads (`77 GB → 38.5 GB`, cutting `attn_core` `298 → 182.4 ms`), but still converts MXFP8 → BF16 in registers via BF16x2 SIMD before running BF16 `mma16816`.
-  - **Goal:** Use native `sm_121` block-scaled FP8 Tensor Core MMA directly on the staged `E4M3 + E8M0/32` KV tiles (eliminating conversion instructions and increasing occupancy).
-  - **Est. gain:** `-25 to -35 ms/chunk` (**-2.5 s** off 248K TTFT).
+  - **Root cause:** Patch `0012` halved KV reads (`77 GB → 38.5 GB`, cutting `attn_core` `298 → 182.4 ms` @ ~211 GB/s = 77% peak), but (1) still runs software `kv8_convert` + SMEM roundtrip into `tiles_kv` with an extra `__syncthreads()`, and (2) holding both raw MXFP8 stage (`17.4 KB`) and BF16 `tiles_kv` (`26.6 KB`) raises SMEM to `44.0 KB`, dropping occupancy from `3 → 2 CTAs/SM`.
+  - **How to fix:** Quantize the CTA's small `Q` tile to MXFP8 once at CTA start, and execute `mma.sync.aligned.kind::mxf8f6f4.block_scale` directly on staged `E4M3 + E8M0/32` KV tiles — eliminating `kv8_convert` and `tiles_kv`, dropping SMEM to `~26 KB` (restoring **3 CTAs/SM**), and doubling TC throughput.
+  - **Est. gain:** `-25 to -35 ms/chunk` (`182.4 → ~145–155 ms`, **-2.5 s** off 248K TTFT, >90% GB10 BW ceiling).
 
 ---
 
