@@ -56,6 +56,20 @@ Baseline on NVIDIA DGX Spark (GB10, 128 GB LPDDR5X, 273 GB/s, 48 SMs, 24 MiB L2)
 
 ---
 
+## 4. MoE Routed 512×4-bit EXL3 (`453 ms` prefill / `16.5 ms` N=1 decode)
+
+- [ ] **Eliminate Split-K `z` Partials / Fuse `up` Finish + SwiGLU + `down rot_in` on Decode (`n <= 16`)**
+  - **Root cause:** In N=1 decode (`16.5 ms` @ ~185–200 GB/s vs N=4's 236 GB/s), `~2.8 ms` (17% of experts) is spent in 4 separate small rotation & split-K finish launches per layer (`192` launches/round) plus fp32 `z` partial write/read.
+  - **Goal:** Eliminate split-K `z` partials via in-block/cluster reduction and fuse `up` finish + SwiGLU + `down rot_in` directly on decode (`n <= 16`).
+  - **Est. gain:** `-1.5 to -2.5 ms/round` (**+3–5% N=1 decode**), 100% bit-exact.
+
+- [ ] **EXL3 `exl3_prompt.cuh` Instruction-Scheduling & Fusion Tuning (Prefill, Stay on EXL3)**
+  - **Root cause:** Without leaving EXL3 4.05 bpw (avoiding double-quantization), `exl3_prompt.cuh` (`453 ms` @ 245K) runs at `~48 eff. TFLOPS` where 4-bit trellis bit-unpacking + `mul1` `__dp4a` codebook ALU shares cycles with FP16 MMA.
+  - **Goal:** Profile and tune inner-loop `mul1` decode instruction scheduling / `rot_in` fusion in `exl3_prompt.cuh` while staying 100% on EXL3.
+  - **Est. gain:** Modest `~5–10%` on `routed4` (`-20 to -45 ms/chunk`), 100% bit-exact.
+
+---
+
 ## Reference
 - Interactive 3D architecture & latency profiler: `flash-4/docs/architecture-3d.html`
 - Serve locally: `python3 -m http.server 8090 --directory flash-4/docs`
